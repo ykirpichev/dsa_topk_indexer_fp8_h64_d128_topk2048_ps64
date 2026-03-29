@@ -18,6 +18,7 @@ This is a FlashInfer AI Kernel Generation Contest starter kit (MLSys 2026). Part
 ### Non-obvious Caveats
 
 - **PATH**: pip installs CLI tools to `~/.local/bin`. The update script exports this, and it is also appended to `~/.bashrc`. If a fresh shell still can't find `modal` or `flashinfer-bench`, run `export PATH="$HOME/.local/bin:$PATH"`.
+- **Modal auth**: Modal authenticates via `MODAL_TOKEN_ID` and `MODAL_TOKEN_SECRET` environment variables (injected from Cursor Secrets). The `~/.modal.toml` file does NOT persist across new agent sessions. If `modal run` fails with "Token missing", check that these secrets are set in the environment.
 - **config.toml `entry_point` format**: The template ships with `entry_point = "kernel"`, but `flashinfer-bench` v0.1.2+ requires `<file_path>::<function_name>` format (e.g., `kernel.py::kernel`). Using the old format causes a Pydantic validation error. When using the Python API directly (as shown in README), specify the correct format.
 - **No GPU on Cloud Agent VMs**: `run_local.py` and `run_modal.py` require CUDA GPUs. On CPU-only VMs, you can still validate the environment by packing solutions and using the `flashinfer_bench` Python API.
 - **No linter/test suite**: This repo has no configured linter, test runner, or CI. Validation is done by running `pack_solution.py` and the benchmark scripts.
