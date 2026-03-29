@@ -169,7 +169,8 @@ class _GatherDequantKernel:
         t = s % PS
         page_slot = s // PS
 
-        page_id = Int32(m_bt[(b, page_slot)])
+        bt_off = b * actual_pages + page_slot
+        page_id = Int32(m_bt[bt_off])
         if page_id < Int32(0):
             page_id = Int32(0)
         if page_id >= P:
