@@ -17,7 +17,22 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-import modal
+try:
+    import modal
+except ModuleNotFoundError:
+    print(
+        "Error: the 'modal' package is not installed. Install it with:\n"
+        "  pip install modal\n"
+        "Then run either:\n"
+        "  modal run scripts/run_modal.py\n"
+        "or:\n"
+        "  python scripts/run_modal.py",
+        file=sys.stderr,
+    )
+    raise SystemExit(1) from None
+
+from modal.exception import AuthError
+
 from flashinfer_bench import Benchmark, BenchmarkConfig, Solution, TraceSet
 
 app = modal.App("flashinfer-bench")
@@ -102,9 +117,8 @@ def print_results(results: dict):
             print()
 
 
-@app.local_entrypoint()
-def main():
-    """Pack solution and run benchmark on Modal."""
+def _run_modal_benchmark() -> None:
+    """Pack solution and run benchmark on Modal (shared by CLI and `python -m` / direct run)."""
     from scripts.pack_solution import pack_solution
 
     print("Packing solution from source files...")
@@ -122,3 +136,31 @@ def main():
         return
 
     print_results(results)
+
+
+@app.local_entrypoint()
+def main():
+    """Pack solution and run benchmark on Modal."""
+    _run_modal_benchmark()
+
+
+if __name__ == "__main__":
+    # `modal run` loads this file as a named module (`__name__` != "__main__"), so only
+    # direct `python scripts/run_modal.py` hits this path. Modal still requires a logged-in
+    # client (`modal setup` / `modal token new`) for `.remote()` calls.
+    try:
+        with modal.enable_output():
+            with app.run():
+                _run_modal_benchmark()
+    except AuthError as exc:
+        print(
+            f"Error: {exc}\n"
+            "Authenticate Modal once with:\n"
+            "  modal setup\n"
+            "or:\n"
+            "  modal token new\n"
+            "Then run:\n"
+            "  modal run scripts/run_modal.py",
+            file=sys.stderr,
+        )
+        raise SystemExit(1) from None
