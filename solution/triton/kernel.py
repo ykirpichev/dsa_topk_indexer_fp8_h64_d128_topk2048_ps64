@@ -1,10 +1,15 @@
 """
 DSA TopK indexer — B200 / Blackwell (sm_100) Triton + PyTorch.
 
-Matches the CUDA baseline pipeline:
+Pipeline:
   1) Triton: fused paged FP8 gather + per-token scale → K_batched [B, S, D] f32
-  2) torch.bmm: logits [B, H, S] = Q @ K^T
-  3) relu, weighted sum, torch.topk, global index transform
+  2) torch.bmm (FP32): logits [B, H, S] = Q @ K^T — matches reference top-k exactly.
+
+FP8 matmul note: `torch._scaled_mm` (rowwise E4M3, fp32 out) hit RUNTIME_ERROR on
+Modal’s `flashinfer/flashinfer-ci-cu132` + B200; bf16 output fixed the crash but
+broke top-k vs reference. BF16 `bmm` was faster on some shapes but failed
+INCORRECT_NUMERICAL on several smoke workloads. Until cuBLASLt rowwise FP8 + fp32
+acc is stable here, keep FP32 `bmm`.
 
 Fixed shape: H=64, D=128, PS=64, K_topk=2048 (dsa_topk_indexer_fp8_h64_d128_topk2048_ps64).
 """
