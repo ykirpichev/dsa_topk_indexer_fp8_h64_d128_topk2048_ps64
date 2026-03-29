@@ -1,22 +1,46 @@
 """
 DSA TopK indexer — Python + CuTe DSL (nvidia-cutlass-dsl).
 
-Equivalent pipeline to `version_v1` (CUDA extension):
+Target stack: CUDA **13.2** toolkit (nvcc) + **cuda-python 13.2** + **nvidia-cutlass-dsl**.
+The PyPI wheel’s `cutlass.cute.experimental` package is currently a stub; this kernel uses
+stable CuTe DSL + inline PTX only.
+
+Pipeline (same as `version_v1` CUDA extension):
   1) CuTe DSL: fused FP8 page gather + dequant → K_batched [B, S, D] f32
   2) torch.bmm, relu * weights, torch.topk
   3) CuTe DSL: local → global token indices
 
-Optional `cutlass.cute.experimental` is imported when the toolkit is CUDA 13.1+;
-on CUDA 13.2+ environments this enables the experimental CuTe DSL module.
-
-Compilation uses the TVM-FFI tensor bridge (`--enable-tvm-ffi`), aligned with
-cuda-python 13.x stacks pulled in by `nvidia-cutlass-dsl`.
+Uses TVM-FFI (`--enable-tvm-ffi`) for torch tensor IO.
 """
 
 from __future__ import annotations
 
 import functools
+import glob
+import os
+from pathlib import Path
 from typing import Callable
+
+
+def _ensure_cuda_home() -> None:
+    """Point CUDA_HOME at pip-installed CUDA 13.x toolkit (nvidia-cuda-nvcc) if unset."""
+    if os.environ.get("CUDA_HOME"):
+        return
+    try:
+        import site
+    except ImportError:
+        return
+    roots = list(site.getsitepackages())
+    u = getattr(site, "getusersitepackages", lambda: "")()
+    if u:
+        roots.append(u)
+    for sp in roots:
+        for nvcc in glob.glob(os.path.join(sp, "nvidia", "cu13", "bin", "nvcc")):
+            os.environ["CUDA_HOME"] = str(Path(nvcc).resolve().parent.parent)
+            return
+
+
+_ensure_cuda_home()
 
 import cutlass
 import cutlass.cute as cute
@@ -24,11 +48,6 @@ import torch
 from cutlass import Float32, Int32, Uint32, Uint8
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import llvm
-
-try:
-    import cutlass.cute.experimental as _cute_experimental  # noqa: F401
-except NotImplementedError:
-    _cute_experimental = None
 
 
 # --- PTX: global loads / FP8 decode -------------------------------------------------

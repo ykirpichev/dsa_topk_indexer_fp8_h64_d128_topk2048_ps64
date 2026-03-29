@@ -1,7 +1,7 @@
 """
 FlashInfer-Bench Modal Cloud Benchmark Runner.
 
-Automatically packs the solution from source files and runs benchmarks
+Automatically packs the Python CuTe DSL solution and runs benchmarks
 on NVIDIA B200 GPUs via Modal.
 
 Setup (one-time):
@@ -10,6 +10,8 @@ Setup (one-time):
     modal volume put flashinfer-trace /path/to/flashinfer-trace/
 """
 
+import glob
+import os
 import sys
 from pathlib import Path
 
@@ -22,18 +24,41 @@ from flashinfer_bench import Benchmark, BenchmarkConfig, Solution, TraceSet
 
 app = modal.App("flashinfer-bench")
 
+
+def _ensure_cuda_home_modal() -> None:
+    """Use pip-installed CUDA 13.x (nvidia-cuda-nvcc) for CuTe DSL on Modal."""
+    if os.environ.get("CUDA_HOME"):
+        return
+    import site
+
+    for sp in site.getsitepackages():
+        for nvcc in glob.glob(os.path.join(sp, "nvidia", "cu13", "bin", "nvcc")):
+            os.environ["CUDA_HOME"] = str(Path(nvcc).resolve().parent.parent)
+            return
+
 trace_volume = modal.Volume.from_name("flashinfer-trace", create_if_missing=True)
 TRACE_SET_PATH = "/data"
 
+# CUDA 13.2-class stack + CuTe DSL for the Python solution (sm_100 B200).
 image = (
     modal.Image.debian_slim(python_version="3.12")
-    .pip_install("flashinfer-bench", "torch", "triton", "numpy")
+    .pip_install(
+        "flashinfer-bench",
+        "torch",
+        "triton",
+        "numpy",
+        "nvidia-cutlass-dsl",
+        "cuda-python>=13.2",
+        "nvidia-cuda-nvcc",
+    )
 )
 
 
 @app.function(image=image, gpu="B200:1", timeout=3600, volumes={TRACE_SET_PATH: trace_volume})
 def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
     """Run benchmark on Modal B200 and return results."""
+    _ensure_cuda_home_modal()
+
     if config is None:
         config = BenchmarkConfig(warmup_runs=3, iterations=100, num_trials=5)
 
@@ -104,15 +129,14 @@ def print_results(results: dict):
 
 @app.local_entrypoint()
 def main():
-    """Pack solution and run benchmark on Modal."""
-    from scripts.pack_solution import pack_solution
+    """Pack Python solution and run benchmark on Modal."""
+    from scripts.python_solution_pack import build_python_solution
 
-    print("Packing solution from source files...")
-    solution_path = pack_solution()
-
-    print("\nLoading solution...")
-    solution = Solution.model_validate_json(solution_path.read_text())
-    print(f"Loaded: {solution.name} ({solution.definition})")
+    print("Packing Python CuTe DSL solution...")
+    solution = build_python_solution()
+    solution_path = PROJECT_ROOT / "solution.json"
+    solution_path.write_text(solution.model_dump_json(indent=2))
+    print(f"Wrote {solution_path} ({solution.name}, {solution.definition})")
 
     print("\nRunning benchmark on Modal B200...")
     results = run_benchmark.remote(solution)

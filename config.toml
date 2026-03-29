@@ -4,6 +4,6 @@ definition = "dsa_topk_indexer_fp8_h64_d128_topk2048_ps64"
 author = "team-name"
 
 [build]
+# Use `python scripts/python_solution_pack.py` to build solution.json (pack_solution is cuda/triton only).
 language = "python"
 entry_point = "kernel.py::kernel"
-dependencies = ["nvidia-cutlass-dsl"]

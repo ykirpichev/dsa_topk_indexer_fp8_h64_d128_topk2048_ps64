@@ -13,7 +13,11 @@ PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from flashinfer_bench import Benchmark, BenchmarkConfig, Solution, TraceSet
-from scripts.pack_solution import pack_solution
+
+try:
+    import tomllib
+except ImportError:
+    import tomli as tomllib
 
 
 def get_trace_set_path() -> str:
@@ -100,8 +104,21 @@ def print_results(results: dict):
 
 def main():
     """Pack solution and run benchmark."""
-    print("Packing solution from source files...")
-    solution_path = pack_solution()
+    config_path = PROJECT_ROOT / "config.toml"
+    with open(config_path, "rb") as f:
+        cfg = tomllib.load(f)
+    lang = cfg["build"]["language"]
+
+    if lang == "python":
+        print("Packing Python solution...")
+        from scripts.python_solution_pack import write_solution_json
+
+        solution_path = write_solution_json()
+    else:
+        from scripts.pack_solution import pack_solution
+
+        print("Packing solution from source files...")
+        solution_path = pack_solution()
 
     print("\nLoading solution...")
     solution = Solution.model_validate_json(solution_path.read_text())
