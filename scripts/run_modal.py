@@ -34,10 +34,51 @@ app = modal.App("flashinfer-bench")
 trace_volume = modal.Volume.from_name("flashinfer-trace", create_if_missing=True)
 TRACE_SET_PATH = "/data"
 
+# Track-specific constants (dsa_topk_indexer_fp8_h64_d128_topk2048_ps64)
+_H       = 64    # number of index heads
+_D       = 128   # head dimension (FP8 bytes per head per token)
+_PS      = 64    # page size (tokens per page)
+_HDS     = 132   # bytes per token in KV cache (128 FP8 + 4 float32 scale)
+_K_TOPK  = 2048  # topk
+_B200_HBM_BW_TBS = 8.0  # B200 HBM3e peak bandwidth (TB/s)
+
 image = (
     modal.Image.from_registry("flashinfer/flashinfer-ci-cu132:latest", add_python="3.12")
     .pip_install("flashinfer-bench")
 )
+
+
+def _load_seq_lens(trace_root: str, workload) -> list[int] | None:
+    """Load seq_lens tensor from the workload's safetensors file."""
+    try:
+        import safetensors.torch
+        sl_spec = workload.inputs.get("seq_lens", {})
+        if isinstance(sl_spec, dict) and sl_spec.get("type") == "safetensors":
+            path = Path(trace_root) / sl_spec["path"]
+            st = safetensors.torch.load_file(str(path))
+            return st[sl_spec["tensor_key"]].tolist()
+    except Exception:
+        pass
+    return None
+
+
+def _roofline_ms(seq_lens: list[int]) -> float:
+    """Compute HBM roofline latency (ms) for a given set of sequence lengths.
+
+    Bytes counted:
+      - K cache reads: for each token, _HDS bytes (128 FP8 + 4-byte float32 scale)
+      - Q reads:       B * _H * _D bytes (FP8)
+      - Weights reads: B * _H * 4 bytes (float32)
+      - TopK output:   B * min(_K_TOPK, seq_len_b) * 4 bytes (int32)
+    """
+    B = len(seq_lens)
+    T = sum(seq_lens)
+    k_bytes   = T * _HDS
+    q_bytes   = B * _H * _D
+    w_bytes   = B * _H * 4
+    out_bytes = sum(min(_K_TOPK, sl) * 4 for sl in seq_lens)
+    total     = k_bytes + q_bytes + w_bytes + out_bytes
+    return total / (_B200_HBM_BW_TBS * 1e12) * 1e3
 
 
 @app.function(image=image, gpu="B200:1", timeout=7200, volumes={TRACE_SET_PATH: trace_volume})
@@ -103,45 +144,74 @@ def run_benchmark(
             if trace.evaluation.correctness:
                 entry["max_abs_error"] = trace.evaluation.correctness.max_absolute_error
                 entry["max_rel_error"] = trace.evaluation.correctness.max_relative_error
+
+            # Workload metadata for roofline
+            wl = trace.workload
+            axes = wl.axes if hasattr(wl, "axes") else wl.get("axes", {})
+            batch_size = axes.get("batch_size", 1) if isinstance(axes, dict) else getattr(axes, "batch_size", 1)
+            seq_lens = _load_seq_lens(TRACE_SET_PATH, wl if hasattr(wl, "inputs") else type("W", (), {"inputs": wl.get("inputs", {})})())
+            if seq_lens is not None:
+                entry["seq_lens"] = seq_lens
+            else:
+                # Fallback: approximate from axes
+                max_num_pages = axes.get("max_num_pages", 0) if isinstance(axes, dict) else getattr(axes, "max_num_pages", 0)
+                entry["seq_lens"] = [max_num_pages * _PS] * batch_size
+
             results[definition.name][trace.workload.uuid] = entry
 
     return results
 
 
 def print_results(results: dict):
-    """Print benchmark results in a formatted way."""
+    """Print benchmark results with roofline analysis table."""
+    import math
+
     for def_name, traces in results.items():
         print(f"\n{def_name}:")
-        speedups: list[float] = []
+
+        # Collect rows for table
+        rows = []
         for workload_uuid, result in traces.items():
-            status = result.get("status")
-            print(f"  Workload {workload_uuid[:8]}...: {status}", end="")
+            status = result.get("status", "UNKNOWN")
+            latency = result.get("latency_ms")
+            speedup = result.get("speedup_factor")
+            abs_err = result.get("max_abs_error")
+            seq_lens = result.get("seq_lens", [])
 
-            if result.get("latency_ms") is not None:
-                print(f" | sol {result['latency_ms']:.3f} ms", end="")
+            T = sum(seq_lens) if seq_lens else None
+            roofline = _roofline_ms(seq_lens) if seq_lens else None
+            pct_peak = (roofline / latency * 100) if (roofline and latency) else None
+            # correctness match: fraction of topk indices in common with reference
+            # abs_err=0 means exact match → 1.0; use directly
+            match = (1.0 - abs_err) if abs_err is not None else None
 
-            if result.get("reference_latency_ms") is not None:
-                print(f" | ref {result['reference_latency_ms']:.3f} ms", end="")
+            rows.append((T, latency, speedup, match, roofline, pct_peak, status))
 
-            if result.get("speedup_factor") is not None:
-                sp = result["speedup_factor"]
-                speedups.append(sp)
-                print(f" | {sp:.2f}x speedup", end="")
+        # Sort by T ascending
+        rows.sort(key=lambda r: (r[0] is None, r[0]))
 
-            if result.get("max_abs_error") is not None:
-                abs_err = result["max_abs_error"]
-                rel_err = result.get("max_rel_error", 0)
-                print(f" | abs_err={abs_err:.2e}, rel_err={rel_err:.2e}", end="")
+        # Print table header (roofline in µs for readability)
+        print(f"  {'T':>8} | {'Lat(ms)':>7} | {'Spdup':>7} | {'Match':>6} | {'RF(µs)':>7} | {'%Peak':>5} | Status")
+        print(f"  {'-'*8}-+-{'-'*7}-+-{'-'*7}-+-{'-'*6}-+-{'-'*7}-+-{'-'*5}-+-{'-'*8}")
 
-            print()
+        speedups = []
+        for T, latency, speedup, match, roofline, pct_peak, status in rows:
+            t_str   = f"{T:8d}"        if T        is not None else f"{'?':>8}"
+            lat_str = f"{latency:7.3f}" if latency  is not None else f"{'?':>7}"
+            sp_str  = f"{speedup:6.2f}x" if speedup is not None else f"{'?':>7}"
+            mt_str  = f"{match:6.4f}"  if match    is not None else f"{'?':>6}"
+            rf_us   = roofline * 1000  if roofline  is not None else None
+            rf_str  = f"{rf_us:7.3f}"  if rf_us    is not None else f"{'?':>7}"
+            pk_str  = f"{pct_peak:4.1f}%" if pct_peak is not None else f"{'?':>5}"
+            print(f"  {t_str} | {lat_str} | {sp_str} | {mt_str} | {rf_str} | {pk_str} | {status}")
+            if speedup is not None:
+                speedups.append(speedup)
 
         if speedups:
-            mean_sp = sum(speedups) / len(speedups)
-            print(
-                f"\n  --- Aggregate ({len(speedups)} workloads): "
-                f"mean speedup {mean_sp:.2f}x "
-                f"(min {min(speedups):.2f}x, max {max(speedups):.2f}x) ---"
-            )
+            geomean = math.exp(sum(math.log(s) for s in speedups) / len(speedups))
+            passed = sum(1 for _, _, _, _, _, _, st in rows if st == "PASSED")
+            total = len(rows)
+            print(f"\n  Geomean: {geomean:.2f}x ({passed}/{total} PASSED)")
 
 
 @app.local_entrypoint()
