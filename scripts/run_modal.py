@@ -222,11 +222,11 @@ def print_results(results: dict):
         # RF_log = optimistic HBM (logical tokens only); RF_impl = padded gather + K f32 + logits
         print(
             f"  {'T':>8} | {'S_pad':>6} | {'Lat(ms)':>7} | {'Spdup':>7} | {'Match':>6} | "
-            f"{'RF_Lµs':>7} | {'RF_Iµs':>7} | {'%Pk_I':>6} | Status"
+            f"{'RF_Lµs':>7} | {'RF_Iµs':>7} | {'%Pk_I':>8} | Status"
         )
         print(
             f"  {'-'*8}-+-{'-'*6}-+-{'-'*7}-+-{'-'*7}-+-{'-'*6}-+-"
-            f"{'-'*7}-+-{'-'*7}-+-{'-'*6}-+-{'-'*8}"
+            f"{'-'*7}-+-{'-'*7}-+-{'-'*8}-+-{'-'*8}"
         )
 
         speedups = []
@@ -240,7 +240,12 @@ def print_results(results: dict):
             ri_us = rf_impl * 1000 if rf_impl is not None else None
             rl_str = f"{rl_us:7.3f}" if rl_us is not None else f"{'?':>7}"
             ri_str = f"{ri_us:7.3f}" if ri_us is not None else f"{'?':>7}"
-            pk_str = f"{pct_peak:5.1f}%" if pct_peak is not None else f"{'?':>6}"
+            if pct_peak is None:
+                pk_str = f"{'?':>8}"
+            elif pct_peak < 0.1:
+                pk_str = f"{pct_peak:7.4f}%"
+            else:
+                pk_str = f"{pct_peak:7.1f}%"
             print(
                 f"  {t_str} | {s_str} | {lat_str} | {sp_str} | {mt_str} | "
                 f"{rl_str} | {ri_str} | {pk_str} | {status}"
