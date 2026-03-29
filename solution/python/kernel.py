@@ -629,16 +629,24 @@ def kernel(
         block_table[:, :actual_pages].to(torch.int32).clamp(0, p - 1).contiguous()
     )
 
-    k_batched = torch.empty((b, s, d), device=q_index_fp8.device, dtype=torch.float32)
+    device = q_index_fp8.device
+    k_batched = torch.empty((b, s, d), device=device, dtype=torch.float32)
     _run_gather_dequant(cache_u8, bt_i32, k_batched, b, s, p, ps, hds, actual_pages)
 
     q_f32 = q_index_fp8.to(torch.float32)
     if _USE_FP8_TMMA_MM and s % _N_TILE_FP8 == 0:
-        logits = torch.empty((b, _h, s), device=q_index_fp8.device, dtype=torch.float32)
+        logits = torch.empty((b, _h, s), device=device, dtype=torch.float32)
         _fp8_batched_mm_hs(q_f32, k_batched, logits)
     else:
         logits = torch.bmm(q_f32, k_batched.transpose(1, 2).contiguous())
     weighted = logits.relu() * weights.contiguous().unsqueeze(2)
+
+    # Batched score reduce + mask (avoid Python loop over heads)
+    col = torch.arange(s, device=device, dtype=torch.int64).view(1, s)
+    sl_t = seq_lens.to(device).to(torch.int64).view(b, 1)
+    valid = col < sl_t
+    scores = (weighted * valid.unsqueeze(1).to(dtype=weighted.dtype)).sum(dim=1)
+    scores = scores.masked_fill(~valid, float("-inf"))
 
     bt_ptr = bt_i32
     out_ptr = topk_indices
@@ -648,8 +656,7 @@ def kernel(
         if sl == 0:
             continue
         actual_topk = min(k_topk, sl)
-        scores = weighted[bi, :, :sl].sum(0)
-        _, topk_local = scores.topk(actual_topk, dim=-1, largest=True, sorted=True)
+        _, topk_local = scores[bi, :].topk(actual_topk, dim=-1, largest=True, sorted=True)
         topk_local_i32 = topk_local.to(torch.int32).contiguous()
         _run_page_transform(
             topk_local_i32,

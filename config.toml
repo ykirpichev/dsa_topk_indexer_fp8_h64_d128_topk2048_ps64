@@ -1,9 +1,13 @@
 [solution]
-name = "cute-dsl-b200-fp8-topk-v1"
+name = "my-team-solution-v1"      # Primary: Triton + torch.bmm (fast on B200)
 definition = "dsa_topk_indexer_fp8_h64_d128_topk2048_ps64"
 author = "team-name"
 
 [build]
-language = "python"
+language = "triton"
 entry_point = "kernel.py::kernel"
-dependencies = ["nvidia-cutlass-dsl"]
+
+# CuTe / cutlass-dsl experiment lives in solution/python/ — use:
+#   language = "python"
+#   entry_point = "kernel.py::kernel"
+#   dependencies = ["nvidia-cutlass-dsl"]
