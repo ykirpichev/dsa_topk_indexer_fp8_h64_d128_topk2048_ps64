@@ -1,36 +1,71 @@
 """
-Baseline: PyTorch reference matching the competition definition (SGLang / deep_gemm semantics).
+DSA TopK indexer — B200 / Blackwell (sm_100) Triton + PyTorch.
 
-Correctness-first; replace inner loops with Triton for performance later.
+Matches the CUDA baseline pipeline:
+  1) Triton: fused paged FP8 gather + per-token scale → K_batched [B, S, D] f32
+  2) torch.bmm: logits [B, H, S] = Q @ K^T
+  3) relu, weighted sum, torch.topk, global index transform
+
+Fixed shape: H=64, D=128, PS=64, K_topk=2048 (dsa_topk_indexer_fp8_h64_d128_topk2048_ps64).
 """
 
+from __future__ import annotations
+
 import torch
+import triton
+import triton.language as tl
+
+# B200-only constants for this definition
+_H = 64
+_D = 128
+_PS = 64
+_K_TOPK = 2048
 
 
-def dequant_fp8_kv_cache(k_index_cache_fp8: torch.Tensor) -> torch.Tensor:
-    """Dequantize FP8 KV cache from deep_gemm format.
+@triton.jit
+def _gather_dequant_kernel(
+    cache_ptr,
+    bt_ptr,
+    k_out_ptr,
+    B,
+    S,
+    D: tl.constexpr,
+    P,
+    PS: tl.constexpr,
+    HDS: tl.constexpr,
+    actual_pages,
+    stride_bt0,
+    stride_bt1,
+):
+    """One program per (batch, padded token); 128 lanes cover D=128."""
+    token_idx = tl.program_id(0)
+    d_offs = tl.arange(0, D)
 
-    Input: [num_pages, page_size, 1, 132] int8 (interpreted as uint8)
-    Output: [num_pages, page_size, 128] float32
-    """
-    k_index_cache_fp8 = k_index_cache_fp8.view(torch.uint8)
-    num_pages, page_size, _num_heads, head_dim_sf = k_index_cache_fp8.shape
-    head_dim = head_dim_sf - 4  # 128
+    b = token_idx // S
+    s = token_idx % S
 
-    kv_flat = k_index_cache_fp8.view(num_pages, page_size * head_dim_sf)
+    page_col = s // PS
+    bt_addr = bt_ptr + b * stride_bt0 + page_col * stride_bt1
+    page_id = tl.load(bt_addr)
+    page_id = tl.minimum(page_id, P - 1)
 
-    fp8_bytes = kv_flat[:, : page_size * head_dim].contiguous()
-    fp8_tensor = fp8_bytes.view(num_pages, page_size, head_dim).view(torch.float8_e4m3fn)
-    fp8_float = fp8_tensor.to(torch.float32)
+    t = s % PS
+    page_byte = page_id.to(tl.int64) * (PS * HDS)
+    fp8_byte = page_byte + t.to(tl.int64) * D + d_offs.to(tl.int64)
 
-    scale_bytes = kv_flat[:, page_size * head_dim :].contiguous()
-    scale = scale_bytes.view(num_pages, page_size, 4).view(torch.float32)
+    u8 = tl.load(cache_ptr + fp8_byte)
+    fp8v = u8.to(tl.float8e4nv, bitcast=True)
+    fv = fp8v.to(tl.float32)
 
-    return fp8_float * scale
+    scale_off = page_byte + PS * D + t.to(tl.int64) * 4
+    scale = tl.load((cache_ptr + scale_off).to(tl.pointer_type(tl.float32)))
+
+    out_off = token_idx.to(tl.int64) * D + d_offs.to(tl.int64)
+    tl.store(k_out_ptr + out_off, fv * scale)
 
 
 @torch.inference_mode()
-def run(
+def kernel(
     q_index_fp8: torch.Tensor,
     k_index_cache_fp8: torch.Tensor,
     weights: torch.Tensor,
@@ -38,48 +73,76 @@ def run(
     block_table: torch.Tensor,
     topk_indices: torch.Tensor,
 ) -> None:
-    """Destination-passing entry: writes topk_indices in-place."""
-    batch_size, num_index_heads, index_head_dim = q_index_fp8.shape
-    _num_pages, page_size, _, _ = k_index_cache_fp8.shape
-    topk = 2048
-
-    assert num_index_heads == 64
-    assert index_head_dim == 128
-    assert page_size == 64
-
+    assert q_index_fp8.is_cuda
     device = q_index_fp8.device
 
-    q = q_index_fp8.to(torch.float32)
-    k_all = dequant_fp8_kv_cache(k_index_cache_fp8)
+    B, H, D = q_index_fp8.shape
+    P, PS, _, HDS = k_index_cache_fp8.shape
+    K_topk = topk_indices.size(1)
+
+    assert H == _H and D == _D and PS == _PS and K_topk == _K_TOPK
+    assert HDS == D + 4
 
     topk_indices.fill_(-1)
 
-    for b in range(batch_size):
-        seq_len = int(seq_lens[b].item())
+    if B == 0:
+        return
 
-        if seq_len == 0:
+    seq_cpu = seq_lens.detach().to("cpu")
+    if seq_cpu.dtype in (torch.int32, torch.int64):
+        sl_list = seq_cpu.view(-1).tolist()
+    else:
+        sl_list = [int(x) for x in seq_cpu.view(-1)]
+    max_seq_len = max(sl_list) if sl_list else 0
+    if max_seq_len == 0:
+        return
+
+    max_pages_needed = (max_seq_len + PS - 1) // PS
+    actual_pages = min(max_pages_needed, block_table.size(1))
+    S = actual_pages * PS
+
+    bt = block_table[:, :actual_pages].to(device=device, dtype=torch.int32).clamp(0, P - 1).contiguous()
+    cache_u8 = (
+        k_index_cache_fp8
+        if k_index_cache_fp8.dtype == torch.uint8
+        else k_index_cache_fp8.view(torch.uint8)
+    ).contiguous()
+
+    K_batched = torch.empty((B, S, D), dtype=torch.float32, device=device)
+
+    grid = (B * S,)
+    _gather_dequant_kernel[grid](
+        cache_u8,
+        bt,
+        K_batched,
+        B,
+        S,
+        D,
+        P,
+        PS,
+        HDS,
+        actual_pages,
+        bt.stride(0),
+        bt.stride(1),
+    )
+
+    q_f32 = q_index_fp8.to(torch.float32)
+    logits = torch.bmm(q_f32, K_batched.transpose(1, 2))
+    weighted = torch.relu(logits) * weights.unsqueeze(2).contiguous()
+
+    for b in range(B):
+        sl = sl_list[b]
+        if sl == 0:
             continue
+        actual_topk = min(K_topk, sl)
+        scores = weighted[b, :, :sl].sum(dim=0)
+        _, topk_local = torch.topk(scores, actual_topk, dim=-1, largest=True, sorted=True)
+        topk_local_i32 = topk_local.to(torch.int32)
 
-        num_pages_for_seq = (seq_len + page_size - 1) // page_size
-        page_indices = block_table[b, :num_pages_for_seq].to(torch.long)
+        bt_b = bt[b]
+        page_idx = topk_local_i32 // PS
+        offset = topk_local_i32 % PS
+        global_page = bt_b[page_idx.long()]
+        topk_global = global_page * PS + offset
 
-        k_paged = k_all[page_indices]
-        k = k_paged.reshape(-1, index_head_dim)[:seq_len]
-
-        q_b = q[b]
-        scores = q_b @ k.T
-        scores_relu = torch.relu(scores)
-
-        w = weights[b]
-        weighted_scores = scores_relu * w[:, None]
-        final_scores = weighted_scores.sum(dim=0)
-
-        actual_topk = min(topk, seq_len)
-        _, topk_idx = torch.topk(final_scores, actual_topk)
-
-        page_idx_per_token = topk_idx // page_size
-        offset_per_token = topk_idx % page_size
-        global_page_idx = page_indices[page_idx_per_token]
-        topk_tokens = global_page_idx * page_size + offset_per_token
-
-        topk_indices[b, :actual_topk] = topk_tokens.to(torch.int32)
+        topk_indices[b, :actual_topk] = topk_global
