@@ -12,6 +12,10 @@ Cap workloads on a full-style benchmark (default timing config)::
 
     FIB_MODAL_MAX_WORKLOADS=16 modal run scripts/run_modal.py
 
+CuTe DSL gather/page JIT for ``solution/python/kernel.py``::
+
+    FIB_MODAL_DSA_CUTE_JIT=1 modal run scripts/run_modal.py
+
 Setup (one-time):
     modal setup
     modal volume create flashinfer-trace
@@ -112,6 +116,11 @@ def run_benchmark(
     solution: Solution, smoke: bool = False, max_workloads: int | None = None
 ) -> dict:
     """Run benchmark on Modal B200 and return results."""
+    # Forward to isolated solution workers (Python/CuTe path)
+    if os.environ.get("FIB_MODAL_DSA_CUTE_JIT", "").lower() in ("1", "true", "yes"):
+        os.environ["DSA_CUTE_JIT"] = "1"
+    if os.environ.get("FIB_MODAL_DSA_FP8_TMMA_MM", "").lower() in ("1", "true", "yes"):
+        os.environ["DSA_FP8_TMMA_MM"] = "1"
     if smoke:
         # Fewer workloads / trials than production, but profile_baseline=True is required
         # for reference_latency_ms and speedup_factor.

@@ -6,9 +6,10 @@ page cache, vectorized paged gather into `K_batched`, `torch.bmm`, relu×weights
 `topk`, and a small PyTorch page-table transform. This matches the dataset reference
 and passes smoke workloads.
 
-**Opt-in CuTe JIT** (`DSA_CUTE_JIT=1`): inline-PTX gather + page-transform kernels
-from the historical CuTe DSL template (TVM-FFI compile). Use when you have verified
-correctness in your environment.
+**Opt-in CuTe JIT** (`DSA_CUTE_JIT=1`): inline-PTX gather + page-transform (TVM-FFI).
+Modal smoke with JIT on still shows **some** `INCORRECT_NUMERICAL` workloads (race vs
+reference ordering); use for perf experiments only until fixed. Scale loads use
+`gmem_addr_f32` for 4-byte alignment; `torch.cuda.synchronize()` after CuTe launches.
 
 **Opt-in FP8 TMMA** (`DSA_FP8_TMMA_MM=1`): Blackwell `tcgen05` FP8 UMMA batched GEMM
 (`make_trivial_tiled_mma`), requires `S % 128` and a successful CuTe compile; still
@@ -323,18 +324,17 @@ class _GatherDequantKernel:
         t = s % PS
         page_slot = s // PS
 
+        # Match Triton/CUDA: only upper clamp (host bt is already clamped to [0, P-1])
         page_id = Int32(m_bt[(b, page_slot)])
-        if page_id < Int32(0):
-            page_id = Int32(0)
-        if page_id >= P:
-            page_id = P - Int32(1)
+        page_id = cutlass.min(page_id, P - Int32(1))
 
+        # SoA per page (same as CUDA/Triton): [PS*D fp8][PS*4 scales]
         page_byte = page_id * (PS * HDS)
         fp8_off = page_byte + t * Dm + d
         scale_off = page_byte + PS * Dm + t * Int32(4)
 
         fp8_u8 = ld_global_u8(gmem_addr_u8(m_cache, fp8_off))
-        scale = ld_global_f32(gmem_addr_u8(m_cache, scale_off))
+        scale = ld_global_f32(gmem_addr_f32(m_cache, scale_off))
         val = fp8_e4m3_u8_to_f32(fp8_u8 & Uint32(0xFF)) * scale
 
         out_lin = token_idx * Dm + d
@@ -545,6 +545,7 @@ def _run_gather_dequant(
             Int32(hds),
             Int32(actual_pages),
         )
+        torch.cuda.synchronize()
     except Exception:
         k_batched.copy_(
             _pytorch_gather_dequant_k_batched(
@@ -586,6 +587,7 @@ def _run_page_transform(
             Int32(actual_topk),
             Int32(ps),
         )
+        torch.cuda.synchronize()
     except Exception:
         _pytorch_page_transform(local_idx, bt_row, out_row, actual_topk, ps)
 
