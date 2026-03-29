@@ -62,22 +62,48 @@ def _load_seq_lens(trace_root: str, workload) -> list[int] | None:
     return None
 
 
-def _roofline_ms(seq_lens: list[int]) -> float:
-    """Compute HBM roofline latency (ms) for a given set of sequence lengths.
+def _padded_s(max_sl: int) -> int:
+    """Padded token length along K (same as kernel): ceil(max_sl / PS) * PS."""
+    if max_sl <= 0:
+        return 0
+    pages = (max_sl + _PS - 1) // _PS
+    return pages * _PS
 
-    Bytes counted:
-      - K cache reads: for each token, _HDS bytes (128 FP8 + 4-byte float32 scale)
-      - Q reads:       B * _H * _D bytes (FP8)
-      - Weights reads: B * _H * 4 bytes (float32)
-      - TopK output:   B * min(_K_TOPK, seq_len_b) * 4 bytes (int32)
-    """
+
+def _roofline_ms_logical_tokens(seq_lens: list[int]) -> float:
+    """HBM lower bound assuming one K-cache read per *logical* token only (optimistic)."""
     B = len(seq_lens)
     T = sum(seq_lens)
-    k_bytes   = T * _HDS
-    q_bytes   = B * _H * _D
-    w_bytes   = B * _H * 4
+    k_bytes = T * _HDS
+    q_bytes = B * _H * _D
+    w_bytes = B * _H * 4
     out_bytes = sum(min(_K_TOPK, sl) * 4 for sl in seq_lens)
-    total     = k_bytes + q_bytes + w_bytes + out_bytes
+    total = k_bytes + q_bytes + w_bytes + out_bytes
+    return total / (_B200_HBM_BW_TBS * 1e12) * 1e3
+
+
+def _roofline_ms_impl_staging(seq_lens: list[int]) -> float:
+    """HBM-centric bound closer to this implementation: padded gather + K f32 staging + logits.
+
+    Counts:
+      - K cache: B * S_pad * _HDS (Triton touches every padded slot, not only sum(seq_lens))
+      - K_batched f32: write + read for GEMM ≈ 2 * B * S_pad * _D * 4
+      - Q (fp32 for bmm): B * _H * _D * 4
+      - logits f32: B * _H * S_pad * 4 (bmm output; subsequent ops add more traffic)
+      - weights + topk output as in logical model
+    """
+    B = len(seq_lens)
+    if B == 0:
+        return 0.0
+    max_sl = max(seq_lens)
+    S_pad = _padded_s(max_sl)
+    q_bytes = B * _H * _D * 4
+    w_bytes = B * _H * 4
+    out_bytes = sum(min(_K_TOPK, sl) * 4 for sl in seq_lens)
+    k_cache_bytes = B * S_pad * _HDS
+    k_staging_bytes = 2 * B * S_pad * _D * 4
+    logits_bytes = B * _H * S_pad * 4
+    total = k_cache_bytes + k_staging_bytes + logits_bytes + q_bytes + w_bytes + out_bytes
     return total / (_B200_HBM_BW_TBS * 1e12) * 1e3
 
 
@@ -179,39 +205,59 @@ def print_results(results: dict):
             seq_lens = result.get("seq_lens", [])
 
             T = sum(seq_lens) if seq_lens else None
-            roofline = _roofline_ms(seq_lens) if seq_lens else None
-            pct_peak = (roofline / latency * 100) if (roofline and latency) else None
+            max_sl = max(seq_lens) if seq_lens else None
+            S_pad = _padded_s(max_sl) if max_sl is not None else None
+            rf_log = _roofline_ms_logical_tokens(seq_lens) if seq_lens else None
+            rf_impl = _roofline_ms_impl_staging(seq_lens) if seq_lens else None
+            pct_peak = (rf_impl / latency * 100) if (rf_impl and latency) else None
             # correctness match: fraction of topk indices in common with reference
             # abs_err=0 means exact match → 1.0; use directly
             match = (1.0 - abs_err) if abs_err is not None else None
 
-            rows.append((T, latency, speedup, match, roofline, pct_peak, status))
+            rows.append((T, S_pad, latency, speedup, match, rf_log, rf_impl, pct_peak, status))
 
         # Sort by T ascending
         rows.sort(key=lambda r: (r[0] is None, r[0]))
 
-        # Print table header (roofline in µs for readability)
-        print(f"  {'T':>8} | {'Lat(ms)':>7} | {'Spdup':>7} | {'Match':>6} | {'RF(µs)':>7} | {'%Peak':>5} | Status")
-        print(f"  {'-'*8}-+-{'-'*7}-+-{'-'*7}-+-{'-'*6}-+-{'-'*7}-+-{'-'*5}-+-{'-'*8}")
+        # RF_log = optimistic HBM (logical tokens only); RF_impl = padded gather + K f32 + logits
+        print(
+            f"  {'T':>8} | {'S_pad':>6} | {'Lat(ms)':>7} | {'Spdup':>7} | {'Match':>6} | "
+            f"{'RF_Lµs':>7} | {'RF_Iµs':>7} | {'%Pk_I':>6} | Status"
+        )
+        print(
+            f"  {'-'*8}-+-{'-'*6}-+-{'-'*7}-+-{'-'*7}-+-{'-'*6}-+-"
+            f"{'-'*7}-+-{'-'*7}-+-{'-'*6}-+-{'-'*8}"
+        )
 
         speedups = []
-        for T, latency, speedup, match, roofline, pct_peak, status in rows:
-            t_str   = f"{T:8d}"        if T        is not None else f"{'?':>8}"
-            lat_str = f"{latency:7.3f}" if latency  is not None else f"{'?':>7}"
-            sp_str  = f"{speedup:6.2f}x" if speedup is not None else f"{'?':>7}"
-            mt_str  = f"{match:6.4f}"  if match    is not None else f"{'?':>6}"
-            rf_us   = roofline * 1000  if roofline  is not None else None
-            rf_str  = f"{rf_us:7.3f}"  if rf_us    is not None else f"{'?':>7}"
-            pk_str  = f"{pct_peak:4.1f}%" if pct_peak is not None else f"{'?':>5}"
-            print(f"  {t_str} | {lat_str} | {sp_str} | {mt_str} | {rf_str} | {pk_str} | {status}")
+        for T, S_pad, latency, speedup, match, rf_log, rf_impl, pct_peak, status in rows:
+            t_str = f"{T:8d}" if T is not None else f"{'?':>8}"
+            s_str = f"{S_pad:6d}" if S_pad is not None else f"{'?':>6}"
+            lat_str = f"{latency:7.3f}" if latency is not None else f"{'?':>7}"
+            sp_str = f"{speedup:6.2f}x" if speedup is not None else f"{'?':>7}"
+            mt_str = f"{match:6.4f}" if match is not None else f"{'?':>6}"
+            rl_us = rf_log * 1000 if rf_log is not None else None
+            ri_us = rf_impl * 1000 if rf_impl is not None else None
+            rl_str = f"{rl_us:7.3f}" if rl_us is not None else f"{'?':>7}"
+            ri_str = f"{ri_us:7.3f}" if ri_us is not None else f"{'?':>7}"
+            pk_str = f"{pct_peak:5.1f}%" if pct_peak is not None else f"{'?':>6}"
+            print(
+                f"  {t_str} | {s_str} | {lat_str} | {sp_str} | {mt_str} | "
+                f"{rl_str} | {ri_str} | {pk_str} | {status}"
+            )
             if speedup is not None:
                 speedups.append(speedup)
 
         if speedups:
             geomean = math.exp(sum(math.log(s) for s in speedups) / len(speedups))
-            passed = sum(1 for _, _, _, _, _, _, st in rows if st == "PASSED")
+            passed = sum(1 for *_, st in rows if st == "PASSED")
             total = len(rows)
             print(f"\n  Geomean: {geomean:.2f}x ({passed}/{total} PASSED)")
+            print(
+                "\n  Roofline: RF_L = logical-token K reads only; RF_I = padded K-cache + "
+                "2×K_f32 staging + logits (closer to this kernel). Low %Pk_I ⇒ compute-bound "
+                "or unmodeled traffic (e.g. sort/topk, block_table, Python loop)."
+            )
 
 
 @app.local_entrypoint()
