@@ -35,8 +35,8 @@ trace_volume = modal.Volume.from_name("flashinfer-trace", create_if_missing=True
 TRACE_SET_PATH = "/data"
 
 image = (
-    modal.Image.debian_slim(python_version="3.12")
-    .pip_install("flashinfer-bench", "torch", "triton", "numpy")
+    modal.Image.from_registry("flashinfer/flashinfer-ci-cu132:latest", add_python="3.12")
+    .pip_install("flashinfer-bench")
 )
 
 
