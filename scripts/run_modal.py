@@ -55,8 +55,19 @@ image = (
 
 
 @app.function(image=image, gpu="B200:1", timeout=3600, volumes={TRACE_SET_PATH: trace_volume})
-def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
-    """Run benchmark on Modal B200 and return results."""
+def run_benchmark(
+    solution: Solution,
+    config: BenchmarkConfig | None = None,
+    max_workloads: int = 8,
+) -> dict:
+    """Run benchmark on Modal B200 and return results.
+
+    Parameters
+    ----------
+    max_workloads
+        If > 0, only the first *max_workloads* workloads are run (fast dev loop).
+        If <= 0, all workloads in the trace set are run (use before commits).
+    """
     _ensure_cuda_home_modal()
 
     if config is None:
@@ -72,6 +83,14 @@ def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
 
     if not workloads:
         raise ValueError(f"No workloads found for definition '{solution.definition}'")
+
+    total = len(workloads)
+    if max_workloads > 0:
+        workloads = workloads[:max_workloads]
+    print(
+        f"Benchmark subset: {len(workloads)} / {total} workloads "
+        f"(max_workloads={max_workloads}, use max_workloads<=0 for full suite)"
+    )
 
     bench_trace_set = TraceSet(
         root=trace_set.root,
@@ -109,6 +128,7 @@ def print_results(results: dict):
     """Print benchmark results in a formatted way."""
     for def_name, traces in results.items():
         print(f"\n{def_name}:")
+        speedups: list[float] = []
         for workload_uuid, result in traces.items():
             status = result.get("status")
             print(f"  Workload {workload_uuid[:8]}...: {status}", end="")
@@ -117,7 +137,9 @@ def print_results(results: dict):
                 print(f" | {result['latency_ms']:.3f} ms", end="")
 
             if result.get("speedup_factor") is not None:
-                print(f" | {result['speedup_factor']:.2f}x speedup", end="")
+                sp = result["speedup_factor"]
+                speedups.append(sp)
+                print(f" | {sp:.2f}x speedup", end="")
 
             if result.get("max_abs_error") is not None:
                 abs_err = result["max_abs_error"]
@@ -126,10 +148,23 @@ def print_results(results: dict):
 
             print()
 
+        if speedups:
+            mean_sp = sum(speedups) / len(speedups)
+            print(f"  --- mean speedup over {len(speedups)} workload(s): {mean_sp:.2f}x ---")
+
 
 @app.local_entrypoint()
-def main():
-    """Pack Python solution and run benchmark on Modal."""
+def main(max_workloads: int = 8):
+    """Pack Python solution and run benchmark on Modal.
+
+    Examples
+    --------
+    modal run scripts/run_modal.py
+        First 8 workloads only (default).
+
+    modal run scripts/run_modal.py --max-workloads 0
+        Full workload suite (~128); use before committing kernel changes.
+    """
     from scripts.python_solution_pack import build_python_solution
 
     print("Packing Python CuTe DSL solution...")
@@ -139,7 +174,7 @@ def main():
     print(f"Wrote {solution_path} ({solution.name}, {solution.definition})")
 
     print("\nRunning benchmark on Modal B200...")
-    results = run_benchmark.remote(solution)
+    results = run_benchmark.remote(solution, None, max_workloads)
 
     if not results:
         print("No results returned!")
