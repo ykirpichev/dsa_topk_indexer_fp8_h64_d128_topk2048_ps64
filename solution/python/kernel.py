@@ -11,9 +11,10 @@ Modal smoke with JIT on still shows **some** `INCORRECT_NUMERICAL` workloads (ra
 reference ordering); use for perf experiments only until fixed. Scale loads use
 `gmem_addr_f32` for 4-byte alignment; `torch.cuda.synchronize()` after CuTe launches.
 
-**Opt-in FP8 TMMA** (`DSA_FP8_TMMA_MM=1`): Blackwell `tcgen05` FP8 UMMA batched GEMM
-(`make_trivial_tiled_mma`), requires `S % 128` and a successful CuTe compile; still
-experimental (FlashAttention-style pipelines need TMA + warpgroup specialization).
+**Opt-in FP8 TMMA** (`DSA_FP8_TMMA_MM=1`): uses **`blackwell_fp8_batched_mm.py`**, patterned
+after NVIDIA CUTLASS Blackwell tutorials (`examples/python/CuTeDSL/blackwell/tutorial_gemm/`):
+`from_dlpack` + `cute.compile(..., --generate-line-info --enable-tvm-ffi)` + `tcgen05`
+`make_trivial_tiled_mma`. Requires `S % 128`; full tutorial GEMMs add TMA + pipelined smem.
 
 Dependencies: `nvidia-cutlass-dsl` (see `config.toml`). Set `CUTE_DSL_ARCH=sm_100a` when
 compiling tcgen05 kernels.
@@ -27,14 +28,17 @@ from typing import Callable
 
 import cutlass
 import cutlass.cute as cute
-import cutlass.cute.algorithm as cute_alg
 import torch
-from cutlass import Float32, Float8E4M3FN, Int32, Uint32, Uint8
+from cutlass import Float32, Int32, Uint32, Uint8
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import llvm
-from cutlass.cute.nvgpu.tcgen05 import CtaGroup, OperandMajorMode, OperandSource
-from cutlass.cute.runtime import from_dlpack
-from cutlass.utils.blackwell_helpers import make_trivial_tiled_mma
+
+try:
+    from .blackwell_fp8_batched_mm import fp8_batched_mm_hs as _fp8_batched_mm_hs
+    from .blackwell_fp8_batched_mm import _N_TILE as _N_TILE_FP8
+except ImportError:
+    from blackwell_fp8_batched_mm import fp8_batched_mm_hs as _fp8_batched_mm_hs
+    from blackwell_fp8_batched_mm import _N_TILE as _N_TILE_FP8
 
 try:
     import cutlass.cute.experimental as _cute_experimental  # noqa: F401
@@ -45,146 +49,6 @@ except NotImplementedError:
 _USE_CUTE_JIT = os.environ.get("DSA_CUTE_JIT", "").lower() in ("1", "true", "yes")
 # Blackwell FP8 TMMA matmul: set DSA_FP8_TMMA_MM=1 when the tcgen05 kernel compiles.
 _USE_FP8_TMMA_MM = os.environ.get("DSA_FP8_TMMA_MM", "").lower() in ("1", "true", "yes")
-
-_MM_FP8 = 64
-_K_FP8 = 128
-_N_TILE_FP8 = 128
-
-
-class _Fp8BatchedMmHsKernel:
-    """tcgen05 FP8 UMMA batched GEMM (optional path)."""
-
-    @cute.jit
-    def __call__(
-        self,
-        m_q: cute.Tensor,
-        m_k: cute.Tensor,
-        m_c: cute.Tensor,
-        B: Int32,
-        S: Int32,
-        stream,
-    ):
-        num_n_tiles = cute.ceil_div(S, Int32(_N_TILE_FP8))
-        self._device_kernel(m_q, m_k, m_c, B, S, num_n_tiles).launch(
-            grid=[B * num_n_tiles, 1, 1],
-            block=[128, 1, 1],
-            stream=stream,
-        )
-
-    @cute.kernel
-    def _device_kernel(
-        self,
-        m_q: cute.Tensor,
-        m_k: cute.Tensor,
-        m_c: cute.Tensor,
-        B: Int32,
-        S: Int32,
-        num_n_tiles: Int32,
-    ):
-        bidx, _, _ = cute.arch.block_idx()
-        tidx, _, _ = cute.arch.thread_idx()
-
-        bi = bidx // num_n_tiles
-        n_tile = bidx - bi * num_n_tiles
-
-        tiled_mma = make_trivial_tiled_mma(
-            Float8E4M3FN,
-            OperandMajorMode.K,
-            OperandMajorMode.K,
-            Float32,
-            CtaGroup.ONE,
-            (_MM_FP8, _N_TILE_FP8),
-            OperandSource.SMEM,
-        )
-        thr_mma = tiled_mma.get_slice(tidx)
-
-        gA = cute.local_tile(m_q, (_MM_FP8, _K_FP8), (bi, 0))
-        gB = cute.local_tile(m_k, (_N_TILE_FP8, _K_FP8), (bi, n_tile))
-        gC = cute.local_tile(m_c, (_MM_FP8, _N_TILE_FP8), (bi, n_tile))
-
-        tCgA = thr_mma.partition_A(gA)
-        tCgB = thr_mma.partition_B(gB)
-        tCgC = thr_mma.partition_C(gC)
-
-        tCrC = cute.zeros_like(tCgC, Float32)
-
-        tAgA = cute.local_tile(tCgA, (None, None, _K_FP8), (None, None, 0))
-        tBgB = cute.local_tile(tCgB, (None, None, _K_FP8), (None, None, 0))
-        tArA = cute.make_rmem_tensor_like(tAgA, Float8E4M3FN)
-        tBrB = cute.make_rmem_tensor_like(tBgB, Float8E4M3FN)
-        cute.autovec_copy(tAgA, tArA)
-        cute.autovec_copy(tBgB, tBrB)
-        cute_alg.gemm(tiled_mma, tCrC, tArA, tBrB, tCrC)
-
-        cute.autovec_copy(tCrC, tCgC)
-
-
-@functools.cache
-def _compiled_fp8_batched_mm() -> Callable:
-    os.environ.setdefault("CUTE_DSL_ARCH", "sm_100a")
-
-    sym_b = cute.sym_int()
-    sym_s = cute.sym_int()
-
-    kobj = _Fp8BatchedMmHsKernel()
-    m_q = cute.runtime.make_fake_compact_tensor(
-        Float8E4M3FN,
-        (sym_b, _MM_FP8, _K_FP8),
-        stride_order=(2, 1, 0),
-        assumed_align=16,
-    )
-    m_k = cute.runtime.make_fake_compact_tensor(
-        Float8E4M3FN,
-        (sym_b, sym_s, _K_FP8),
-        stride_order=(2, 1, 0),
-        assumed_align=16,
-    )
-    m_c = cute.runtime.make_fake_compact_tensor(
-        Float32,
-        (sym_b, _MM_FP8, sym_s),
-        stride_order=(2, 1, 0),
-        assumed_align=16,
-    )
-    stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
-
-    return cute.compile(
-        kobj,
-        m_q,
-        m_k,
-        m_c,
-        sym_b,
-        sym_s,
-        stream_fake,
-        options="--enable-tvm-ffi",
-    )
-
-
-def _quantize_rows_f32_to_fp8(x_f32: torch.Tensor) -> torch.Tensor:
-    e_max = float(torch.finfo(torch.float8_e4m3fn).max)
-    amax = x_f32.abs().amax(dim=-1, keepdim=True).clamp(min=1e-12)
-    scale = amax / e_max
-    return (x_f32 / scale).clamp(-e_max, e_max).to(torch.float8_e4m3fn)
-
-
-def _fp8_batched_mm_hs(q_f32: torch.Tensor, k_f32: torch.Tensor, c_out: torch.Tensor) -> None:
-    b, h, d = q_f32.shape
-    _, s, d2 = k_f32.shape
-    assert h == _MM_FP8 and d == _K_FP8 and d2 == _K_FP8
-    assert c_out.shape == (b, h, s)
-    assert s % _N_TILE_FP8 == 0
-
-    q_fp8 = _quantize_rows_f32_to_fp8(q_f32).contiguous()
-    k_fp8 = _quantize_rows_f32_to_fp8(k_f32).contiguous()
-
-    fn = _compiled_fp8_batched_mm()
-    m_q = from_dlpack(q_fp8, assumed_align=16)
-    m_q.element_type = Float8E4M3FN
-    m_k = from_dlpack(k_fp8, assumed_align=16)
-    m_k.element_type = Float8E4M3FN
-    m_c = from_dlpack(c_out, assumed_align=16)
-
-    fn(m_q, m_k, m_c, Int32(b), Int32(s))
-
 
 # --- PTX: global loads / FP8 decode -------------------------------------------------
 

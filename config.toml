@@ -7,7 +7,7 @@ author = "team-name"
 language = "triton"
 entry_point = "kernel.py::kernel"
 
-# CuTe / cutlass-dsl experiment lives in solution/python/ — use:
+# CuTe / cutlass-dsl (Blackwell tutorial_gemm-style FP8 helper: blackwell_fp8_batched_mm.py):
 #   language = "python"
 #   entry_point = "kernel.py::kernel"
 #   dependencies = ["nvidia-cutlass-dsl"]
