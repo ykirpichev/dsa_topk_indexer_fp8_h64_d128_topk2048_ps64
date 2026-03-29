@@ -46,6 +46,8 @@ def pack_solution(output_path: Path = None) -> Path:
         source_dir = PROJECT_ROOT / "solution" / "triton"
     elif language == "cuda":
         source_dir = PROJECT_ROOT / "solution" / "cuda"
+    elif language == "python":
+        source_dir = PROJECT_ROOT / "solution" / "python"
     else:
         raise ValueError(f"Unsupported language: {language}")
 
@@ -55,13 +57,20 @@ def pack_solution(output_path: Path = None) -> Path:
     # Create build spec
     dps = build_config.get("destination_passing_style", True)
     binding = build_config.get("binding", None)
-    spec = BuildSpec(
-        language=language,
-        target_hardware=["cuda"],
-        entry_point=entry_point,
-        destination_passing_style=dps,
-        **({} if binding is None else {"binding": binding}),
-    )
+    deps = build_config.get("dependencies", [])
+    if isinstance(deps, str):
+        deps = [deps]
+    spec_kw: dict = {
+        "language": language,
+        "target_hardware": ["cuda"],
+        "entry_point": entry_point,
+        "destination_passing_style": dps,
+    }
+    if binding is not None:
+        spec_kw["binding"] = binding
+    if deps:
+        spec_kw["dependencies"] = deps
+    spec = BuildSpec(**spec_kw)
 
     # Pack the solution
     solution = pack_solution_from_files(

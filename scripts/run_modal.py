@@ -44,7 +44,7 @@ _B200_HBM_BW_TBS = 8.0  # B200 HBM3e peak bandwidth (TB/s)
 
 image = (
     modal.Image.from_registry("flashinfer/flashinfer-ci-cu132:latest", add_python="3.12")
-    .pip_install("flashinfer-bench")
+    .pip_install("flashinfer-bench", "nvidia-cutlass-dsl==4.4.2")
 )
 
 
