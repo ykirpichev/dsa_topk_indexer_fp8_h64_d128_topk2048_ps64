@@ -4,12 +4,21 @@ FlashInfer-Bench Modal Cloud Benchmark Runner.
 Automatically packs the solution from source files and runs benchmarks
 on NVIDIA B200 GPUs via Modal.
 
+Smoke run (few workloads, shorter timing — still measures speedup vs reference)::
+
+    FIB_MODAL_SMOKE=1 modal run scripts/run_modal.py
+
+Cap workloads on a full-style benchmark (default timing config)::
+
+    FIB_MODAL_MAX_WORKLOADS=16 modal run scripts/run_modal.py
+
 Setup (one-time):
     modal setup
     modal volume create flashinfer-trace
     modal volume put flashinfer-trace /path/to/flashinfer-trace/
 """
 
+import os
 import sys
 from pathlib import Path
 
@@ -31,11 +40,25 @@ image = (
 )
 
 
-@app.function(image=image, gpu="B200:1", timeout=3600, volumes={TRACE_SET_PATH: trace_volume})
-def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
+@app.function(image=image, gpu="B200:1", timeout=7200, volumes={TRACE_SET_PATH: trace_volume})
+def run_benchmark(
+    solution: Solution, smoke: bool = False, max_workloads: int | None = None
+) -> dict:
     """Run benchmark on Modal B200 and return results."""
-    if config is None:
+    if smoke:
+        # Fewer workloads / trials than production, but profile_baseline=True is required
+        # for reference_latency_ms and speedup_factor.
+        config = BenchmarkConfig(
+            warmup_runs=2,
+            iterations=40,
+            num_trials=3,
+            timeout_seconds=1800,
+            profile_baseline=True,
+        )
+        workload_limit = 8
+    else:
         config = BenchmarkConfig(warmup_runs=3, iterations=100, num_trials=5)
+        workload_limit = None
 
     trace_set = TraceSet.from_path(TRACE_SET_PATH)
 
@@ -47,6 +70,11 @@ def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
 
     if not workloads:
         raise ValueError(f"No workloads found for definition '{solution.definition}'")
+
+    if smoke:
+        workloads = workloads[:workload_limit]
+    elif max_workloads is not None and max_workloads > 0:
+        workloads = workloads[:max_workloads]
 
     bench_trace_set = TraceSet(
         root=trace_set.root,
@@ -84,15 +112,21 @@ def print_results(results: dict):
     """Print benchmark results in a formatted way."""
     for def_name, traces in results.items():
         print(f"\n{def_name}:")
+        speedups: list[float] = []
         for workload_uuid, result in traces.items():
             status = result.get("status")
             print(f"  Workload {workload_uuid[:8]}...: {status}", end="")
 
             if result.get("latency_ms") is not None:
-                print(f" | {result['latency_ms']:.3f} ms", end="")
+                print(f" | sol {result['latency_ms']:.3f} ms", end="")
+
+            if result.get("reference_latency_ms") is not None:
+                print(f" | ref {result['reference_latency_ms']:.3f} ms", end="")
 
             if result.get("speedup_factor") is not None:
-                print(f" | {result['speedup_factor']:.2f}x speedup", end="")
+                sp = result["speedup_factor"]
+                speedups.append(sp)
+                print(f" | {sp:.2f}x speedup", end="")
 
             if result.get("max_abs_error") is not None:
                 abs_err = result["max_abs_error"]
@@ -101,10 +135,27 @@ def print_results(results: dict):
 
             print()
 
+        if speedups:
+            mean_sp = sum(speedups) / len(speedups)
+            print(
+                f"\n  --- Aggregate ({len(speedups)} workloads): "
+                f"mean speedup {mean_sp:.2f}x "
+                f"(min {min(speedups):.2f}x, max {max(speedups):.2f}x) ---"
+            )
+
 
 @app.local_entrypoint()
 def main():
     """Pack solution and run benchmark on Modal."""
+    smoke = os.environ.get("FIB_MODAL_SMOKE", "").lower() in ("1", "true", "yes")
+    cap_raw = os.environ.get("FIB_MODAL_MAX_WORKLOADS", "").strip()
+    max_workloads: int | None = None
+    if cap_raw:
+        try:
+            max_workloads = int(cap_raw)
+        except ValueError:
+            max_workloads = None
+
     from scripts.pack_solution import pack_solution
 
     print("Packing solution from source files...")
@@ -114,8 +165,13 @@ def main():
     solution = Solution.model_validate_json(solution_path.read_text())
     print(f"Loaded: {solution.name} ({solution.definition})")
 
-    print("\nRunning benchmark on Modal B200...")
-    results = run_benchmark.remote(solution)
+    if smoke:
+        print("\nRunning smoke benchmark on Modal B200 (8 workloads, timed vs reference)...")
+    elif max_workloads:
+        print(f"\nRunning benchmark on Modal B200 (first {max_workloads} workloads)...")
+    else:
+        print("\nRunning full benchmark on Modal B200...")
+    results = run_benchmark.remote(solution, smoke=smoke, max_workloads=max_workloads)
 
     if not results:
         print("No results returned!")
