@@ -12,6 +12,7 @@ This is a FlashInfer AI Kernel Generation Contest starter kit (MLSys 2026). Part
 |---------|--------------|-------|
 | `flashinfer-bench` Python API | `python3 -c "from flashinfer_bench import BuildSpec; print('OK')"` | Core dependency; installed via pip |
 | `flashinfer-bench` CLI | `flashinfer-bench --help` | Requires `~/.local/bin` on PATH |
+| `modal` CLI | `modal --version` | Requires `~/.local/bin` on PATH; needs `modal setup` for auth |
 | Solution packing | `python3 scripts/pack_solution.py` | Requires correct `entry_point` format in `config.toml` (see below) |
 
 ### Non-obvious Caveats
