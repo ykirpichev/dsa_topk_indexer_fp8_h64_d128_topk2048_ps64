@@ -8,6 +8,14 @@ Smoke run (few workloads, shorter timing — still measures speedup vs reference
 
     FIB_MODAL_SMOKE=1 modal run scripts/run_modal.py
 
+Append **random** extra workloads from the trace (only if the trace lists more than 8)::
+
+    FIB_MODAL_SMOKE=1 FIB_MODAL_SMOKE_EXTRA_N=5 FIB_MODAL_SMOKE_EXTRA_SEED=42 modal run scripts/run_modal.py
+
+Append workloads by **0-based index** into the definition list (for large local traces)::
+
+    FIB_MODAL_SMOKE=1 FIB_MODAL_SMOKE_EXTRA_INDICES=20,45,67,88,100 modal run scripts/run_modal.py
+
 Cap workloads on a full-style benchmark (default timing config)::
 
     FIB_MODAL_MAX_WORKLOADS=16 modal run scripts/run_modal.py
@@ -25,6 +33,7 @@ Setup (one-time):
 """
 
 import os
+import random
 import sys
 from pathlib import Path
 
@@ -150,7 +159,59 @@ def run_benchmark(
         raise ValueError(f"No workloads found for definition '{solution.definition}'")
 
     if smoke:
-        workloads = workloads[:workload_limit]
+        base_n = min(workload_limit, len(workloads))
+        smoke_list = list(workloads[:base_n])
+        seen_uuids = {t.workload.uuid for t in smoke_list}
+        extra_n_raw = os.environ.get("FIB_MODAL_SMOKE_EXTRA_N", "").strip()
+        if extra_n_raw:
+            try:
+                extra_n = max(0, int(extra_n_raw))
+            except ValueError:
+                extra_n = 0
+            if extra_n > 0:
+                seed_s = os.environ.get("FIB_MODAL_SMOKE_EXTRA_SEED", "42").strip()
+                try:
+                    seed = int(seed_s)
+                except ValueError:
+                    seed = 42
+                rng = random.Random(seed)
+                if len(workloads) > base_n:
+                    pool = workloads[base_n:]
+                    k = min(extra_n, len(pool))
+                    extra_idx = rng.sample(range(len(pool)), k=k) if k else []
+                    for i in sorted(extra_idx):
+                        tr = pool[i]
+                        uid = tr.workload.uuid
+                        if uid not in seen_uuids:
+                            seen_uuids.add(uid)
+                            smoke_list.append(tr)
+                elif len(workloads) > 0:
+                    candidates = [
+                        t for t in workloads if t.workload.uuid not in seen_uuids
+                    ]
+                    k = min(extra_n, len(candidates))
+                    if k:
+                        pick = rng.sample(candidates, k=k)
+                        for t in pick:
+                            seen_uuids.add(t.workload.uuid)
+                            smoke_list.append(t)
+        idx_raw = os.environ.get("FIB_MODAL_SMOKE_EXTRA_INDICES", "").strip()
+        if idx_raw:
+            for part in idx_raw.split(","):
+                part = part.strip()
+                if not part:
+                    continue
+                try:
+                    wi = int(part)
+                except ValueError:
+                    continue
+                if 0 <= wi < len(workloads):
+                    tr = workloads[wi]
+                    uid = tr.workload.uuid
+                    if uid not in seen_uuids:
+                        seen_uuids.add(uid)
+                        smoke_list.append(tr)
+        workloads = smoke_list
     elif max_workloads is not None and max_workloads > 0:
         workloads = workloads[:max_workloads]
 
@@ -298,7 +359,18 @@ def main():
     print(f"Loaded: {solution.name} ({solution.definition})")
 
     if smoke:
-        print("\nRunning smoke benchmark on Modal B200 (8 workloads, timed vs reference)...")
+        n_wl = None
+        try:
+            ts = TraceSet.from_path(TRACE_SET_PATH)
+            n_wl = len(ts.workloads.get(solution.definition, []))
+        except Exception:
+            pass
+        extra = os.environ.get("FIB_MODAL_SMOKE_EXTRA_N", "").strip()
+        extra_s = f", +{extra} random extra" if extra else ""
+        nw = f", trace has {n_wl} workloads" if n_wl is not None else ""
+        print(
+            f"\nRunning smoke benchmark on Modal B200 (timed vs reference{extra_s}{nw})..."
+        )
     elif max_workloads:
         print(f"\nRunning benchmark on Modal B200 (first {max_workloads} workloads)...")
     else:

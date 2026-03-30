@@ -101,18 +101,16 @@ def kernel(
         q = q_index_fp8.to(torch.float32)
         logits = torch.bmm(q, k_b.transpose(1, 2).contiguous())
 
-    col = torch.arange(s_pad, device=dev, dtype=torch.int64).view(1, s_pad)
-    sl_t = seq_lens.to(dev).to(torch.int64).view(b, 1)
-    valid = col < sl_t
-    w = logits.relu() * weights.unsqueeze(2)
-    scores = (w * valid.unsqueeze(1).to(w.dtype)).sum(dim=1).masked_fill(~valid, float("-inf"))
+    # Match Triton reference: sum only over heads on logits[:, :, :sl] (ignore padded tokens).
+    weighted = logits.relu() * weights.unsqueeze(2).contiguous()
 
     for bi in range(b):
         sl_i = sl[bi]
         if sl_i == 0:
             continue
         tk = min(k_topk, sl_i)
-        _, idx = scores[bi, :].topk(tk, dim=-1, largest=True, sorted=True)
+        scores_bi = weighted[bi, :, :sl_i].sum(dim=0)
+        _, idx = scores_bi.topk(tk, dim=-1, largest=True, sorted=True)
         loc = idx.to(torch.int32).contiguous()
         _local_tokens_to_global(topk_indices[bi], loc, bt[bi], tk, ps)
 
