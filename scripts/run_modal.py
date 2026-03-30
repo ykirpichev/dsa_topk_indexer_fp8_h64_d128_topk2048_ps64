@@ -12,6 +12,14 @@ Cap workloads on a full-style benchmark (default timing config)::
 
     FIB_MODAL_MAX_WORKLOADS=16 modal run scripts/run_modal.py
 
+Full suite (all workloads in the trace volume; no smoke, no cap)::
+
+    modal run scripts/run_modal.py
+
+Optional: raise per-workload solver timeout or Modal function timeout (seconds)::
+
+    FIB_MODAL_WORKLOAD_TIMEOUT_SEC=3600 FIB_MODAL_FN_TIMEOUT_SEC=28800 modal run scripts/run_modal.py
+
 Setup (one-time):
     modal setup
     modal volume create flashinfer-trace
@@ -28,6 +36,9 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 import modal
 from flashinfer_bench import Benchmark, BenchmarkConfig, Solution, TraceSet
+
+# Modal container wall clock; full 128-workload runs can exceed 2h.
+_MODAL_FN_TIMEOUT = int(os.environ.get("FIB_MODAL_FN_TIMEOUT_SEC", "28800"))
 
 app = modal.App("flashinfer-bench")
 
@@ -81,7 +92,7 @@ def _roofline_ms(seq_lens: list[int]) -> float:
     return total / (_B200_HBM_BW_TBS * 1e12) * 1e3
 
 
-@app.function(image=image, gpu="B200:1", timeout=7200, volumes={TRACE_SET_PATH: trace_volume})
+@app.function(image=image, gpu="B200:1", timeout=_MODAL_FN_TIMEOUT, volumes={TRACE_SET_PATH: trace_volume})
 def run_benchmark(
     solution: Solution, smoke: bool = False, max_workloads: int | None = None
 ) -> dict:
@@ -98,7 +109,13 @@ def run_benchmark(
         )
         workload_limit = 17
     else:
-        config = BenchmarkConfig(warmup_runs=3, iterations=100, num_trials=5)
+        wl_to = int(os.environ.get("FIB_MODAL_WORKLOAD_TIMEOUT_SEC", "1800"))
+        config = BenchmarkConfig(
+            warmup_runs=3,
+            iterations=100,
+            num_trials=5,
+            timeout_seconds=max(300, wl_to),
+        )
         workload_limit = None
 
     trace_set = TraceSet.from_path(TRACE_SET_PATH)
