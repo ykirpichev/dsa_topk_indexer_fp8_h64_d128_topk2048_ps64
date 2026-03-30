@@ -7,5 +7,5 @@ author = "team-name"
 language = "triton"
 entry_point = "kernel.py::kernel"
 
-# FP8 TMMA path (Modal: FIB_MODAL_DSA_FP8_TMMA_MM=1): language = "python",
-# entry_point = "kernel.py::kernel", dependencies = ["nvidia-cutlass-dsl", "triton"]
+# Python FP8: language = "python", entry_point = "kernel.py::kernel",
+# dependencies = ["nvidia-cutlass-dsl", "triton"]

@@ -12,10 +12,11 @@ Cap workloads on a full-style benchmark (default timing config)::
 
     FIB_MODAL_MAX_WORKLOADS=16 modal run scripts/run_modal.py
 
-Python FP8 path (``DSA_FP8_TMMA_MM=1``): Triton FP8 gather + CuTe FP8 UMMA + Triton fused
-``logits *= k_scale``::
+Python FP8 path: ``FIB_MODAL_DSA_FP8_TMMA_MM=1`` → ``DSA_FP8_TMMA_MM``; optional
+``FIB_MODAL_DSA_FP8_MXF8_MM=1`` → **MXF8** ``MmaMXF8Op`` (tcgen05 block-scaled FP8)::
 
     FIB_MODAL_DSA_FP8_TMMA_MM=1 modal run scripts/run_modal.py
+    FIB_MODAL_DSA_FP8_TMMA_MM=1 FIB_MODAL_DSA_FP8_MXF8_MM=1 modal run scripts/run_modal.py
 
 Setup (one-time):
     modal setup
@@ -119,6 +120,9 @@ def run_benchmark(
     """Run benchmark on Modal B200 and return results."""
     if os.environ.get("FIB_MODAL_DSA_FP8_TMMA_MM", "").lower() in ("1", "true", "yes"):
         os.environ["DSA_FP8_TMMA_MM"] = "1"
+    if os.environ.get("FIB_MODAL_DSA_FP8_MXF8_MM", "").lower() in ("1", "true", "yes"):
+        os.environ["DSA_FP8_TMMA_MM"] = "1"
+        os.environ["DSA_FP8_MXF8_MM"] = "1"
     if smoke:
         # Fewer workloads / trials than production, but profile_baseline=True is required
         # for reference_latency_ms and speedup_factor.
