@@ -3,30 +3,24 @@
  *
  * Pipeline:
  *   1. Fused FP8 page gather + dequant  (custom CUDA kernel)
- *   2. Batched GEMM: q @ K^T            (torch::bmm, float32)
- *   3. ATen relu + weighted sum         (bit-exact)
- *   4. torch::topk                      (bit-exact)
- *   5. page_transform kernel            (local → global)
+ *   2. Batched GEMM: q @ K^T            (torch::bmm, float32) → logits [B,H,S]
+ *   3. Per batch row: scores = (logits[b, :, 0:sl].relu() * weights[b].unsqueeze(1)).sum(0)
+ *      — same reduction as the old full [B,H,S] weighted tensor, but peak memory is
+ *      O(H*sl) per batch instead of O(B*H*S). torch::topk unchanged.
+ *   4. page_transform kernel            (local → global)
  *
- * NaN handling: FP8 E4M3 NaN bytes propagate as float NaN through K_batched
- * → logit NaN → relu(NaN) = 0 (CUDA fmaxf(0, NaN) = 0).  Matches reference.
+ * NaN: PyTorch relu on logits (same as reference).
  */
 
 #include <torch/extension.h>
 #include <c10/cuda/CUDAStream.h>
 #include <cuda_fp8.h>
+#include <cuda_runtime.h>
 #include <algorithm>
 #include <vector>
 
 // ============================================================================
 // Kernel: fused page gather + FP8 dequant + scale → K_batched [B, S, D] f32
-//
-// Cache layout per page (PS*HDS bytes total):
-//   [PS * D  fp8 bytes]  K[t, d] at offset t*D + d within page
-//   [PS * 4  float bytes] scale[t] at offset PS*D + t*4 within page
-//
-// Block:  D threads (one per dimension)
-// Grid:   B*S blocks (one per token)
 // ============================================================================
 __global__ void gather_dequant_kernel(
         const uint8_t* __restrict__ cache,
@@ -52,7 +46,6 @@ __global__ void gather_dequant_kernel(
     *reinterpret_cast<uint8_t*>(&fp8_val) = fp8_u8;
     const float scale = *reinterpret_cast<const float*>(cache + scale_byte);
 
-    // NaN FP8 → float NaN → NaN * scale = NaN → relu(NaN) = 0 later.
     K_batched[token_idx * D + d] = static_cast<float>(fp8_val) * scale;
 }
 
@@ -117,9 +110,6 @@ void run(
     int32_t*     out_ptr = topk_indices.data_ptr<int32_t>();
     cudaStream_t stream  = at::cuda::getCurrentCUDAStream();
 
-    // -------------------------------------------------------------------------
-    // Phase 1 — fused gather + FP8 dequant + scale → K_batched [B, S, D]
-    // -------------------------------------------------------------------------
     const int num_tokens = B * S;
     torch::Tensor K_batched = torch::empty({B, S, D},
             q_index_fp8.options().dtype(torch::kFloat32));
@@ -130,31 +120,24 @@ void run(
             K_batched.data_ptr<float>(),
             B, S, D, P, PS, HDS, actual_pages);
 
-    // -------------------------------------------------------------------------
-    // Phase 2 — batched GEMM: logits [B, H, S] = q @ K^T
-    // -------------------------------------------------------------------------
-    auto q_float = q_index_fp8.to(torch::kFloat32);  // [B, H, D]
-    auto logits  = torch::bmm(q_float, K_batched.transpose(1, 2));  // [B, H, S]
+    auto q_float = q_index_fp8.to(torch::kFloat32);
+    auto logits  = torch::bmm(q_float, K_batched.transpose(1, 2)).contiguous();
 
-    // -------------------------------------------------------------------------
-    // Phase 3 — relu + weighted sum → scores [B, S]
-    // Phase 4 — topk
-    // Phase 5 — page-table transform → global token indices
-    // -------------------------------------------------------------------------
     constexpr int BLOCK_T = 256;
-    auto weighted = logits.relu() * weights.contiguous().unsqueeze(2);  // [B, H, S]
 
     for (int b = 0; b < B; ++b) {
         const int sl = sl_vec[b];
         if (sl == 0) continue;
         const int actual_topk = std::min(K_topk, sl);
 
-        auto scores   = weighted[b].narrow(1, 0, sl).sum(0);
+        auto row_logits = logits[b].narrow(1, 0, sl);
+        auto row_w = weights[b].unsqueeze(1);
+        auto scores = (row_logits.relu() * row_w).sum(0);
         auto topk_out = scores.topk(actual_topk, -1, true, true);
         auto topk_idxs = std::get<1>(topk_out).to(torch::kInt32).contiguous();
 
         int grid_t = (actual_topk + BLOCK_T - 1) / BLOCK_T;
-        page_transform_kernel<<<grid_t, BLOCK_T, 0, at::cuda::getCurrentCUDAStream()>>>(
+        page_transform_kernel<<<grid_t, BLOCK_T, 0, stream>>>(
                 topk_idxs.data_ptr<int32_t>(),
                 bt_ptr + (long long)b * actual_pages,
                 out_ptr + (long long)b * K_topk,
@@ -165,7 +148,7 @@ void run(
 // ============================================================================
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("run", &run,
-          "DSA TopK Indexer: fused FP8-gather + bmm + relu/weighted-sum + topK + page-table transform",
+          "DSA TopK Indexer: fused FP8-gather + bmm + batched row scores + topk + page transform",
           py::arg("q_index_fp8"), py::arg("k_index_cache_fp8"), py::arg("weights"),
           py::arg("seq_lens"),    py::arg("block_table"),       py::arg("topk_indices"));
 }
