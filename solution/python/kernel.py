@@ -14,7 +14,12 @@ reference ordering); use for perf experiments only until fixed. Scale loads use
 **Opt-in FP8 TMMA** (`DSA_FP8_TMMA_MM=1`): uses **`blackwell_fp8_batched_mm.py`**, patterned
 after NVIDIA CUTLASS Blackwell tutorials (`examples/python/CuTeDSL/blackwell/tutorial_gemm/`):
 `from_dlpack` + `cute.compile(..., --generate-line-info --enable-tvm-ffi)` + `tcgen05`
-`make_trivial_tiled_mma`. Requires `S % 128`; full tutorial GEMMs add TMA + pipelined smem.
+`make_trivial_tiled_mma`. Requires `S % 128`.
+
+**CuTe experimental TMA** (`DSA_FP8_TMMA_MM_EXT=1`, also set `DSA_FP8_TMMA_MM=1`): same FP8
+GEMM but host/device use `cutlass.cute.experimental` (`tma_load`, `get_cta_v_map_ab`) with
+TMA + SMEM pipeline + TMEM accumulator (see CUTLASS `dense_gemm_cute_pipeline.py`). Requires
+CUDA toolkit 13.1+ where `import cutlass.cute.experimental` succeeds.
 
 Dependencies: `nvidia-cutlass-dsl` (see `config.toml`). Set `CUTE_DSL_ARCH=sm_100a` when
 compiling tcgen05 kernels.
