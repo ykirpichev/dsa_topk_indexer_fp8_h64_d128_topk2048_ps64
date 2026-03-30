@@ -6,7 +6,7 @@
  *   2. Batched GEMM: q @ K^T            (torch::bmm, float32)
  *   3. ATen relu + weighted sum         (bit-exact)
  *   4. torch::topk                      (bit-exact)
- *   5. page_transform kernel            (local → global)
+ *   5. Batched page_transform after all topk (one launch; block per batch row)
  *
  * NaN handling: FP8 E4M3 NaN bytes propagate as float NaN through K_batched
  * → logit NaN → relu(NaN) = 0 (CUDA fmaxf(0, NaN) = 0).  Matches reference.
@@ -16,6 +16,7 @@
 #include <c10/cuda/CUDAStream.h>
 #include <cuda_fp8.h>
 #include <algorithm>
+#include <cstring>
 #include <vector>
 
 // ============================================================================
@@ -57,18 +58,30 @@ __global__ void gather_dequant_kernel(
 }
 
 // ============================================================================
-// Kernel: page-table transform local → global token indices
+// Batched page-table transform: one block per batch row b.
+// local_packed[b * K_topk + i] = local index; counts[b] = valid i in [0, counts[b])
 // ============================================================================
-__global__ void page_transform_kernel(
-        const int* __restrict__ local_indices,
-        const int* __restrict__ block_table_b,
-        int*       __restrict__ out,
-        int actual_topk, int PS)
+__global__ void page_transform_batched_kernel(
+        const int32_t* __restrict__ local_packed,
+        const int32_t* __restrict__ block_table,
+        int32_t*       __restrict__ out_packed,
+        const int32_t* __restrict__ counts,
+        int actual_pages,
+        int K_topk,
+        int PS)
 {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= actual_topk) return;
-    int local = local_indices[i];
-    out[i] = block_table_b[local / PS] * PS + (local % PS);
+    const int b = blockIdx.x;
+    const int k = counts[b];
+    if (k <= 0) return;
+
+    const int32_t* loc = local_packed + (long long)b * K_topk;
+    const int32_t* bt  = block_table + (long long)b * actual_pages;
+    int32_t* o = out_packed + (long long)b * K_topk;
+
+    for (int i = threadIdx.x; i < k; i += blockDim.x) {
+        int local = loc[i];
+        o[i] = bt[local / PS] * PS + (local % PS);
+    }
 }
 
 // ============================================================================
@@ -144,6 +157,12 @@ void run(
     constexpr int BLOCK_T = 256;
     auto weighted = logits.relu() * weights.contiguous().unsqueeze(2);  // [B, H, S]
 
+    auto opts_i32 = torch::TensorOptions()
+            .dtype(torch::kInt32)
+            .device(q_index_fp8.device());
+    torch::Tensor local_packed = torch::empty({B, K_topk}, opts_i32);
+    std::vector<int32_t> counts_host((size_t)B, 0);
+
     for (int b = 0; b < B; ++b) {
         const int sl = sl_vec[b];
         if (sl == 0) continue;
@@ -153,19 +172,31 @@ void run(
         auto topk_out = scores.topk(actual_topk, -1, true, true);
         auto topk_idxs = std::get<1>(topk_out).to(torch::kInt32).contiguous();
 
-        int grid_t = (actual_topk + BLOCK_T - 1) / BLOCK_T;
-        page_transform_kernel<<<grid_t, BLOCK_T, 0, at::cuda::getCurrentCUDAStream()>>>(
-                topk_idxs.data_ptr<int32_t>(),
-                bt_ptr + (long long)b * actual_pages,
-                out_ptr + (long long)b * K_topk,
-                actual_topk, PS);
+        local_packed.select(0, b).narrow(0, 0, actual_topk).copy_(topk_idxs);
+        counts_host[(size_t)b] = (int32_t)actual_topk;
     }
+
+    torch::Tensor counts_cpu = torch::empty({B}, torch::TensorOptions().dtype(torch::kInt32));
+    std::memcpy(
+            counts_cpu.data_ptr<int32_t>(),
+            counts_host.data(),
+            (size_t)B * sizeof(int32_t));
+    torch::Tensor counts_dev = counts_cpu.to(q_index_fp8.device());
+
+    page_transform_batched_kernel<<<B, BLOCK_T, 0, stream>>>(
+            local_packed.data_ptr<int32_t>(),
+            bt_i32.data_ptr<int32_t>(),
+            out_ptr,
+            counts_dev.data_ptr<int32_t>(),
+            actual_pages,
+            K_topk,
+            PS);
 }
 
 // ============================================================================
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("run", &run,
-          "DSA TopK Indexer: fused FP8-gather + bmm + relu/weighted-sum + topK + page-table transform",
+          "DSA TopK Indexer: fused FP8-gather + bmm + relu/weighted-sum + topK + batched page-table transform",
           py::arg("q_index_fp8"), py::arg("k_index_cache_fp8"), py::arg("weights"),
           py::arg("seq_lens"),    py::arg("block_table"),       py::arg("topk_indices"));
 }
