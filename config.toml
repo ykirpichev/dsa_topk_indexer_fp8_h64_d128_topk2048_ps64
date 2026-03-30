@@ -7,7 +7,5 @@ author = "team-name"
 language = "triton"
 entry_point = "kernel.py::kernel"
 
-# CuTe / cutlass-dsl (Blackwell tutorial_gemm-style FP8 helper: blackwell_fp8_batched_mm.py):
-#   language = "python"
-#   entry_point = "kernel.py::kernel"
-#   dependencies = ["nvidia-cutlass-dsl"]
+# Python / B200 FP8 UMMA (blackwell_fp8_batched_mm.py): set language = "python",
+# entry_point = "kernel.py::kernel", dependencies = ["nvidia-cutlass-dsl"]
