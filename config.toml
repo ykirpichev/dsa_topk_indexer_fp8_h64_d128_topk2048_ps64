@@ -7,5 +7,7 @@ author = "team-name"
 language = "triton"
 entry_point = "kernel.py::kernel"
 
-# Python / B200 FP8 UMMA (blackwell_fp8_batched_mm.py): set language = "python",
-# entry_point = "kernel.py::kernel", dependencies = ["nvidia-cutlass-dsl"]
+# Python (Modal measured ~1.22× vs ref; optional FP8 TMMA can fail strict top-k match):
+#   language = "python"
+#   entry_point = "kernel.py::kernel"
+#   dependencies = ["nvidia-cutlass-dsl"]
