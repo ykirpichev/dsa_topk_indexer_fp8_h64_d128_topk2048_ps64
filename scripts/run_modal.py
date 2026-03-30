@@ -4,7 +4,7 @@ FlashInfer-Bench Modal Cloud Benchmark Runner.
 Automatically packs the solution from source files and runs benchmarks
 on NVIDIA B200 GPUs via Modal.
 
-Smoke run (few workloads, shorter timing — still measures speedup vs reference)::
+Smoke run (first 17 workloads, shorter timing — still measures speedup vs reference)::
 
     FIB_MODAL_SMOKE=1 modal run scripts/run_modal.py
 
@@ -96,7 +96,7 @@ def run_benchmark(
             timeout_seconds=1800,
             profile_baseline=True,
         )
-        workload_limit = 8
+        workload_limit = 17
     else:
         config = BenchmarkConfig(warmup_runs=3, iterations=100, num_trials=5)
         workload_limit = None
@@ -236,7 +236,7 @@ def main():
     print(f"Loaded: {solution.name} ({solution.definition})")
 
     if smoke:
-        print("\nRunning smoke benchmark on Modal B200 (8 workloads, timed vs reference)...")
+        print("\nRunning smoke benchmark on Modal B200 (17 workloads, timed vs reference)...")
     elif max_workloads:
         print(f"\nRunning benchmark on Modal B200 (first {max_workloads} workloads)...")
     else:
