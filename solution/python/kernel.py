@@ -1,8 +1,10 @@
 """
-B200 Python entry: PyTorch paged FP8 dequant + gather, ``torch.bmm`` or optional FP8 UMMA
-(``DSA_FP8_TMMA_MM=1``, ``blackwell_fp8_batched_mm``). Definition: H=64, D=128, PS=64.
+B200 Python: Triton FP8 paged gather + optional CuTe TMA+FP8 UMMA matmul + FP32 K scales after multiply.
 
-Requires ``nvidia-cutlass-dsl`` when using FP8 TMMA. Validate on Modal: ``modal run scripts/run_modal.py``.
+When ``DSA_FP8_TMMA_MM=1``: logits_fp8 = Q_fp8 @ K_fp8^T (FP8 MMA, FP32 acc), then
+``logits = logits_fp8 * k_scale`` (per-token K scale from cache). Else ``torch.bmm`` on f32 K.
+
+``blackwell_fp8_batched_mm``: TMA loads + tcgen05 FP8 MMA + TMEM → FP32 GMEM (no per-row re-quant).
 """
 
 from __future__ import annotations
@@ -14,9 +16,11 @@ import torch
 try:
     from .blackwell_fp8_batched_mm import fp8_batched_mm_hs as _fp8_mm
     from .blackwell_fp8_batched_mm import _N_TILE as _N_TILE_FP8
+    from .triton_gather_fp8 import gather_k_fp8_scaled as _gather_k_fp8
 except ImportError:
     from blackwell_fp8_batched_mm import fp8_batched_mm_hs as _fp8_mm
     from blackwell_fp8_batched_mm import _N_TILE as _N_TILE_FP8
+    from triton_gather_fp8 import gather_k_fp8_scaled as _gather_k_fp8
 
 _USE_FP8_TMMA = os.environ.get("DSA_FP8_TMMA_MM", "").lower() in ("1", "true", "yes")
 
@@ -28,7 +32,7 @@ def _pages_fp32(cache_u8: torch.Tensor, p: int, ps: int, d: int, hds: int) -> to
     return fp8 * sc
 
 
-def _gather_k(
+def _gather_k_f32(
     cache_u8: torch.Tensor,
     bt_i32: torch.Tensor,
     b: int,
@@ -74,7 +78,7 @@ def kernel(
         k_index_cache_fp8
         if k_index_cache_fp8.dtype == torch.uint8
         else k_index_cache_fp8.view(torch.uint8)
-    )
+    ).contiguous()
 
     sl = [int(x) for x in seq_lens.cpu()]
     if not sl or max(sl) == 0:
@@ -85,14 +89,17 @@ def kernel(
     bt = block_table[:, :ap].to(torch.int32).clamp(0, p - 1).contiguous()
     dev = q_index_fp8.device
 
-    k_b = torch.empty((b, s_pad, d), device=dev, dtype=torch.float32)
-    k_b.copy_(_gather_k(cache_u8, bt, b, s_pad, d, p, ps, hds))
-
-    q = q_index_fp8.to(torch.float32)
     if _USE_FP8_TMMA and s_pad % _N_TILE_FP8 == 0:
+        k_u8, k_scale = _gather_k_fp8(cache_u8, bt, b, s_pad, p, ps, hds)
+        k_fp8 = k_u8.view(torch.float8_e4m3fn)
+        q_fp8 = q_index_fp8.view(torch.float8_e4m3fn) if q_index_fp8.dtype != torch.float8_e4m3fn else q_index_fp8
         logits = torch.empty((b, n_heads, s_pad), device=dev, dtype=torch.float32)
-        _fp8_mm(q, k_b, logits)
+        _fp8_mm(q_fp8.contiguous(), k_fp8.contiguous(), logits)
+        logits.mul_(k_scale.unsqueeze(1))
     else:
+        k_b = torch.empty((b, s_pad, d), device=dev, dtype=torch.float32)
+        k_b.copy_(_gather_k_f32(cache_u8, bt, b, s_pad, d, p, ps, hds))
+        q = q_index_fp8.to(torch.float32)
         logits = torch.bmm(q, k_b.transpose(1, 2).contiguous())
 
     col = torch.arange(s_pad, device=dev, dtype=torch.int64).view(1, s_pad)

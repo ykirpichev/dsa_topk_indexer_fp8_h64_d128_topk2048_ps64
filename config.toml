@@ -7,7 +7,7 @@ author = "team-name"
 language = "triton"
 entry_point = "kernel.py::kernel"
 
-# Python (Modal measured ~1.22× vs ref; optional FP8 TMMA can fail strict top-k match):
+# Python + FP8 UMMA + Triton FP8 gather (Modal: FIB_MODAL_DSA_FP8_TMMA_MM=1):
 #   language = "python"
 #   entry_point = "kernel.py::kernel"
-#   dependencies = ["nvidia-cutlass-dsl"]
+#   dependencies = ["nvidia-cutlass-dsl", "triton"]

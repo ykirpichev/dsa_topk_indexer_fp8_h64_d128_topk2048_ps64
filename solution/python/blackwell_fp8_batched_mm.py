@@ -1,4 +1,7 @@
-"""B200-only batched FP8 GEMM: tcgen05 UMMA (H=64, D=128, N-tile 128). Competition S is always a multiple of 128."""
+"""B200 batched FP8 GEMM: tcgen05 FP8 UMMA, FP32 accumulator/output (GMEM→RMEM operands).
+
+TMA-pipelined variant (tutorial ``fp16_gemm_0`` style) did not compile on cutlass-dsl 4.4.2 for
+this MNK tile on Modal; bulk GMEM loads still feed SMEM-backed UMMA efficiently on Blackwell."""
 
 from __future__ import annotations
 
@@ -20,8 +23,6 @@ _COMPILE_OPTS = "--generate-line-info --enable-tvm-ffi"
 
 
 class Fp8BatchedMmHsKernel:
-    """One CTA per (batch, N-tile); GMEM → registers → SMEM-backed FP8 UMMA, FP32 out."""
-
     @cute.jit
     def __call__(
         self,
@@ -88,7 +89,7 @@ def _compiled() -> Callable:
         Float8E4M3FN, (sb, _MM, _K), stride_order=(2, 1, 0), assumed_align=16
     )
     m_k = cute.runtime.make_fake_compact_tensor(
-        Float8E4M3FN, (ss, sb, _K), stride_order=(2, 1, 0), assumed_align=16
+        Float8E4M3FN, (sb, ss, _K), stride_order=(2, 1, 0), assumed_align=16
     )
     m_c = cute.runtime.make_fake_compact_tensor(
         Float32, (sb, _MM, ss), stride_order=(2, 1, 0), assumed_align=16
@@ -97,20 +98,13 @@ def _compiled() -> Callable:
     return cute.compile(k, m_q, m_k, m_c, sb, ss, st, options=_COMPILE_OPTS)
 
 
-def _quantize_rows_fp8(x: torch.Tensor) -> torch.Tensor:
-    mx = float(torch.finfo(torch.float8_e4m3fn).max)
-    amax = x.abs().amax(dim=-1, keepdim=True).clamp(min=1e-12)
-    return (x / (amax / mx)).clamp(-mx, mx).to(torch.float8_e4m3fn)
-
-
-def fp8_batched_mm_hs(q_f32: torch.Tensor, k_f32: torch.Tensor, c_out: torch.Tensor) -> None:
-    """c_out[b,h,s] = sum_d q[b,h,d] * k[b,s,d]. Shapes fixed: H=64, D=128, S % 128 == 0."""
-    b, h, d = q_f32.shape
-    _, s, d2 = k_f32.shape
+def fp8_batched_mm_hs(q_fp8: torch.Tensor, k_fp8: torch.Tensor, c_out: torch.Tensor) -> None:
+    b, h, d = q_fp8.shape
+    _, s, d2 = k_fp8.shape
     assert h == _MM and d == _K and d2 == _K and c_out.shape == (b, h, s) and s % _N_TILE == 0
 
-    q8 = _quantize_rows_fp8(q_f32).contiguous()
-    k8 = _quantize_rows_fp8(k_f32).contiguous()
+    q8 = q_fp8.contiguous()
+    k8 = k_fp8.contiguous()
     fn = _compiled()
     mq = from_dlpack(q8, assumed_align=16, enable_tvm_ffi=True)
     mq.element_type = Float8E4M3FN
