@@ -6,7 +6,7 @@
  *   2. Batched GEMM: q @ K^T            (torch::bmm, float32)
  *   3. ATen relu + weighted sum         (bit-exact)
  *   4. torch::topk                      (bit-exact)
- *   5. Batched page_transform after all topk (one launch; block per batch row)
+ *   5. Batched page_transform: int64 top-k indices + device seq_lens → global int32
  *
  * NaN handling: FP8 E4M3 NaN bytes propagate as float NaN through K_batched
  * → logit NaN → relu(NaN) = 0 (CUDA fmaxf(0, NaN) = 0).  Matches reference.
@@ -16,7 +16,6 @@
 #include <c10/cuda/CUDAStream.h>
 #include <cuda_fp8.h>
 #include <algorithm>
-#include <cstring>
 #include <vector>
 
 // ============================================================================
@@ -59,27 +58,29 @@ __global__ void gather_dequant_kernel(
 
 // ============================================================================
 // Batched page-table transform: one block per batch row b.
-// local_packed[b * K_topk + i] = local index; counts[b] = valid i in [0, counts[b])
+// local_long[b * K_topk + i] = top-k local indices (int64 from at::topk_out);
+// k = min(K_topk, seq_lens[b])
 // ============================================================================
 __global__ void page_transform_batched_kernel(
-        const int32_t* __restrict__ local_packed,
+        const int64_t* __restrict__ local_long,
+        const int32_t* __restrict__ seq_lens,
         const int32_t* __restrict__ block_table,
         int32_t*       __restrict__ out_packed,
-        const int32_t* __restrict__ counts,
         int actual_pages,
         int K_topk,
         int PS)
 {
     const int b = blockIdx.x;
-    const int k = counts[b];
-    if (k <= 0) return;
+    const int sl = seq_lens[b];
+    if (sl <= 0) return;
+    const int k = (K_topk < sl) ? K_topk : sl;
 
-    const int32_t* loc = local_packed + (long long)b * K_topk;
+    const int64_t* loc = local_long + (long long)b * K_topk;
     const int32_t* bt  = block_table + (long long)b * actual_pages;
     int32_t* o = out_packed + (long long)b * K_topk;
 
     for (int i = threadIdx.x; i < k; i += blockDim.x) {
-        int local = loc[i];
+        int local = (int)loc[i];
         o[i] = bt[local / PS] * PS + (local % PS);
     }
 }
@@ -126,7 +127,6 @@ void run(
 
     auto bt_i32 = block_table.slice(1, 0, actual_pages)
                              .to(torch::kInt32).clamp(0, P - 1).contiguous();
-    const int*   bt_ptr  = bt_i32.data_ptr<int32_t>();
     int32_t*     out_ptr = topk_indices.data_ptr<int32_t>();
     cudaStream_t stream  = at::cuda::getCurrentCUDAStream();
 
@@ -157,37 +157,25 @@ void run(
     constexpr int BLOCK_T = 256;
     auto weighted = logits.relu() * weights.contiguous().unsqueeze(2);  // [B, H, S]
 
-    auto opts_i32 = torch::TensorOptions()
-            .dtype(torch::kInt32)
-            .device(q_index_fp8.device());
-    torch::Tensor local_packed = torch::empty({B, K_topk}, opts_i32);
-    std::vector<int32_t> counts_host((size_t)B, 0);
+    auto opts_dev = q_index_fp8.options();
+    torch::Tensor local_topk_long = torch::empty({B, K_topk}, opts_dev.dtype(torch::kInt64));
+    torch::Tensor seq_lens_dev = seq_lens.to(logits.device()).to(torch::kInt32).contiguous();
 
     for (int b = 0; b < B; ++b) {
         const int sl = sl_vec[b];
         if (sl == 0) continue;
-        const int actual_topk = std::min(K_topk, sl);
-
-        auto scores   = weighted[b].narrow(1, 0, sl).sum(0);
-        auto topk_out = scores.topk(actual_topk, -1, true, true);
-        auto topk_idxs = std::get<1>(topk_out).to(torch::kInt32).contiguous();
-
-        local_packed.select(0, b).narrow(0, 0, actual_topk).copy_(topk_idxs);
-        counts_host[(size_t)b] = (int32_t)actual_topk;
+        const int k = std::min(K_topk, sl);
+        auto scores = weighted[b].narrow(1, 0, sl).sum(0);
+        auto topk_vals = torch::empty({k}, scores.options());
+        auto topk_idx_slice = local_topk_long.select(0, b).narrow(0, 0, k);
+        at::topk_out(topk_vals, topk_idx_slice, scores, k, /*dim=*/-1, /*largest=*/true, /*sorted=*/true);
     }
 
-    torch::Tensor counts_cpu = torch::empty({B}, torch::TensorOptions().dtype(torch::kInt32));
-    std::memcpy(
-            counts_cpu.data_ptr<int32_t>(),
-            counts_host.data(),
-            (size_t)B * sizeof(int32_t));
-    torch::Tensor counts_dev = counts_cpu.to(q_index_fp8.device());
-
     page_transform_batched_kernel<<<B, BLOCK_T, 0, stream>>>(
-            local_packed.data_ptr<int32_t>(),
+            local_topk_long.data_ptr<int64_t>(),
+            seq_lens_dev.data_ptr<int32_t>(),
             bt_i32.data_ptr<int32_t>(),
             out_ptr,
-            counts_dev.data_ptr<int32_t>(),
             actual_pages,
             K_topk,
             PS);
