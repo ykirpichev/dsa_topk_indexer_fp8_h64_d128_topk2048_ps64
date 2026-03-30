@@ -1,10 +1,7 @@
 """
-B200 Python: Triton FP8 paged gather + optional CuTe TMA+FP8 UMMA matmul + FP32 K scales after multiply.
+B200 Python: Triton FP8 gather + CuTe FP8 UMMA + **Triton** fused ``logits *= k_scale``.
 
-When ``DSA_FP8_TMMA_MM=1``: logits_fp8 = Q_fp8 @ K_fp8^T (FP8 MMA, FP32 acc), then
-``logits = logits_fp8 * k_scale`` (per-token K scale from cache). Else ``torch.bmm`` on f32 K.
-
-``blackwell_fp8_batched_mm``: TMA loads + tcgen05 FP8 MMA + TMEM → FP32 GMEM (no per-row re-quant).
+``DSA_FP8_TMMA_MM=1``: UMMA then ``triton_scale_logits.scale_logits_by_k`` (no fragile CuTe broadcast).
 """
 
 from __future__ import annotations
@@ -17,10 +14,12 @@ try:
     from .blackwell_fp8_batched_mm import fp8_batched_mm_hs as _fp8_mm
     from .blackwell_fp8_batched_mm import _N_TILE as _N_TILE_FP8
     from .triton_gather_fp8 import gather_k_fp8_scaled as _gather_k_fp8
+    from .triton_scale_logits import scale_logits_by_k as _scale_logits
 except ImportError:
     from blackwell_fp8_batched_mm import fp8_batched_mm_hs as _fp8_mm
     from blackwell_fp8_batched_mm import _N_TILE as _N_TILE_FP8
     from triton_gather_fp8 import gather_k_fp8_scaled as _gather_k_fp8
+    from triton_scale_logits import scale_logits_by_k as _scale_logits
 
 _USE_FP8_TMMA = os.environ.get("DSA_FP8_TMMA_MM", "").lower() in ("1", "true", "yes")
 
@@ -95,7 +94,7 @@ def kernel(
         q_fp8 = q_index_fp8.view(torch.float8_e4m3fn) if q_index_fp8.dtype != torch.float8_e4m3fn else q_index_fp8
         logits = torch.empty((b, n_heads, s_pad), device=dev, dtype=torch.float32)
         _fp8_mm(q_fp8.contiguous(), k_fp8.contiguous(), logits)
-        logits.mul_(k_scale.unsqueeze(1))
+        _scale_logits(logits, k_scale)
     else:
         k_b = torch.empty((b, s_pad, d), device=dev, dtype=torch.float32)
         k_b.copy_(_gather_k_f32(cache_u8, bt, b, s_pad, d, p, ps, hds))

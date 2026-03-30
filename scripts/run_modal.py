@@ -12,7 +12,8 @@ Cap workloads on a full-style benchmark (default timing config)::
 
     FIB_MODAL_MAX_WORKLOADS=16 modal run scripts/run_modal.py
 
-Optional Blackwell FP8 UMMA matmul for ``solution/python/kernel.py`` (``DSA_FP8_TMMA_MM=1``)::
+Python FP8 path (``DSA_FP8_TMMA_MM=1``): Triton FP8 gather + CuTe FP8 UMMA + Triton fused
+``logits *= k_scale``::
 
     FIB_MODAL_DSA_FP8_TMMA_MM=1 modal run scripts/run_modal.py
 

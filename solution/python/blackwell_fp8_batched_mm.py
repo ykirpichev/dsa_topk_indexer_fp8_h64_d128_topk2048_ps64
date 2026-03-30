@@ -1,7 +1,6 @@
-"""B200 batched FP8 GEMM: tcgen05 FP8 UMMA, FP32 accumulator/output (GMEM→RMEM operands).
+"""B200 batched FP8 GEMM: tcgen05 FP8 UMMA, FP32 acc (GMEM→RMEM operands).
 
-TMA-pipelined variant (tutorial ``fp16_gemm_0`` style) did not compile on cutlass-dsl 4.4.2 for
-this MNK tile on Modal; bulk GMEM loads still feed SMEM-backed UMMA efficiently on Blackwell."""
+K-scale broadcast is applied by ``triton_scale_logits.scale_logits_by_k`` (fused Triton epilogue)."""
 
 from __future__ import annotations
 
