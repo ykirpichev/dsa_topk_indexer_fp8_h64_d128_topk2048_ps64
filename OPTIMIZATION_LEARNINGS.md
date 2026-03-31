@@ -63,3 +63,13 @@ FIB_MODAL_SMOKE=1 modal run scripts/run_modal.py
 **Interpretation (2026-03-31 batch):** One smoke per variant vs a **single** baseline run (**6.70×**). Modal variance is large — e.g. **#24** and **#27** look like big wins but earlier sessions showed **dropping `.contiguous()`** and **`-O2`** as neutral or worse. **Do not land** from this table alone; re-run top candidates **3×** and check **128 workloads** before any commit/tag.
 
 **Rerun:** `python3 scripts/opt_ablations.py` (restores `kernel.cu` / `binding.py` after each experiment).
+
+## Combined “winners” stack (not landed)
+
+Merged in one build: `K_batched.contiguous()` after gather; `q_float` contiguous; `bmm` on `permute({0,2,1})` **without** post-`.contiguous()`; `BLOCK_T=128`; `weights.unsqueeze(2)` only; `sum_out` + `scores_buf`; reused `topk_vals_buf`; `binding` **`-O2`** + JIT name `topk_cuda_cublas_combo`.
+
+| Run | Geomean (17 wl) | Verdict |
+|-----|-----------------|--------|
+| Modal smoke 2026-03-31 | **7.06×**, 17/17 PASSED | **Reverted** — not clearly better than prior **~7.2–7.5×** single-variant runs; interactions + noise. |
+
+Lesson: **positive single ablations do not compose** reliably; validate combos on **multiple** smokes + **128** full before shipping.
