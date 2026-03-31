@@ -4,7 +4,7 @@
  * Pipeline:
  *   1. Fused FP8 page gather + dequant  (custom CUDA kernel)
  *   2. Batched GEMM: q @ K^T            (torch::bmm, float32)
- *   3. ATen relu + weighted sum         (bit-exact)
+ *   3. In-place relu_ + mul_(weights) on logits (bit-exact vs relu*weights)
  *   4. torch::topk                      (bit-exact)
  *   5. Batched page_transform: int64 top-k indices + device seq_lens → global int32
  *
@@ -147,15 +147,17 @@ void run(
     // Phase 2 — batched GEMM: logits [B, H, S] = q @ K^T
     // -------------------------------------------------------------------------
     auto q_float = q_index_fp8.to(torch::kFloat32);  // [B, H, D]
-    auto logits  = torch::bmm(q_float, K_batched.transpose(1, 2));  // [B, H, S]
+    auto logits  = torch::bmm(q_float, K_batched.transpose(1, 2)).contiguous();  // [B, H, S]
 
     // -------------------------------------------------------------------------
-    // Phase 3 — relu + weighted sum → scores [B, S]
+    // Phase 3 — in-place relu then mul (same as relu()*w broadcast; one fewer [B,H,S] temp)
     // Phase 4 — topk
     // Phase 5 — page-table transform → global token indices
     // -------------------------------------------------------------------------
     constexpr int BLOCK_T = 256;
-    auto weighted = logits.relu() * weights.contiguous().unsqueeze(2);  // [B, H, S]
+    auto w_bcast = weights.contiguous().unsqueeze(2);
+    logits.relu_();
+    logits.mul_(w_bcast);
 
     auto opts_dev = q_index_fp8.options();
     torch::Tensor local_topk_long = torch::empty({B, K_topk}, opts_dev.dtype(torch::kInt64));
@@ -165,7 +167,7 @@ void run(
         const int sl = sl_vec[b];
         if (sl == 0) continue;
         const int k = std::min(K_topk, sl);
-        auto scores = weighted[b].narrow(1, 0, sl).sum(0);
+        auto scores = logits[b].narrow(1, 0, sl).sum(0);
         auto topk_vals = torch::empty({k}, scores.options());
         auto topk_idx_slice = local_topk_long.select(0, b).narrow(0, 0, k);
         at::topk_out(topk_vals, topk_idx_slice, scores, k, /*dim=*/-1, /*largest=*/true, /*sorted=*/true);
@@ -184,7 +186,7 @@ void run(
 // ============================================================================
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("run", &run,
-          "DSA TopK Indexer: fused FP8-gather + bmm + relu/weighted-sum + topK + batched page-table transform",
+          "DSA TopK Indexer: fused FP8-gather + bmm + in-place relu/mul + topK + batched page-table transform",
           py::arg("q_index_fp8"), py::arg("k_index_cache_fp8"), py::arg("weights"),
           py::arg("seq_lens"),    py::arg("block_table"),       py::arg("topk_indices"));
 }
