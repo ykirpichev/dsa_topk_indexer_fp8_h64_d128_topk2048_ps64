@@ -5,7 +5,7 @@
  *   1. Fused FP8 page gather + dequant  (custom CUDA kernel)
  *   2. Batched GEMM: q @ K^T            (torch::bmm, float32)
  *   3. In-place relu_ + mul_(weights) on logits (bit-exact vs relu*weights)
- *   4. torch::topk                      (bit-exact)
+ *   4. torch::topk (reused [K_topk] values buffer across batch rows)
  *   5. Batched page_transform: int64 top-k indices + device seq_lens → global int32
  *
  * NaN handling: FP8 E4M3 NaN bytes propagate as float NaN through K_batched
@@ -162,13 +162,14 @@ void run(
     auto opts_dev = q_index_fp8.options();
     torch::Tensor local_topk_long = torch::empty({B, K_topk}, opts_dev.dtype(torch::kInt64));
     torch::Tensor seq_lens_dev = seq_lens.to(logits.device()).to(torch::kInt32).contiguous();
+    torch::Tensor topk_vals_buf = torch::empty({K_topk}, logits.options());
 
     for (int b = 0; b < B; ++b) {
         const int sl = sl_vec[b];
         if (sl == 0) continue;
         const int k = std::min(K_topk, sl);
         auto scores = logits[b].narrow(1, 0, sl).sum(0);
-        auto topk_vals = torch::empty({k}, scores.options());
+        auto topk_vals = topk_vals_buf.narrow(0, 0, k);
         auto topk_idx_slice = local_topk_long.select(0, b).narrow(0, 0, k);
         at::topk_out(topk_vals, topk_idx_slice, scores, k, /*dim=*/-1, /*largest=*/true, /*sorted=*/true);
     }
