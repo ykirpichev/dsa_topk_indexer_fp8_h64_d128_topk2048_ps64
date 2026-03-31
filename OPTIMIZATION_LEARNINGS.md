@@ -73,3 +73,28 @@ Merged in one build: `K_batched.contiguous()` after gather; `q_float` contiguous
 | Modal smoke 2026-03-31 | **7.06×**, 17/17 PASSED | **Reverted** — not clearly better than prior **~7.2–7.5×** single-variant runs; interactions + noise. |
 
 Lesson: **positive single ablations do not compose** reliably; validate combos on **multiple** smokes + **128** full before shipping.
+
+### Batch 2 (ids 33–47)
+
+| Id | Idea | Geomean | Status |
+|---|---|---|---|
+| 0 | baseline before batch | 6.46× | OK |
+| 33 | seq_lens_dev created early (q device) before gather; remove duplicate before loop | 6.88× | OK (Δ+0.42 vs baseline) |
+| 34 | page_transform BLOCK_T 192 | 7.02× | OK (Δ+0.56 vs baseline) |
+| 35 | binding extra_cflags host -O3 | 6.98× | OK (Δ+0.52 vs baseline) |
+| 36 | nvcc -gencode arch=compute_100,code=sm_100 | 6.95× | OK (Δ+0.49 vs baseline) |
+| 37 | nvcc --ftz=true | 6.94× | OK (Δ+0.48 vs baseline) |
+| 38 | nvcc --prec-div=false (faster approx div) | 6.91× | OK (Δ+0.45 vs baseline) |
+| 39 | page_transform BLOCK_T 64 | 6.83× | OK (Δ+0.37 vs baseline) |
+| 40 | page_transform BLOCK_T 384 | 7.20× | OK (Δ+0.74 vs baseline) |
+| 41 | bmm uses transpose().clone() before matmul | 6.34× | OK (Δ-0.12 vs baseline) |
+| 42 | JIT name topk_cuda_cublas_b42 (rebuild) | 6.95× | OK (Δ+0.49 vs baseline) |
+| 43 | Use at::relu_(logits) instead of logits.relu_() | 6.98× | OK (Δ+0.52 vs baseline) |
+| 44 | Use at::mul_(logits, w_bcast) instead of logits.mul_(w_bcast) | — | FAIL_OR_ERROR |
+| 45 | K_batched empty -> zeros (same gather overwrite) | 6.55× | OK (Δ+0.09 vs baseline) |
+| 46 | bt_i32 without .contiguous() after clamp | 7.08× | OK (Δ+0.62 vs baseline) |
+| 47 | nvcc -Xptxas -O2 (PTX assembler opt) | 6.49× | OK (Δ+0.03 vs baseline) |
+
+**Batch 2 notes:** Baseline **6.46×** (single run). **#44** `at::mul_(logits, w_bcast)` → **FAIL_OR_ERROR** (likely API/signature — use `logits.mul_(w_bcast)`). **#36–38, 47** change FP32 semantics risk for contest — do not ship without correctness audit. **#40** (BLOCK 384) and **#46** (no `bt` contiguous) look best on this noisy run — re-validate.
+
+**Rerun batch 2:** `python3 scripts/opt_ablations.py --batch2`

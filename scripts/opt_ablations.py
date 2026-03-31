@@ -247,6 +247,171 @@ EXPERIMENTS: list[Exp] = [
     ),
 ]
 
+# Second batch of ideas (ids 33–47); run: python3 scripts/opt_ablations.py --batch2
+EXPERIMENTS_BATCH2: list[Exp] = [
+    Exp(
+        33,
+        "seq_lens_dev created early (q device) before gather; remove duplicate before loop",
+        [
+            (
+                "    cudaStream_t stream  = at::cuda::getCurrentCUDAStream();\n\n"
+                "    // -------------------------------------------------------------------------\n"
+                "    // Phase 1 — fused gather + FP8 dequant + scale → K_batched [B, S, D]",
+                "    cudaStream_t stream  = at::cuda::getCurrentCUDAStream();\n"
+                "    torch::Tensor seq_lens_dev = seq_lens.to(q_index_fp8.device()).to(torch::kInt32).contiguous();\n\n"
+                "    // -------------------------------------------------------------------------\n"
+                "    // Phase 1 — fused gather + FP8 dequant + scale → K_batched [B, S, D]",
+            ),
+            (
+                "    torch::Tensor local_topk_long = torch::empty({B, K_topk}, opts_dev.dtype(torch::kInt64));\n"
+                "    torch::Tensor seq_lens_dev = seq_lens.to(logits.device()).to(torch::kInt32).contiguous();\n\n"
+                "    for (int b = 0; b < B; ++b) {",
+                "    torch::Tensor local_topk_long = torch::empty({B, K_topk}, opts_dev.dtype(torch::kInt64));\n\n"
+                "    for (int b = 0; b < B; ++b) {",
+            ),
+        ],
+        [],
+    ),
+    Exp(
+        34,
+        "page_transform BLOCK_T 192",
+        [("constexpr int BLOCK_T = 256;", "constexpr int BLOCK_T = 192;")],
+        [],
+    ),
+    Exp(
+        35,
+        "binding extra_cflags host -O3",
+        [],
+        [
+            (
+                "_ext = torch.utils.cpp_extension.load(\n"
+                '            name="topk_cuda_cublas",\n'
+                "            sources=[str(_THIS_DIR / \"kernel.cu\")],",
+                "_ext = torch.utils.cpp_extension.load(\n"
+                '            name="topk_cuda_cublas",\n'
+                "            sources=[str(_THIS_DIR / \"kernel.cu\")],\n"
+                '            extra_cflags=["-O3"],',
+            )
+        ],
+    ),
+    Exp(
+        36,
+        "nvcc -gencode arch=compute_100,code=sm_100",
+        [],
+        [
+            (
+                'extra_cuda_cflags=["-O3", "--expt-relaxed-constexpr"],',
+                'extra_cuda_cflags=["-O3", "--expt-relaxed-constexpr", "-gencode=arch=compute_100,code=sm_100"],',
+            )
+        ],
+    ),
+    Exp(
+        37,
+        "nvcc --ftz=true",
+        [],
+        [
+            (
+                'extra_cuda_cflags=["-O3", "--expt-relaxed-constexpr"],',
+                'extra_cuda_cflags=["-O3", "--expt-relaxed-constexpr", "--ftz=true"],',
+            )
+        ],
+    ),
+    Exp(
+        38,
+        "nvcc --prec-div=false (faster approx div)",
+        [],
+        [
+            (
+                'extra_cuda_cflags=["-O3", "--expt-relaxed-constexpr"],',
+                'extra_cuda_cflags=["-O3", "--expt-relaxed-constexpr", "--prec-div=false"],',
+            )
+        ],
+    ),
+    Exp(
+        39,
+        "page_transform BLOCK_T 64",
+        [("constexpr int BLOCK_T = 256;", "constexpr int BLOCK_T = 64;")],
+        [],
+    ),
+    Exp(
+        40,
+        "page_transform BLOCK_T 384",
+        [("constexpr int BLOCK_T = 256;", "constexpr int BLOCK_T = 384;")],
+        [],
+    ),
+    Exp(
+        41,
+        "bmm uses transpose().clone() before matmul",
+        [
+            (
+                "auto logits  = torch::bmm(q_float, K_batched.transpose(1, 2)).contiguous();  // [B, H, S]",
+                "auto logits  = torch::bmm(q_float, K_batched.transpose(1, 2).clone()).contiguous();  // [B, H, S]",
+            )
+        ],
+        [],
+    ),
+    Exp(
+        42,
+        "JIT name topk_cuda_cublas_b42 (rebuild)",
+        [],
+        [
+            (
+                'name="topk_cuda_cublas",',
+                'name="topk_cuda_cublas_b42",',
+            )
+        ],
+    ),
+    Exp(
+        43,
+        "Use at::relu_(logits) instead of logits.relu_()",
+        [
+            ("logits.relu_();", "at::relu_(logits);"),
+        ],
+        [],
+    ),
+    Exp(
+        44,
+        "Use at::mul_(logits, w_bcast) instead of logits.mul_(w_bcast)",
+        [
+            ("logits.mul_(w_bcast);", "at::mul_(logits, w_bcast);"),
+        ],
+        [],
+    ),
+    Exp(
+        45,
+        "K_batched empty -> zeros (same gather overwrite)",
+        [
+            (
+                "torch::Tensor K_batched = torch::empty({B, S, D},",
+                "torch::Tensor K_batched = torch::zeros({B, S, D},",
+            )
+        ],
+        [],
+    ),
+    Exp(
+        46,
+        "bt_i32 without .contiguous() after clamp",
+        [
+            (
+                ".to(torch::kInt32).clamp(0, P - 1).contiguous();",
+                ".to(torch::kInt32).clamp(0, P - 1);",
+            )
+        ],
+        [],
+    ),
+    Exp(
+        47,
+        "nvcc -Xptxas -O2 (PTX assembler opt)",
+        [],
+        [
+            (
+                'extra_cuda_cflags=["-O3", "--expt-relaxed-constexpr"],',
+                'extra_cuda_cflags=["-O3", "--expt-relaxed-constexpr", "-Xptxas", "-O2"],',
+            )
+        ],
+    ),
+]
+
 
 def apply_exp(exp: Exp) -> None:
     restore()
@@ -264,8 +429,10 @@ def apply_exp(exp: Exp) -> None:
     BINDING.write_text(btxt)
 
 
-def append_log(rows: list[tuple[int, str, float | None, str]]):
-    block = "\n| " + " | ".join(["Batch", "Idea", "Geomean", "Status"]) + " |\n"
+def append_log(
+    rows: list[tuple[int, str, float | None, str]], heading: str = "### Batch (default 18–32)"
+):
+    block = f"\n{heading}\n\n| " + " | ".join(["Id", "Idea", "Geomean", "Status"]) + " |\n"
     block += "|" + "|".join(["---"] * 4) + "|\n"
     for eid, name, g, st in rows:
         gv = f"{g:.2f}×" if g is not None else "—"
@@ -281,6 +448,12 @@ def append_log(rows: list[tuple[int, str, float | None, str]]):
 
 
 def main():
+    experiments = EXPERIMENTS
+    log_heading = "### Batch 1 (ids 18–32)"
+    if len(sys.argv) > 1 and sys.argv[1] == "--batch2":
+        experiments = EXPERIMENTS_BATCH2
+        log_heading = "### Batch 2 (ids 33–47)"
+
     save_backups()
     restore()
     base_g, base_st = run_smoke()
@@ -288,7 +461,7 @@ def main():
     rows: list[tuple[int, str, float | None, str]] = []
     rows.append((0, "baseline before batch", base_g, base_st))
 
-    for exp in EXPERIMENTS:
+    for exp in experiments:
         try:
             apply_exp(exp)
         except Exception as e:
@@ -304,7 +477,7 @@ def main():
         print(f"Exp {exp.id}: geomean={g} {note}")
         restore()
 
-    append_log(rows)
+    append_log(rows, heading=log_heading)
     print("Appended to OPTIMIZATION_LEARNINGS.md")
     return 0
 
