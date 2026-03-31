@@ -1,5 +1,7 @@
 """B200 FP8 batched GEMM for DSA TopK.
 
+Uses **single CTA** only: ``tcgen05.CtaGroup.ONE`` and launch ``cluster=[1,1,1]`` (no 2-CTA cluster).
+
 - **Default (`MmaFP8Op`)**: 64×128 CTA tile, plain FP8 UMMA (matches H=64).
 - **MXF8 (`MmaMXF8Op`)** — opt-in ``DSA_FP8_MXF8_MM=1``: tcgen05 **block-scaled** FP8; CTA **M must be 128**
   (we pad Q to 128×D), **K block = 32** with **Float8E8M0FNU** scales. KV cache stores one **f32 scale per
@@ -57,7 +59,10 @@ class Fp8BatchedMmHsKernel:
     ):
         n_tiles = cute.ceil_div(s, Int32(_N_TILE))
         self._k(m_q, m_k, m_c, b, s, n_tiles).launch(
-            grid=[b * n_tiles, 1, 1], block=[128, 1, 1], stream=stream
+            grid=[b * n_tiles, 1, 1],
+            block=[128, 1, 1],
+            cluster=[1, 1, 1],
+            stream=stream,
         )
 
     @cute.kernel
@@ -119,7 +124,10 @@ class Fp8Mxf8BatchedMmKernel:
     ):
         n_tiles = cute.ceil_div(s, Int32(_N_TILE))
         self._k(m_q_pad, m_k, m_sfa, m_sfb, m_c_pad, b, s, n_tiles).launch(
-            grid=[b * n_tiles, 1, 1], block=[128, 1, 1], stream=stream
+            grid=[b * n_tiles, 1, 1],
+            block=[128, 1, 1],
+            cluster=[1, 1, 1],
+            stream=stream,
         )
 
     @cute.kernel
