@@ -1,11 +1,15 @@
 [solution]
-name = "my-team-solution-v1"      # Primary: Triton + torch.bmm (fast on B200)
+# HF mlsys26-contest discussion #2 baseline (deep_gemm + flashinfer-python).
+name = "flashinfer_deepgemm_wrapper_2ba145"
 definition = "dsa_topk_indexer_fp8_h64_d128_topk2048_ps64"
-author = "team-name"
+author = "flashinfer, deep_gemm"
 
 [build]
-language = "triton"
-entry_point = "kernel.py::kernel"
+language = "python"
+entry_point = "main.py::run"
+dependencies = ["flashinfer-python", "deep_gemm"]
+destination_passing_style = false
 
-# Python FP8: language = "python", entry_point = "kernel.py::kernel",
-# dependencies = ["nvidia-cutlass-dsl", "triton"]
+# CuTe + Triton path: entry_point = "kernel.py::kernel",
+#   dependencies = ["nvidia-cutlass-dsl", "triton"], destination_passing_style = true (omit or true)
+# Triton-only: language = "triton", entry_point = "kernel.py::kernel"
