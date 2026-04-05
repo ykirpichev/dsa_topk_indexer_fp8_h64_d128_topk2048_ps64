@@ -57,9 +57,17 @@ _HDS     = 132   # bytes per token in KV cache (128 FP8 + 4 float32 scale)
 _K_TOPK  = 2048  # topk
 _B200_HBM_BW_TBS = 8.0  # B200 HBM3e peak bandwidth (TB/s)
 
+# PyPI ``deep_gemm`` sdist omits CUTLASS submodules; install from Git (HF baseline needs it).
+_DEEPGEMM_CLONE_INSTALL = (
+    "git clone --depth 1 https://github.com/deepseek-ai/DeepGEMM.git /opt/DeepGEMM && "
+    "cd /opt/DeepGEMM && git submodule update --init --recursive --depth 1 && "
+    "python -m pip install --no-build-isolation ."
+)
+
 image = (
     modal.Image.from_registry("flashinfer/flashinfer-ci-cu132:latest", add_python="3.12")
-    .pip_install("flashinfer-bench", "nvidia-cutlass-dsl==4.4.2")
+    .run_commands(_DEEPGEMM_CLONE_INSTALL)
+    .pip_install("flashinfer-bench", "nvidia-cutlass-dsl==4.4.2", "flashinfer-python")
 )
 
 
