@@ -98,3 +98,43 @@ Lesson: **positive single ablations do not compose** reliably; validate combos o
 **Batch 2 notes:** Baseline **6.46×** (single run). **#44** `at::mul_(logits, w_bcast)` → **FAIL_OR_ERROR** (likely API/signature — use `logits.mul_(w_bcast)`). **#36–38, 47** change FP32 semantics risk for contest — do not ship without correctness audit. **#40** (BLOCK 384) and **#46** (no `bt` contiguous) look best on this noisy run — re-validate.
 
 **Rerun batch 2:** `python3 scripts/opt_ablations.py --batch2`
+
+### `page_transform` `BLOCK_T` resweep (same session, sequential smokes)
+
+Repeated Modal smoke (**17 wl**) with only `constexpr int BLOCK_T` changed (defaults back to **256** in repo).
+
+| `BLOCK_T` | Geomean | Notes |
+|-----------|---------|--------|
+| 64 | **6.95×** | 17/17 |
+| 128 | **7.09×** | 17/17 |
+| 192 | **6.91×** | 17/17 |
+| **256** (default) | **6.80×** | 17/17 |
+| 384 | **6.54×** | 17/17 — *contradicts batch-2’s 7.20× for 384 → noise* |
+| 512 | **7.09×** | 17/17 |
+
+**Conclusion:** **Not safe to pick a “winner” from one pass.** Best *this* sweep: **128 / 512** (~7.09×); worst: **384** (6.54×). Earlier batch had **384** best. **Recommendation:** run **3× median** per candidate on smoke, then **full 128** for finalists **128 vs 256 vs 512** only. **Do not ship 384** without confirming batch-2 result was fluke.
+
+**Reproduce sweep (bash):**
+
+```bash
+cp solution/cuda/kernel.cu /tmp/k.bak
+for BT in 64 128 192 256 384 512; do
+  sed -i "s/constexpr int BLOCK_T = [0-9]*;/constexpr int BLOCK_T = ${BT};/" solution/cuda/kernel.cu
+  echo "=== BLOCK_T=$BT ==="
+  FIB_MODAL_SMOKE=1 modal run scripts/run_modal.py 2>&1 | grep Geomean
+  cp /tmp/k.bak solution/cuda/kernel.cu
+done
+```
+
+### More ideas (page_transform & neighbors)
+
+1. **Warp-specialized transform:** one warp per batch row `b` (up to 32 threads) when `k = min(K_topk, sl) ≤ 32` often — else fall back to current loop (reduces launch overhead for small `k`).
+2. **Fuse last steps:** single kernel reading `local_topk_long` + `seq_lens` + `block_table` + writing `out` with **I/O coalesced** (measure vs tiny kernel today).
+3. **`__launch_bounds__`** on `page_transform_batched_kernel` to help occupancy for chosen `BLOCK_T`.
+4. **Vectorize index gather:** load 2× `int64` or `int4` from `loc` when `k` and alignment allow.
+5. **Dynamic shared memory:** stage `bt` row or `loc[0:k]` for `k` small (avoid repeated global reads).
+6. **Profile Nsight** on B200: confirm `page_transform` % before investing — it may be **<5%** of end-to-end.
+7. **Match `k` to warp multiple:** pad loop or use `k` rounded up to 32 for simpler divergence (only if padding indices never read).
+8. **Second stream:** overlap `page_transform` with next workload’s host prep (only if harness allows async).
+9. **Compile-time `BLOCK_T`** via `-DBLOCK_T=128` + small set of **prebuilt** extension names to A/B without `sed`.
+10. **Grid-stride loop** with fixed **256 threads** and `for (i = tid; i < k; i += 256)` — sometimes better than `blockDim` tied to `BLOCK_T` for irregular `k`.
