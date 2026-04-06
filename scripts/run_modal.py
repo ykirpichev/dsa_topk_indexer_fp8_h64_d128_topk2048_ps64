@@ -26,6 +26,9 @@ Python FP8 path: ``FIB_MODAL_DSA_FP8_TMMA_MM=1`` → ``DSA_FP8_TMMA_MM``; option
     FIB_MODAL_DSA_FP8_TMMA_MM=1 modal run scripts/run_modal.py
     FIB_MODAL_DSA_FP8_TMMA_MM=1 FIB_MODAL_DSA_FP8_MXF8_MM=1 modal run scripts/run_modal.py
 
+HF baseline exact reference (FP32 ``bmm``, no DeepGEMM): ``FIB_MODAL_DSA_BASELINE_FP32_REFERENCE=1`` →
+``DSA_BASELINE_FP32_REFERENCE`` in ``main.py::run``.
+
 Setup (one-time):
     modal setup
     modal volume create flashinfer-trace
@@ -67,7 +70,7 @@ _DEEPGEMM_CLONE_INSTALL = (
 image = (
     modal.Image.from_registry("flashinfer/flashinfer-ci-cu132:latest", add_python="3.12")
     .run_commands(_DEEPGEMM_CLONE_INSTALL)
-    .pip_install("flashinfer-bench", "nvidia-cutlass-dsl==4.4.2", "flashinfer-python")
+    .pip_install("flashinfer-bench", "nvidia-cutlass-dsl==4.4.2")
 )
 
 
@@ -140,6 +143,12 @@ def run_benchmark(
     if os.environ.get("FIB_MODAL_DSA_FP8_MXF8_MM", "").lower() in ("1", "true", "yes"):
         os.environ["DSA_FP8_TMMA_MM"] = "1"
         os.environ["DSA_FP8_MXF8_MM"] = "1"
+    if os.environ.get("FIB_MODAL_DSA_BASELINE_FP32_REFERENCE", "").lower() in (
+        "1",
+        "true",
+        "yes",
+    ):
+        os.environ["DSA_BASELINE_FP32_REFERENCE"] = "1"
     if smoke:
         # Fewer workloads / trials than production, but profile_baseline=True is required
         # for reference_latency_ms and speedup_factor.

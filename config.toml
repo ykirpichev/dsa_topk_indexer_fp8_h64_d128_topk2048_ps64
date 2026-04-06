@@ -7,7 +7,7 @@ author = "flashinfer, deep_gemm"
 [build]
 language = "python"
 entry_point = "main.py::run"
-dependencies = ["flashinfer-python", "deep_gemm"]
+dependencies = ["deep_gemm", "triton"]
 destination_passing_style = false
 
 # CuTe + Triton path: entry_point = "kernel.py::kernel",
