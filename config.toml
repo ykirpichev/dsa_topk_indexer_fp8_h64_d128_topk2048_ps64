@@ -1,8 +1,15 @@
 [solution]
-name = "my-team-solution-v1"      # Solution name
-definition = "fused_moe"          # Track: fused_moe | sparse_attention | gated_delta_net
-author = "team-name"              # Team/author name
+# HF mlsys26-contest discussion #2 baseline (deep_gemm + flashinfer-python).
+name = "flashinfer_deepgemm_wrapper_2ba145"
+definition = "dsa_topk_indexer_fp8_h64_d128_topk2048_ps64"
+author = "flashinfer, deep_gemm"
 
 [build]
-language = "triton"               # triton | cuda
-entry_point = "kernel"            # Kernel function name
+language = "python"
+entry_point = "main.py::run"
+dependencies = ["deep_gemm", "triton"]
+destination_passing_style = false
+
+# CuTe + Triton path: entry_point = "kernel.py::kernel",
+#   dependencies = ["nvidia-cutlass-dsl", "triton"], destination_passing_style = true (omit or true)
+# Triton-only: language = "triton", entry_point = "kernel.py::kernel"
