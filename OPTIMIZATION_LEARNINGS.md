@@ -20,6 +20,7 @@
 | 7 | 2026-03-30 | Fused on-the-fly `q·K` (no `K_batched`) | match + slow OR fail | **Reverted** |
 | 8 | 2026-03-30 | `_nested_from_padded_tensor` + `sum` | RUNTIME_ERROR | **Aborted** |
 | 9 | 2026-03-29 | In-place `relu_` + `mul_` vs `relu()*w` | 128/128 + smoke OK | **Kept** — `submission-v3` @ `96da9a2` |
+| 10 | 2026-03-30 | **Combined:** `sum_out` → reused `scores_buf[max_seq_len]` + `topk_out` → reused `topk_vals_buf[B,K_topk]` (slices per batch row) | *(not re-run on Modal; env had no GPU)* | **In tree** — targets profiler buckets `aten::sum` + `aten::topk` (fewer small allocations per row); JIT name `topk_cuda_cublas_buf`. **Re-smoke when Modal billing OK**; revert if geomean does not beat prior best. |
 
 ## Next ideas (not run — billing / time)
 

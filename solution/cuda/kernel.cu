@@ -161,16 +161,20 @@ void run(
 
     auto opts_dev = q_index_fp8.options();
     torch::Tensor local_topk_long = torch::empty({B, K_topk}, opts_dev.dtype(torch::kInt64));
+    torch::Tensor topk_vals_buf = torch::empty({B, K_topk}, logits.options());
+    torch::Tensor scores_buf = torch::empty({max_seq_len}, logits.options());
     torch::Tensor seq_lens_dev = seq_lens.to(logits.device()).to(torch::kInt32).contiguous();
 
     for (int b = 0; b < B; ++b) {
         const int sl = sl_vec[b];
         if (sl == 0) continue;
         const int k = std::min(K_topk, sl);
-        auto scores = logits[b].narrow(1, 0, sl).sum(0);
-        auto topk_vals = torch::empty({k}, scores.options());
+        auto row = logits[b].narrow(1, 0, sl);
+        auto scores = scores_buf.narrow(0, 0, sl);
+        at::sum_out(scores, row, /*dim=*/0, /*keepdim=*/false);
+        auto topk_vals_slice = topk_vals_buf.select(0, b).narrow(0, 0, k);
         auto topk_idx_slice = local_topk_long.select(0, b).narrow(0, 0, k);
-        at::topk_out(topk_vals, topk_idx_slice, scores, k, /*dim=*/-1, /*largest=*/true, /*sorted=*/true);
+        at::topk_out(topk_vals_slice, topk_idx_slice, scores, k, /*dim=*/-1, /*largest=*/true, /*sorted=*/true);
     }
 
     page_transform_batched_kernel<<<B, BLOCK_T, 0, stream>>>(

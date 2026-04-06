@@ -24,7 +24,7 @@ def _load_ext():
     global _ext
     if _ext is None:
         _ext = torch.utils.cpp_extension.load(
-            name="topk_cuda_cublas",
+            name="topk_cuda_cublas_buf",
             sources=[str(_THIS_DIR / "kernel.cu")],
             extra_cuda_cflags=["-O3", "--expt-relaxed-constexpr"],
             extra_ldflags=[],
