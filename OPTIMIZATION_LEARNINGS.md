@@ -138,3 +138,39 @@ done
 8. **Second stream:** overlap `page_transform` with next workload’s host prep (only if harness allows async).
 9. **Compile-time `BLOCK_T`** via `-DBLOCK_T=128` + small set of **prebuilt** extension names to A/B without `sed`.
 10. **Grid-stride loop** with fixed **256 threads** and `for (i = tid; i < k; i += 256)` — sometimes better than `blockDim` tied to `BLOCK_T` for irregular `k`.
+
+---
+
+## Profiling: current bottleneck (Modal B200, `torch.profiler`)
+
+**Method:** `FIB_MODAL_PROFILE=1 modal run scripts/modal_profile.py` with `acc_events=True`, **`sort_by=cuda_time_total`**, after JIT warmup. Nsight Systems / NCU still unreliable on this Modal stack (see `scripts/modal_profile.py`).
+
+**Workloads:** **index 16** (smoke-scale T) and **index 127** (large T in trace order) — same **relative** split.
+
+### Approximate **Self CUDA %** of one forward (aggregated over repeats)
+
+| Bucket | ~% of GPU time | Notes |
+|--------|----------------|--------|
+| **`aten::topk`** (+ radix / bitonic / `gatherTopK` children) | **~53–56%** | Dominant |
+| **`aten::sum`** over heads (`reduce_kernel`) | **~18–23%** | Second |
+| **`aten::bmm`** / CUTLASS SGEMM | **~5%** | Small at probed sizes |
+| **`gather_dequant_kernel`** | **~3.6%** | Custom gather |
+| **`Memcpy DtoH`** | **~2–3%** | Often tied to small copies / sync |
+| **`page_transform_batched_kernel`** | **~2.3–2.4%** | **Not** the hot kernel here |
+| **`relu_` / `mul_` / topk `fill_` path** | few % combined | Epilogue |
+
+**Conclusion:** End-to-end for this kernel, **`page_transform` block size is a micro-optimization** compared to **`topk` + per-row `sum` over H`**. Tuning `BLOCK_T` can move Modal smoke geomean mostly through **noise**, not because the transform is the limiter.
+
+### What to optimize next (priority)
+
+1. **Top-k path** — batched or fused selection, or fuse **score build + top-k** while keeping **exact** indices vs reference (hard).
+2. **Head reduction** — fuse **weighted relu** with **sum over H** so you do not materialize full `[H, sl]` for the reduction (must match ATen reduction tree).
+3. **GEMM** — becomes important when **S** is huge; at profiled shapes **`bmm` ~5%**; revisit after (1–2) or profile again on max-**T** workload only.
+4. **Gather** — vectorized loads / coalescing; only ~4% here but simpler than top-k.
+5. **`page_transform`** — low priority unless Nsight on **your** max workload shows otherwise.
+
+**Re-run profile:**
+
+```bash
+FIB_MODAL_PROFILE=1 FIB_PROFILE_WORKLOAD_INDEX=127 FIB_PROFILE_REPEAT=6 modal run scripts/modal_profile.py
+```
