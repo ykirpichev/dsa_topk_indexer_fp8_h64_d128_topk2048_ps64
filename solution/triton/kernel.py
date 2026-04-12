@@ -1,9 +1,9 @@
 """
 DSA Top-K indexer — pure PyTorch, paged flat layout + masks (deep_gemm-style).
 
-Perf vs naive full-length matmul:
-- Truncate sequence axis to min(context_slots, max(seq_lens)) — same tokens as reference, fewer columns.
-- Single batched matmul (no head expand), TF32, optional bf16 matmul + torch.compile.
+Perf:
+- Truncate matmul to min(context_slots, max(seq_lens)).
+- Batched matmul (no head expand), TF32, bf16 GEMM, optional torch.compile on large problems.
 """
 
 from __future__ import annotations
@@ -15,12 +15,14 @@ import torch
 
 _USE_BF16_MATMUL = os.environ.get("FIB_MATMUL_BF16", "1").lower() not in ("0", "false", "no")
 _COMPILE_ENABLED = os.environ.get("FIB_TORCH_COMPILE", "1").lower() not in ("0", "false", "no")
+# Skip compile on tiny problems (compile/autotune overhead dominates).
+_COMPILE_MIN_TOKENS = int(os.environ.get("FIB_COMPILE_MIN_TOKENS", "1024"))
 
 _compiled_hot: Optional[Callable] = None
 
 
-def _dequant_fp8_kv_cache(k_index_cache_fp8: torch.Tensor) -> torch.Tensor:
-    """Dequantize FP8 KV cache from deep_gemm layout to float32. See dataset definition."""
+def _dequant_fp8_kv_cache(k_index_cache_fp8: torch.Tensor, out_bf16: bool) -> torch.Tensor:
+    """Dequantize FP8 KV cache from deep_gemm layout. Optionally return bf16 for bandwidth."""
     k_uint8 = k_index_cache_fp8.view(torch.uint8)
     num_pages, page_size, _num_heads, head_dim_sf = k_uint8.shape
     head_dim = head_dim_sf - 4
@@ -33,44 +35,41 @@ def _dequant_fp8_kv_cache(k_index_cache_fp8: torch.Tensor) -> torch.Tensor:
     scale_bytes = kv_flat[:, page_size * head_dim :].contiguous()
     scale = scale_bytes.view(num_pages, page_size, 4).view(torch.float32)
 
-    return fp8_float * scale
+    x = fp8_float * scale
+    if out_bf16:
+        return x.to(torch.bfloat16)
+    return x
 
 
-def _hot_path(
-    q: torch.Tensor,
+def _hot_path_nocompile(
+    q_mm: torch.Tensor,
     k_eff: torch.Tensor,
     weights: torch.Tensor,
     valid: torch.Tensor,
     global_token: torch.Tensor,
     k_take: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if _USE_BF16_MATMUL:
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            scores = torch.matmul(q, k_eff.transpose(-1, -2))
-        scores = scores.float()
-    else:
-        scores = torch.matmul(q, k_eff.transpose(-1, -2))
-
+    scores = torch.matmul(q_mm, k_eff.transpose(-1, -2)).float()
     final_scores = (torch.relu(scores) * weights.unsqueeze(-1)).sum(dim=1)
     final_scores = final_scores.masked_fill(~valid, float("-inf"))
-
     _values, topk_flat = torch.topk(final_scores, k=k_take, dim=-1)
     topk_global = global_token.gather(1, topk_flat)
     good = torch.isfinite(_values) & valid.gather(1, topk_flat)
     return topk_global, good
 
 
-def _get_hot_path() -> callable:
+def _get_compiled_hot() -> Callable:
     global _compiled_hot
     if _compiled_hot is not None:
         return _compiled_hot
-    if torch.cuda.is_available() and _COMPILE_ENABLED:
-        try:
-            _compiled_hot = torch.compile(_hot_path, dynamic=True, mode="reduce-overhead")
-        except Exception:
-            _compiled_hot = _hot_path
-    else:
-        _compiled_hot = _hot_path
+    if not (torch.cuda.is_available() and _COMPILE_ENABLED):
+        _compiled_hot = _hot_path_nocompile
+        return _compiled_hot
+    try:
+        mode = os.environ.get("FIB_TORCH_COMPILE_MODE", "max-autotune")
+        _compiled_hot = torch.compile(_hot_path_nocompile, dynamic=True, mode=mode)
+    except Exception:
+        _compiled_hot = _hot_path_nocompile
     return _compiled_hot
 
 
@@ -88,9 +87,14 @@ def kernel(q_index_fp8, k_index_cache_fp8, weights, seq_lens, block_table):
     bt = block_table.to(torch.long)
 
     torch.set_float32_matmul_precision("high")
+    if torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
 
+    use_bf16 = _USE_BF16_MATMUL and torch.cuda.is_available()
+    k_all = _dequant_fp8_kv_cache(k_index_cache_fp8, out_bf16=use_bf16)
     q = q_index_fp8.to(torch.float32).contiguous()
-    k_all = _dequant_fp8_kv_cache(k_index_cache_fp8)
+    q_mm = q.to(torch.bfloat16) if use_bf16 else q
 
     _, max_num_pages = bt.shape
     t_flat = max_num_pages * page_size
@@ -111,8 +115,13 @@ def kernel(q_index_fp8, k_index_cache_fp8, weights, seq_lens, block_table):
     valid = j.unsqueeze(0) < seq_lens.to(device).unsqueeze(1)
 
     k_take = min(topk, t_eff)
-    hot = _get_hot_path()
-    topk_global, good = hot(q, k_flat, weights, valid, global_token, k_take)
+
+    if use_bf16 and t_eff >= _COMPILE_MIN_TOKENS and _COMPILE_ENABLED:
+        hot = _get_compiled_hot()
+    else:
+        hot = _hot_path_nocompile
+
+    topk_global, good = hot(q_mm, k_flat, weights, valid, global_token, k_take)
 
     topk_indices = torch.full((batch_size, topk), -1, dtype=torch.int32, device=device)
     topk_indices[:, :k_take] = torch.where(
