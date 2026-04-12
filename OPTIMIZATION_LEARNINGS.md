@@ -28,6 +28,10 @@
 
 **Next options to try (not run):** approximate / two-stage top-k; fused gather→GEMM or FP8 TC GEMM (under rtol/atol); custom top-k kernel for large N, K=2048.
 
+| 17 | 2026-03-30 | **`topk_out` `sorted=true`** | **7.06×**, 17/17 | **Reverted** — slower than `sorted=false` on smoke. |
+| 18 | 2026-03-30 | **`at::matmul`** instead of `torch::bmm` for logits | **7.54×**, 17/17 | **Reverted** — no win vs `bmm`+`contiguous()`. |
+| 19 | 2026-03-30 | **`page_transform_batched_kernel` `BLOCK_T` 256→128** | **8.54×**, 17/17 | **Kept** — best smoke this session; **re-run full 128** to confirm (BLOCK_T sweeps were noisy historically). |
+
 ## Next ideas (not run — billing / time)
 
 10. **`torch::matmul`** instead of `bmm` for `[B,H,D]@[B,D,S]` — often same backend; verify once.

@@ -194,7 +194,7 @@ void run(
     // Phase 4 — topk
     // Phase 5 — page-table transform → global token indices
     // -------------------------------------------------------------------------
-    constexpr int BLOCK_T = 256;
+    constexpr int BLOCK_T = 128;
     auto w_bcast = weights.contiguous().unsqueeze(2);
     logits.relu_();
     logits.mul_(w_bcast);
