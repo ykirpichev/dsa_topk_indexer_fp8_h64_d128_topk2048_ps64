@@ -66,7 +66,7 @@ def _get_compiled_hot() -> Callable:
         _compiled_hot = _hot_path_nocompile
         return _compiled_hot
     try:
-        mode = os.environ.get("FIB_TORCH_COMPILE_MODE", "max-autotune")
+        mode = os.environ.get("FIB_TORCH_COMPILE_MODE", "default")
         _compiled_hot = torch.compile(_hot_path_nocompile, dynamic=True, mode=mode)
     except Exception:
         _compiled_hot = _hot_path_nocompile
@@ -92,10 +92,10 @@ def kernel(q_index_fp8, k_index_cache_fp8, weights, seq_lens, block_table):
         torch.backends.cudnn.allow_tf32 = True
 
     use_bf16 = _USE_BF16_MATMUL and torch.cuda.is_available()
-    k_all = _dequant_fp8_kv_cache(k_index_cache_fp8, out_bf16=use_bf16)
     q = q_index_fp8.to(torch.float32).contiguous()
     q_mm = q.to(torch.bfloat16) if use_bf16 else q
 
+    num_pages_total = k_index_cache_fp8.shape[0]
     _, max_num_pages = bt.shape
     t_flat = max_num_pages * page_size
 
@@ -109,7 +109,14 @@ def kernel(q_index_fp8, k_index_cache_fp8, weights, seq_lens, block_table):
     off = j % page_size
 
     phys_page = bt[:, slot]
-    k_flat = k_all[phys_page, off].contiguous()
+    # Dequant only physical pages that appear in this forward (not the whole cache).
+    uniq = torch.unique(phys_page)
+    k_uniq = _dequant_fp8_kv_cache(k_index_cache_fp8[uniq], out_bf16=use_bf16)
+    mapper = torch.full((num_pages_total,), -1, dtype=torch.long, device=device)
+    mapper[uniq] = torch.arange(uniq.numel(), device=device, dtype=torch.long)
+    row = mapper[phys_page]
+    off_exp = off.unsqueeze(0).expand(batch_size, -1)
+    k_flat = k_uniq[row, off_exp].contiguous()
     global_token = (phys_page * page_size + off).contiguous()
 
     valid = j.unsqueeze(0) < seq_lens.to(device).unsqueeze(1)
