@@ -15,8 +15,8 @@ import torch
 
 _USE_BF16_MATMUL = os.environ.get("FIB_MATMUL_BF16", "1").lower() not in ("0", "false", "no")
 _COMPILE_ENABLED = os.environ.get("FIB_TORCH_COMPILE", "1").lower() not in ("0", "false", "no")
-# Skip compile on tiny problems (compile/autotune overhead dominates).
-_COMPILE_MIN_TOKENS = int(os.environ.get("FIB_COMPILE_MIN_TOKENS", "1024"))
+# Skip compile on tiny problems (compile overhead can dominate).
+_COMPILE_MIN_TOKENS = int(os.environ.get("FIB_COMPILE_MIN_TOKENS", "256"))
 
 _compiled_hot: Optional[Callable] = None
 
@@ -66,7 +66,7 @@ def _get_compiled_hot() -> Callable:
         _compiled_hot = _hot_path_nocompile
         return _compiled_hot
     try:
-        mode = os.environ.get("FIB_TORCH_COMPILE_MODE", "default")
+        mode = os.environ.get("FIB_TORCH_COMPILE_MODE", "reduce-overhead")
         _compiled_hot = torch.compile(_hot_path_nocompile, dynamic=True, mode=mode)
     except Exception:
         _compiled_hot = _hot_path_nocompile
