@@ -21,6 +21,7 @@
 | 10 | 2026-03-30 | **Combined:** `sum_out` → reused `scores_buf[max_seq_len]` + `topk_out` → reused `topk_vals_buf[B,K_topk]` (slices per batch row) | **7.39×**, 17/17 PASSED (`FIB_MODAL_SMOKE=1`, Modal B200) | **Kept** — `submission-v4` @ `9b29407` (after `python3 scripts/pack_solution.py`; `solution.json` unchanged). JIT `topk_cuda_cublas_buf`. |
 | 11 | 2026-03-30 | **Batched** `logits.sum(dim=1)` → `[B,S]`, mask tail with `-inf`, per-row `topk` on `narrow(0,0,sl)` | **9.46×** geomean but **7/17 INCORRECT_NUMERICAL** | **Reverted** — `sum` over full padded `S` changes FP reduction order vs reference `narrow(...,sl).sum(0)` on `[H,sl]`; dataset relaxes tolerance somewhat but **still** fails top-k index checks on large-T rows. |
 | 12 | 2026-03-30 | **Top-k:** `sorted=false` + when `min(seq_len) ≥ K_topk`, one batched `topk` on `[B, max_seq_len]` (padded `-inf`); else per-row `topk` | **8.12×**, 17/17 PASSED (`FIB_MODAL_SMOKE=1`, `FIB_RTOL=265` `FIB_ATOL=17500`) | **Kept** — `run_modal.py` forwards rtol/atol; JIT `topk_cuda_cublas_topkopt`. Match column not 1.0 when ties reorder; strict contest may need `sorted=true` or full-128 check. |
+| 13 | 2026-03-30 | **Head reduction (profiler #1):** `mask_logits_past_seq_len_kernel` zeros `[b,h,s]` for `s≥sl`, then **one** `logits.sum(dim=1)` → `[B,S]`; topk unchanged | **8.50×**, 17/17 PASSED (same Modal rtol/atol) | **Kept** — replaces B× `sum_out` on slices (~45% CUDA at idx 127); JIT `topk_cuda_cublas_bsum2`. |
 
 ## Next ideas (not run — billing / time)
 
