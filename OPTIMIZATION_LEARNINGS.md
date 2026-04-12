@@ -194,3 +194,11 @@ None of these are “free”; each trades implementation cost and/or numerical p
 ```bash
 FIB_MODAL_PROFILE=1 FIB_PROFILE_WORKLOAD_INDEX=127 FIB_PROFILE_REPEAT=6 modal run scripts/modal_profile.py
 ```
+
+### After batched head-sum + GPU score-mask (current `kernel.cu`)
+
+**Full Modal:** `modal run scripts/run_modal.py` — **128/128 PASSED**, **geomean ~10.25×** (default `FIB_RTOL`/`FIB_ATOL`).
+
+**Workload index 127** (`torch.profiler`, 6 repeats): **`aten::topk`** **~61%** Self CUDA; **`aten::sum`** **~2.2%**; **`aten::bmm`** **~12%**; **`gather_dequant_kernel`** **~12%**; **`mask_logits`** **~1.6%**; **`page_transform`** **~1.7%**.
+
+**Next priority:** **`aten::topk`** (dominant again). Then **GEMM + gather** (~24% combined) for further gains (e.g. Tensor Core / fused gather).
