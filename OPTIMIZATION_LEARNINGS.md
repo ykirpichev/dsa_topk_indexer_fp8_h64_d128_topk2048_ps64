@@ -2,6 +2,8 @@
 
 **Policy:** Commit / tag **only** when a change shows a **clear win** on Modal smoke **or** full 128 (same harness config). Everything else lives here.
 
+**Submission `submission-v5`:** Full Modal **`modal run scripts/run_modal.py`**: **128/128 PASSED**, **geomean 12.66×** vs reference, **match 1.0000** all rows, **`FIB_RTOL`/`FIB_ATOL` = 0.01**. CUDA: invalid-K zeroing in gather + **`--ftz=true` `--prec-div=false`** (`topk_cuda_cublas_ftz`). Pack before eval: `python3 scripts/pack_solution.py` (`solution.json` gitignored; contest uses `config.toml` + `solution/` sources).
+
 **Modal harness (2026):** `scripts/run_modal.py` uses **`flashinfer/flashinfer-ci-cu132`** + **`pip install git+.../flashinfer.git`** + **`git+.../flashinfer-bench.git`** + **`cupti-python`** to mirror contest **EVALUATION.md**. Default **`FIB_RTOL`/`FIB_ATOL` = 0.01** (FlashInfer-Bench `BenchmarkConfig`); relaxed thresholds only via env.
 
 | 20 | 2026-03-30 | **Fused invalid-K in gather:** `gather_dequant_kernel` zeros `K[b,s,:]` when `s≥sl`; removed `mask_logits_past_seq_len_kernel` | **8.75×**, 17/17, **match 1.0** (strict `rtol/atol=0.01`) | **Kept** — JIT `topk_cuda_cublas_gather_mask`. Same logits as zeroing after bmm; saves one `[B,H,S]` mask kernel. |
@@ -35,6 +37,7 @@
 | 17 | 2026-03-30 | **`topk_out` `sorted=true`** | **7.06×**, 17/17 | **Reverted** — slower than `sorted=false` on smoke. |
 | 18 | 2026-03-30 | **`at::matmul`** instead of `torch::bmm` for logits | **7.54×**, 17/17 | **Reverted** — no win vs `bmm`+`contiguous()`. |
 | 19 | 2026-03-30 | **`page_transform_batched_kernel` `BLOCK_T` 256→128** | **8.54×**, 17/17 | **Kept** — best smoke this session; **re-run full 128** to confirm (BLOCK_T sweeps were noisy historically). |
+| 22 | 2026-03-30 | **nvcc `--ftz=true` `--prec-div=false`** + fused gather-mask (current stack) | **12.66×**, **128/128**, match **1.0** (full Modal, `rtol=atol=0.01`) | **Kept** — **`submission-v5`** @ tag commit (see top of file). JIT `topk_cuda_cublas_ftz`. |
 
 ## Next ideas (not run — billing / time)
 
