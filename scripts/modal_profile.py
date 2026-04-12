@@ -43,7 +43,9 @@ TRACE_SET_PATH = "/data"
 
 image = (
     modal.Image.from_registry("flashinfer/flashinfer-ci-cu132:latest", add_python="3.12")
-    .pip_install("flashinfer-bench")
+    .pip_install("git+https://github.com/flashinfer-ai/flashinfer.git")
+    .pip_install("git+https://github.com/flashinfer-ai/flashinfer-bench.git")
+    .pip_install("cupti-python")
 )
 
 

@@ -2,6 +2,8 @@
 
 **Policy:** Commit / tag **only** when a change shows a **clear win** on Modal smoke **or** full 128 (same harness config). Everything else lives here.
 
+**Modal harness (2026):** `scripts/run_modal.py` uses **`flashinfer/flashinfer-ci-cu132`** + **`pip install git+.../flashinfer.git`** + **`git+.../flashinfer-bench.git`** + **`cupti-python`** to mirror contest **EVALUATION.md**. Default **`FIB_RTOL`/`FIB_ATOL` = 0.01** (FlashInfer-Bench `BenchmarkConfig`); relaxed thresholds only via env.
+
 **Baseline (reference kernel):** `gather` + `bmm` + `.contiguous()` + in-place `relu_` / `mul_` + `topk_out` + batched `page_transform`. Smoke geomean **varies run-to-run** on Modal (e.g. **~6.85×–7.5×** seen); treat **≥0.15×** relative gain as “maybe real” only if repeated.
 
 ## Log (chronological)

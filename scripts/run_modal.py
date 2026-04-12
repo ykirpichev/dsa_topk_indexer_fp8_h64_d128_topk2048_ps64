@@ -20,11 +20,15 @@ Optional: raise per-workload solver timeout or Modal function timeout (seconds):
 
     FIB_MODAL_WORKLOAD_TIMEOUT_SEC=3600 FIB_MODAL_FN_TIMEOUT_SEC=28800 modal run scripts/run_modal.py
 
-Correctness thresholds (passed to ``flashinfer_bench.BenchmarkConfig``; forwarded from local env into the Modal worker)::
+Correctness thresholds (``BenchmarkConfig``; forwarded into the Modal worker)::
 
+    # Defaults match FlashInfer-Bench ``BenchmarkConfig`` (strict)
+    modal run scripts/run_modal.py
+
+    # Relaxed (only when explicitly needed)
     FIB_RTOL=265 FIB_ATOL=17500 modal run scripts/run_modal.py
 
-Defaults (if unset): ``FIB_RTOL=265``, ``FIB_ATOL=17500``. For strict FlashInfer-Bench defaults use e.g. ``FIB_RTOL=0.01 FIB_ATOL=0.01``.
+Container deps match evaluation (``EVALUATION.md``): ``flashinfer/flashinfer-ci-cu132`` + FlashInfer + FlashInfer-Bench from GitHub main + ``cupti-python`` (see ``image =`` below).
 
 Setup (one-time):
     modal setup
@@ -59,9 +63,12 @@ _HDS     = 132   # bytes per token in KV cache (128 FP8 + 4 float32 scale)
 _K_TOPK  = 2048  # topk
 _B200_HBM_BW_TBS = 8.0  # B200 HBM3e peak bandwidth (TB/s)
 
+# Match EVALUATION.md: base image + FlashInfer + FlashInfer-Bench from GitHub main + cupti-python
 image = (
     modal.Image.from_registry("flashinfer/flashinfer-ci-cu132:latest", add_python="3.12")
-    .pip_install("flashinfer-bench")
+    .pip_install("git+https://github.com/flashinfer-ai/flashinfer.git")
+    .pip_install("git+https://github.com/flashinfer-ai/flashinfer-bench.git")
+    .pip_install("cupti-python")
 )
 
 
@@ -99,11 +106,12 @@ def _roofline_ms(seq_lens: list[int]) -> float:
 
 
 def _default_rtol() -> float:
-    return float(os.environ.get("FIB_RTOL", "265"))
+    # Match flashinfer_bench.BenchmarkConfig default unless overridden
+    return float(os.environ.get("FIB_RTOL", "0.01"))
 
 
 def _default_atol() -> float:
-    return float(os.environ.get("FIB_ATOL", "17500"))
+    return float(os.environ.get("FIB_ATOL", "0.01"))
 
 
 @app.function(image=image, gpu="B200:1", timeout=_MODAL_FN_TIMEOUT, volumes={TRACE_SET_PATH: trace_volume})
@@ -283,8 +291,8 @@ def main():
     solution = Solution.model_validate_json(solution_path.read_text())
     print(f"Loaded: {solution.name} ({solution.definition})")
 
-    rtol = float(os.environ.get("FIB_RTOL", "265"))
-    atol = float(os.environ.get("FIB_ATOL", "17500"))
+    rtol = float(os.environ.get("FIB_RTOL", "0.01"))
+    atol = float(os.environ.get("FIB_ATOL", "0.01"))
     print(f"\nCorrectness thresholds: rtol={rtol}, atol={atol}")
 
     if smoke:
