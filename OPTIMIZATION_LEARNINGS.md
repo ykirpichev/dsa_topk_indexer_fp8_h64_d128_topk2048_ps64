@@ -171,17 +171,55 @@ done
 | **`page_transform_batched_kernel`** | **~3%** | |
 | **`aten::copy_`** / DtoH | **~7–10%** combined | Host sync path |
 
-### Large **T** (workload index **127**, `FIB_PROFILE_REPEAT=6`)
+### Large **T** (workload index **127**, `FIB_PROFILE_REPEAT=6`) — **after gather-mask fusion**
 
 | Bucket | ~% Self CUDA | Notes |
 |--------|----------------|--------|
-| **`aten::sum`** over heads | **~44.6%** | **Dominant** — 150 `sum` ops in trace (batched path: per-row `sum_out` into padded buffer) |
-| **`aten::topk`** (`gatherTopK`) | **~34.6%** | 150 `topk` calls |
-| **`aten::bmm`** / CUTLASS | **~7.0%** | GEMM finally non-trivial vs sum+topk |
-| **`gather_dequant_kernel`** | **~7.0%** | Scales with tokens |
-| **`aten::mul_`** (relu×weights epilogue) | **~2.2%** | |
+| **`aten::topk`** (`gatherTopK`) | **~62%** | **Dominant** (150 calls in trace) |
+| **`aten::bmm`** / CUTLASS | **~12%** | |
+| **`gather_dequant_kernel`** | **~12%** | |
+| **`aten::mul_`** | **~4%** | relu×weights epilogue |
+| **`aten::sum`** over heads | **~2%** | Batched `sum(dim=1)` |
+| **`page_transform_batched_kernel`** | **~3%** | |
+| CPU bookkeeping (`slice`/`narrow`/`select`) | **high CPU %** | Not GPU; torch overhead around views |
 
-**Conclusion:** At **large sequence length**, **head reduction (`sum`)** and **top-k** dominate (**~79%** combined). `page_transform` is still a small slice. **`bmm` and gather** are large enough that **Tensor Core / FP8 GEMM** and **fused gather→GEMM** are the main levers for **large jumps** in speedup—not micro-tuning `BLOCK_T`.
+**Conclusion:** **`topk`** is the main GPU bucket; **GEMM + gather** ~24% combined. Tuning **`BLOCK_T`** alone moves smoke mostly through **noise** unless profile shows `page_transform` hot (here ~3%).
+
+### 15 ideas (ordered roughly by expected impact vs effort)
+
+1. **Custom or two-stage top-k** for large **N** / fixed **K** (radix tiles, shortlist → exact).
+2. **Fused gather + GEMM** — avoid full **`K_batched`** write (hard; numerics).
+3. **FP8 / Tensor Core GEMM** for `q @ K^T` if tolerances allow.
+4. **nvcc `--ftz=true` `--prec-div=false`** — faster non-IEEE FP in custom + generated code (measure full 128).
+5. **`-Xptxas -O3`** PTX assembler tuning.
+6. **`page_transform` `BLOCK_T` sweep** (128 / 256 / 512) — micro when kernel is ~3% GPU.
+7. **`mask_scores` launch width** (256 vs 512 threads) — micro.
+8. **`K^T` contiguous** before `bmm` — sometimes helps cuBLAS; often neutral or worse.
+9. **CUDA graph** capture of steady-state (if harness repeats same shapes).
+10. **Vectorized `uint4` loads** in `gather_dequant_kernel`.
+11. **Fuse relu×weights** into gather or GEMM epilogue (numerics risk).
+12. **`__launch_bounds__`** on `page_transform` / gather.
+13. **Reduce `aten` view churn** — fewer `narrow`/`select` in C++ if API allows.
+14. **Preallocate `logits` + `bmm_out`** — neutral in past tries; re-check after other changes.
+15. **cuBLASLt** batched GEMM — only if bit-exact vs `bmm`.
+
+### Ablation top-10 (Modal smoke, 17 wl, strict `rtol=atol=0.01`)
+
+Script: `scripts/ablation_top10.py --id N`. Baseline = **HEAD** `kernel.cu`/`binding.py` (gather-mask).
+
+| id | Change | Geomean | Verdict |
+|----|--------|---------|---------|
+| 0 | baseline `BLOCK_T=128`, `-O3` only | **8.20×** | ref |
+| 1 | + `-Xptxas -O3` | **8.85×** | keep candidate |
+| 2 | `BLOCK_T=256` | **8.30×** | noise |
+| 3 | `BLOCK_T=512` | **9.08×** | noise |
+| 4 | `mask_scores` block 512 | **7.77×** | worse |
+| 5 | `K_T` contiguous + `bmm` | **7.36×** | worse |
+| 6 | + `--ftz=true --prec-div=false` | **9.34×** | **landed** (JIT `topk_cuda_cublas_ftz`) |
+| 7 | `BLOCK_T=256` + PTX `-O3` | **9.09×** | noise vs id 6 |
+| 9 | JIT name bump only | **8.66×** | rebuild noise |
+
+**Landed:** id **6** only — verify **full 128** still **PASSED** under strict thresholds.
 
 ### On **~30×** speedup at large **T**
 
