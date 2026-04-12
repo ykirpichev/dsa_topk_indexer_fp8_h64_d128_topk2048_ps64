@@ -7,5 +7,5 @@ author = "team-name"              # Team/author name
 language = "triton"               # triton | cuda
 entry_point = "kernel.py::kernel" # file::function (BuildSpec format)
 destination_passing_style = false # value-returning (topk_indices tuple)
-# Pip-style deps for submission metadata / official env (see FAQ)
-dependencies = ["deep-gemm", "flashinfer-python"]
+# Pure PyTorch path: no extra pip deps (see branch pytorch-bmm)
+dependencies = []
