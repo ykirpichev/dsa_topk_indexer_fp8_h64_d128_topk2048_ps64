@@ -20,6 +20,12 @@ Optional: raise per-workload solver timeout or Modal function timeout (seconds):
 
     FIB_MODAL_WORKLOAD_TIMEOUT_SEC=3600 FIB_MODAL_FN_TIMEOUT_SEC=28800 modal run scripts/run_modal.py
 
+Correctness thresholds (passed to ``flashinfer_bench.BenchmarkConfig``; forwarded from local env into the Modal worker)::
+
+    FIB_RTOL=265 FIB_ATOL=17500 modal run scripts/run_modal.py
+
+Defaults (if unset): ``FIB_RTOL=265``, ``FIB_ATOL=17500``. For strict FlashInfer-Bench defaults use e.g. ``FIB_RTOL=0.01 FIB_ATOL=0.01``.
+
 Setup (one-time):
     modal setup
     modal volume create flashinfer-trace
@@ -92,11 +98,32 @@ def _roofline_ms(seq_lens: list[int]) -> float:
     return total / (_B200_HBM_BW_TBS * 1e12) * 1e3
 
 
+def _default_rtol() -> float:
+    return float(os.environ.get("FIB_RTOL", "265"))
+
+
+def _default_atol() -> float:
+    return float(os.environ.get("FIB_ATOL", "17500"))
+
+
 @app.function(image=image, gpu="B200:1", timeout=_MODAL_FN_TIMEOUT, volumes={TRACE_SET_PATH: trace_volume})
 def run_benchmark(
-    solution: Solution, smoke: bool = False, max_workloads: int | None = None
+    solution: Solution,
+    smoke: bool = False,
+    max_workloads: int | None = None,
+    rtol: float | None = None,
+    atol: float | None = None,
 ) -> dict:
-    """Run benchmark on Modal B200 and return results."""
+    """Run benchmark on Modal B200 and return results.
+
+    rtol/atol are passed explicitly from the local entrypoint so the Modal worker
+    uses the same thresholds as the invoking shell (remote env may not mirror local).
+    """
+    if rtol is None:
+        rtol = _default_rtol()
+    if atol is None:
+        atol = _default_atol()
+
     if smoke:
         # Fewer workloads / trials than production, but profile_baseline=True is required
         # for reference_latency_ms and speedup_factor.
@@ -106,6 +133,8 @@ def run_benchmark(
             num_trials=3,
             timeout_seconds=1800,
             profile_baseline=True,
+            rtol=rtol,
+            atol=atol,
         )
         workload_limit = 17
     else:
@@ -115,6 +144,8 @@ def run_benchmark(
             iterations=100,
             num_trials=5,
             timeout_seconds=max(300, wl_to),
+            rtol=rtol,
+            atol=atol,
         )
         workload_limit = None
 
@@ -252,13 +283,17 @@ def main():
     solution = Solution.model_validate_json(solution_path.read_text())
     print(f"Loaded: {solution.name} ({solution.definition})")
 
+    rtol = float(os.environ.get("FIB_RTOL", "265"))
+    atol = float(os.environ.get("FIB_ATOL", "17500"))
+    print(f"\nCorrectness thresholds: rtol={rtol}, atol={atol}")
+
     if smoke:
         print("\nRunning smoke benchmark on Modal B200 (17 workloads, timed vs reference)...")
     elif max_workloads:
         print(f"\nRunning benchmark on Modal B200 (first {max_workloads} workloads)...")
     else:
         print("\nRunning full benchmark on Modal B200...")
-    results = run_benchmark.remote(solution, smoke=smoke, max_workloads=max_workloads)
+    results = run_benchmark.remote(solution, smoke=smoke, max_workloads=max_workloads, rtol=rtol, atol=atol)
 
     if not results:
         print("No results returned!")
