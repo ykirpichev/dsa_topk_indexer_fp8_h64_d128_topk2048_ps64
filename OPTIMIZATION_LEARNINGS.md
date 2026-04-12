@@ -4,6 +4,8 @@
 
 **Modal harness (2026):** `scripts/run_modal.py` uses **`flashinfer/flashinfer-ci-cu132`** + **`pip install git+.../flashinfer.git`** + **`git+.../flashinfer-bench.git`** + **`cupti-python`** to mirror contest **EVALUATION.md**. Default **`FIB_RTOL`/`FIB_ATOL` = 0.01** (FlashInfer-Bench `BenchmarkConfig`); relaxed thresholds only via env.
 
+| 20 | 2026-03-30 | **Fused invalid-K in gather:** `gather_dequant_kernel` zeros `K[b,s,:]` when `s≥sl`; removed `mask_logits_past_seq_len_kernel` | **8.75×**, 17/17, **match 1.0** (strict `rtol/atol=0.01`) | **Kept** — JIT `topk_cuda_cublas_gather_mask`. Same logits as zeroing after bmm; saves one `[B,H,S]` mask kernel. |
+
 **Baseline (reference kernel):** `gather` + `bmm` + `.contiguous()` + in-place `relu_` / `mul_` + `topk_out` + batched `page_transform`. Smoke geomean **varies run-to-run** on Modal (e.g. **~6.85×–7.5×** seen); treat **≥0.15×** relative gain as “maybe real” only if repeated.
 
 ## Log (chronological)

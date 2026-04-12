@@ -5,7 +5,7 @@
  *   1. Fused FP8 page gather + dequant  (custom CUDA kernel)
  *   2. Batched GEMM: q @ K^T            (torch::bmm, float32)
  *   3. In-place relu_ + mul_(weights) on logits (bit-exact vs relu*weights)
- *   4. Mask invalid [s >= seq_len] to 0, batched sum over heads → [B,S]; topk
+ *   4. Invalid K rows zeroed in gather; batched sum over heads → [B,S]; topk
  *   5. Batched page_transform: int64 top-k indices + device seq_lens → global int32
  *
  * NaN handling: FP8 E4M3 NaN bytes propagate as float NaN through K_batched
@@ -32,6 +32,7 @@
 __global__ void gather_dequant_kernel(
         const uint8_t* __restrict__ cache,
         const int32_t* __restrict__ block_table,
+        const int32_t* __restrict__ seq_lens,
         float*         __restrict__ K_batched,
         int B, int S, int D, int P, int PS, int HDS, int actual_pages)
 {
@@ -41,6 +42,12 @@ __global__ void gather_dequant_kernel(
     const int s = token_idx % S;
     const int d = threadIdx.x;
     if (d >= D) return;
+
+    // Invalid tail tokens: K=0 → q@K^T gives 0 logits (same as post-bmm mask; avoids extra pass)
+    if (s >= seq_lens[b]) {
+        K_batched[token_idx * D + d] = 0.f;
+        return;
+    }
 
     const int page_id  = block_table[b * actual_pages + s / PS];
     const int t        = s % PS;
@@ -55,25 +62,6 @@ __global__ void gather_dequant_kernel(
 
     // NaN FP8 → float NaN → NaN * scale = NaN → relu(NaN) = 0 later.
     K_batched[token_idx * D + d] = static_cast<float>(fp8_val) * scale;
-}
-
-// Zero logits[b,h,s] for s >= seq_lens[b] so sum(dim=1) matches narrow(1,0,sl).sum(0).
-// logits: [B, H, S] contiguous float32.
-// ============================================================================
-__global__ void mask_logits_past_seq_len_kernel(
-        float* __restrict__ logits,
-        const int32_t* __restrict__ seq_lens,
-        int B, int H, int S)
-{
-    const int bh = blockIdx.x;
-    const int b = bh / H;
-    const int h = bh % H;
-    if (b >= B || h >= H) return;
-    const int sl = seq_lens[b];
-    const long long base = ((long long)b * H + h) * S;
-    for (int s = (int)threadIdx.x + sl; s < S; s += (int)blockDim.x) {
-        logits[base + s] = 0.f;
-    }
 }
 
 // For batched topk: scores[b,s] = -inf for s >= seq_lens[b] (invalid positions).
@@ -169,9 +157,11 @@ void run(
                              .to(torch::kInt32).clamp(0, P - 1).contiguous();
     int32_t*     out_ptr = topk_indices.data_ptr<int32_t>();
     cudaStream_t stream  = at::cuda::getCurrentCUDAStream();
+    torch::Tensor seq_lens_dev = seq_lens.to(q_index_fp8.device()).to(torch::kInt32).contiguous();
 
     // -------------------------------------------------------------------------
     // Phase 1 — fused gather + FP8 dequant + scale → K_batched [B, S, D]
+    // (invalid s >= seq_len[b] written as 0 — no separate logits mask pass)
     // -------------------------------------------------------------------------
     const int num_tokens = B * S;
     torch::Tensor K_batched = torch::empty({B, S, D},
@@ -180,6 +170,7 @@ void run(
     gather_dequant_kernel<<<num_tokens, D, 0, stream>>>(
             cache_u8.data_ptr<uint8_t>(),
             bt_i32.data_ptr<int32_t>(),
+            seq_lens_dev.data_ptr<int32_t>(),
             K_batched.data_ptr<float>(),
             B, S, D, P, PS, HDS, actual_pages);
 
@@ -198,13 +189,6 @@ void run(
     auto w_bcast = weights.contiguous().unsqueeze(2);
     logits.relu_();
     logits.mul_(w_bcast);
-
-    torch::Tensor seq_lens_dev = seq_lens.to(logits.device()).to(torch::kInt32).contiguous();
-    const int n_bh = B * H;
-    mask_logits_past_seq_len_kernel<<<n_bh, 256, 0, stream>>>(
-            logits.data_ptr<float>(),
-            seq_lens_dev.data_ptr<int32_t>(),
-            B, H, S);
 
     // One batched reduction over heads (replaces B× sum_out on [H,sl] slices in profiler).
     auto scores_2d = logits.sum(/*dim=*/1);
