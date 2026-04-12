@@ -1,8 +1,8 @@
 """
-DSA Top-K indexer — pure PyTorch reference path using batched GEMM (torch.bmm).
+DSA Top-K indexer — pure PyTorch, batched paged layout + masks (deep_gemm-style).
 
-Scores per head: bmm(q.unsqueeze(1), K_batched.transpose(1, 2)) in place of q @ K.T,
-then ReLU, learned head weights, sum, top-k. Matches the contest reference semantics.
+Flattens block_table to length max_num_pages * page_size, gathers K and global token ids,
+masks invalid positions past seq_lens, then batched bmm for per-head scores.
 """
 
 import torch
@@ -28,7 +28,7 @@ def _dequant_fp8_kv_cache(k_index_cache_fp8: torch.Tensor) -> torch.Tensor:
 @torch.no_grad()
 def kernel(q_index_fp8, k_index_cache_fp8, weights, seq_lens, block_table):
     batch_size, num_index_heads, index_head_dim = q_index_fp8.shape
-    num_pages, page_size, _, _ = k_index_cache_fp8.shape
+    _num_pages, page_size, _, _ = k_index_cache_fp8.shape
     topk = 2048
 
     assert num_index_heads == 64
@@ -36,40 +36,47 @@ def kernel(q_index_fp8, k_index_cache_fp8, weights, seq_lens, block_table):
     assert page_size == 64
 
     device = q_index_fp8.device
+    bt = block_table.to(torch.long)
 
     q = q_index_fp8.to(torch.float32)
     k_all = _dequant_fp8_kv_cache(k_index_cache_fp8)
 
+    _, max_num_pages = bt.shape
+    t_flat = max_num_pages * page_size
+    j = torch.arange(t_flat, device=device, dtype=torch.long)
+    slot = j // page_size
+    off = j % page_size
+
+    phys_page = bt[:, slot]
+    k_flat = k_all[phys_page, off]
+    global_token = phys_page * page_size + off
+
+    valid = j.unsqueeze(0) < seq_lens.to(device).unsqueeze(1)
+
+    bh = batch_size * num_index_heads
+    k_bh = k_flat.unsqueeze(1).expand(-1, num_index_heads, -1, -1).reshape(bh, t_flat, index_head_dim)
+    scores = torch.bmm(
+        q.reshape(bh, 1, index_head_dim),
+        k_bh.transpose(1, 2),
+    ).view(batch_size, num_index_heads, t_flat)
+
+    scores_relu = torch.relu(scores)
+    final_scores = (scores_relu * weights.unsqueeze(-1)).sum(dim=1)
+    final_scores = final_scores.masked_fill(~valid, float("-inf"))
+
+    k_take = min(topk, t_flat)
+    values, topk_flat = torch.topk(final_scores, k=k_take, dim=-1)
+
+    topk_global = global_token.gather(1, topk_flat)
+    good = torch.isfinite(values) & valid.gather(1, topk_flat)
+
     topk_indices = torch.full((batch_size, topk), -1, dtype=torch.int32, device=device)
+    topk_indices[:, :k_take] = torch.where(good, topk_global, torch.tensor(-1, device=device, dtype=torch.long)).to(
+        torch.int32
+    )
 
-    for b in range(batch_size):
-        seq_len = int(seq_lens[b].item())
-        if seq_len == 0:
-            continue
-
-        num_pages_for_seq = (seq_len + page_size - 1) // page_size
-        page_indices = block_table[b, :num_pages_for_seq].to(torch.long)
-
-        k_paged = k_all[page_indices]
-        k = k_paged.reshape(-1, index_head_dim)[:seq_len]
-
-        q_b = q[b]
-        # [H, 1, D] bmm [H, D, T] -> [H, 1, T]; same math as q_b @ k.T but uses bmm
-        k_b = k.unsqueeze(0).expand(num_index_heads, -1, -1)
-        scores = torch.bmm(q_b.unsqueeze(1), k_b.transpose(1, 2)).squeeze(1)
-
-        scores_relu = torch.relu(scores)
-        w = weights[b]
-        final_scores = (scores_relu * w[:, None]).sum(dim=0)
-
-        actual_topk = min(topk, seq_len)
-        _, topk_idx = torch.topk(final_scores, actual_topk)
-
-        page_idx_per_token = topk_idx // page_size
-        offset_per_token = topk_idx % page_size
-        global_page_idx = page_indices[page_idx_per_token]
-        topk_tokens = global_page_idx * page_size + offset_per_token
-
-        topk_indices[b, :actual_topk] = topk_tokens.to(torch.int32)
+    empty = seq_lens == 0
+    if empty.any():
+        topk_indices[empty] = -1
 
     return (topk_indices,)
