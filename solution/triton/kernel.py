@@ -49,12 +49,9 @@ def _hot_path_nocompile(
     global_token: torch.Tensor,
     k_take: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    scores = torch.matmul(q_mm, k_eff.transpose(-1, -2))
-    w = weights.unsqueeze(-1)
-    if scores.dtype == torch.bfloat16:
-        w = w.to(torch.bfloat16)
-    final_reduced = (torch.relu(scores) * w).sum(dim=1)
-    final_scores = final_reduced.float().masked_fill(~valid, float("-inf"))
+    scores = torch.matmul(q_mm, k_eff.transpose(-1, -2)).float()
+    final_scores = (torch.relu(scores) * weights.unsqueeze(-1)).sum(dim=1)
+    final_scores = final_scores.masked_fill(~valid, float("-inf"))
     _values, topk_flat = torch.topk(final_scores, k=k_take, dim=-1)
     topk_global = global_token.gather(1, topk_flat)
     good = torch.isfinite(_values) & valid.gather(1, topk_flat)
