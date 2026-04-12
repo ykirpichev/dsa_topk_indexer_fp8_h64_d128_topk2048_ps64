@@ -8,8 +8,21 @@ Setup (one-time):
     modal setup
     modal volume create flashinfer-trace
     modal volume put flashinfer-trace /path/to/flashinfer-trace/
+
+Troubleshooting:
+- safetensors "header too large" on the reference run: trace blobs are likely Git
+  LFS pointers. Run git lfs pull locally, then scripts/refresh_contest_dataset_modal.sh.
+
+The remote image is flashinfer/flashinfer-ci-cu132 (CUDA 13.2 + FlashInfer stack);
+flashinfer-bench is installed on top. DeepGEMM is built from source (git + submodules);
+flashinfer-python is pinned for import flashinfer. Set CUDA_HOME for DeepGEMM's setup.py.
+
+Correctness uses BenchmarkConfig rtol/atol (element-wise; see flashinfer_bench bench/utils).
+Default atol/rtol match scripts/bench_config.py (tightest values that pass all workloads
+for the current deep_gemm+FlashInfer kernel vs reference). Override with FIB_RTOL, FIB_ATOL.
 """
 
+import os
 import sys
 from pathlib import Path
 
@@ -22,12 +35,30 @@ from flashinfer_bench import Benchmark, BenchmarkConfig, Solution, TraceSet
 
 app = modal.App("flashinfer-bench")
 
+
+def default_benchmark_config() -> BenchmarkConfig:
+    """Keep numeric defaults in sync with scripts/bench_config.py (Modal mounts only this file)."""
+    return BenchmarkConfig(
+        warmup_runs=int(os.environ.get("FIB_WARMUP_RUNS", "3")),
+        iterations=int(os.environ.get("FIB_ITERATIONS", "10")),
+        num_trials=int(os.environ.get("FIB_NUM_TRIALS", "3")),
+        rtol=float(os.environ.get("FIB_RTOL", "265")),
+        atol=float(os.environ.get("FIB_ATOL", "17500")),
+    )
+
 trace_volume = modal.Volume.from_name("flashinfer-trace", create_if_missing=True)
 TRACE_SET_PATH = "/data"
 
 image = (
-    modal.Image.debian_slim(python_version="3.12")
-    .pip_install("flashinfer-bench", "torch", "triton", "numpy")
+    modal.Image.from_registry("flashinfer/flashinfer-ci-cu132:latest")
+    .apt_install("git")
+    .env({"CUDA_HOME": "/usr/local/cuda"})
+    .run_commands(
+        "git clone --recursive --depth 1 https://github.com/deepseek-ai/DeepGEMM.git /tmp/DeepGEMM",
+        # PEP517 isolated build has no torch; DeepGEMM setup.py imports torch
+        "pip install --no-build-isolation /tmp/DeepGEMM",
+    )
+    .pip_install("flashinfer-bench", "flashinfer-python", "wheel", "setuptools")
 )
 
 
@@ -35,7 +66,7 @@ image = (
 def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
     """Run benchmark on Modal B200 and return results."""
     if config is None:
-        config = BenchmarkConfig(warmup_runs=3, iterations=100, num_trials=5)
+        config = default_benchmark_config()
 
     trace_set = TraceSet.from_path(TRACE_SET_PATH)
 
@@ -107,6 +138,12 @@ def main():
     """Pack solution and run benchmark on Modal."""
     from scripts.pack_solution import pack_solution
 
+    bench_cfg = default_benchmark_config()
+    print(
+        f"Benchmark config: warmup={bench_cfg.warmup_runs} iters={bench_cfg.iterations} "
+        f"trials={bench_cfg.num_trials} rtol={bench_cfg.rtol:g} atol={bench_cfg.atol:g}"
+    )
+
     print("Packing solution from source files...")
     solution_path = pack_solution()
 
@@ -115,7 +152,7 @@ def main():
     print(f"Loaded: {solution.name} ({solution.definition})")
 
     print("\nRunning benchmark on Modal B200...")
-    results = run_benchmark.remote(solution)
+    results = run_benchmark.remote(solution, bench_cfg)
 
     if not results:
         print("No results returned!")

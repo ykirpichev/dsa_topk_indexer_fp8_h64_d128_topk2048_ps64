@@ -13,6 +13,7 @@ PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from flashinfer_bench import Benchmark, BenchmarkConfig, Solution, TraceSet
+from scripts.bench_config import default_benchmark_config
 from scripts.pack_solution import pack_solution
 
 
@@ -30,7 +31,7 @@ def get_trace_set_path() -> str:
 def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
     """Run benchmark locally and return results."""
     if config is None:
-        config = BenchmarkConfig(warmup_runs=3, iterations=100, num_trials=5)
+        config = default_benchmark_config()
 
     trace_set_path = get_trace_set_path()
     trace_set = TraceSet.from_path(trace_set_path)
@@ -100,6 +101,12 @@ def print_results(results: dict):
 
 def main():
     """Pack solution and run benchmark."""
+    bench_cfg = default_benchmark_config()
+    print(
+        f"Benchmark config: warmup={bench_cfg.warmup_runs} iters={bench_cfg.iterations} "
+        f"trials={bench_cfg.num_trials} rtol={bench_cfg.rtol:g} atol={bench_cfg.atol:g}"
+    )
+
     print("Packing solution from source files...")
     solution_path = pack_solution()
 
@@ -108,7 +115,7 @@ def main():
     print(f"Loaded: {solution.name} ({solution.definition})")
 
     print("\nRunning benchmark...")
-    results = run_benchmark(solution)
+    results = run_benchmark(solution, bench_cfg)
 
     if not results:
         print("No results returned!")
