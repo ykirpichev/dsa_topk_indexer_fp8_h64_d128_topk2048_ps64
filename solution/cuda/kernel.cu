@@ -76,6 +76,26 @@ __global__ void mask_logits_past_seq_len_kernel(
     }
 }
 
+// For batched topk: scores[b,s] = -inf for s >= seq_lens[b] (invalid positions).
+// scores layout: row-major [B, row_stride] with valid columns 0..max_seq_len-1.
+// ============================================================================
+__global__ void mask_scores_past_seq_len_kernel(
+        float* __restrict__ scores,
+        const int32_t* __restrict__ seq_lens,
+        int B,
+        long long row_stride,
+        int max_seq_len)
+{
+    const int b = blockIdx.x;
+    if (b >= B) return;
+    const int sl = seq_lens[b];
+    float* row = scores + (long long)b * row_stride;
+    const float neg_inf = __uint_as_float(0xff800000u);
+    for (int s = (int)threadIdx.x + sl; s < max_seq_len; s += (int)blockDim.x) {
+        row[s] = neg_inf;
+    }
+}
+
 // ============================================================================
 // Batched page-table transform: one block per batch row b.
 // local_long[b * K_topk + i] = top-k local indices (int64 from at::topk_out);
@@ -203,14 +223,14 @@ void run(
     constexpr bool kTopkSorted = false;
 
     if (batched_topk) {
-        const float neg_inf = -std::numeric_limits<float>::infinity();
         torch::Tensor scores_for_topk = scores_2d.narrow(1, 0, max_seq_len);
-        for (int b = 0; b < B; ++b) {
-            const int sl = sl_vec[b];
-            if (sl < max_seq_len) {
-                scores_for_topk.select(0, b).narrow(0, sl, max_seq_len - sl).fill_(neg_inf);
-            }
-        }
+        const int64_t row_stride = scores_for_topk.stride(0);
+        mask_scores_past_seq_len_kernel<<<B, 256, 0, stream>>>(
+                scores_for_topk.data_ptr<float>(),
+                seq_lens_dev.data_ptr<int32_t>(),
+                B,
+                (long long)row_stride,
+                max_seq_len);
         at::topk_out(
                 topk_vals_buf,
                 local_topk_long,

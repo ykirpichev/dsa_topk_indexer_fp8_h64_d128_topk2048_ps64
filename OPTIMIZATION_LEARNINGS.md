@@ -22,6 +22,7 @@
 | 11 | 2026-03-30 | **Batched** `logits.sum(dim=1)` → `[B,S]`, mask tail with `-inf`, per-row `topk` on `narrow(0,0,sl)` | **9.46×** geomean but **7/17 INCORRECT_NUMERICAL** | **Reverted** — `sum` over full padded `S` changes FP reduction order vs reference `narrow(...,sl).sum(0)` on `[H,sl]`; dataset relaxes tolerance somewhat but **still** fails top-k index checks on large-T rows. |
 | 12 | 2026-03-30 | **Top-k:** `sorted=false` + when `min(seq_len) ≥ K_topk`, one batched `topk` on `[B, max_seq_len]` (padded `-inf`); else per-row `topk` | **8.12×**, 17/17 PASSED (`FIB_MODAL_SMOKE=1`, `FIB_RTOL=265` `FIB_ATOL=17500`) | **Kept** — `run_modal.py` forwards rtol/atol; JIT `topk_cuda_cublas_topkopt`. Match column not 1.0 when ties reorder; strict contest may need `sorted=true` or full-128 check. |
 | 13 | 2026-03-30 | **Head reduction (profiler #1):** `mask_logits_past_seq_len_kernel` zeros `[b,h,s]` for `s≥sl`, then **one** `logits.sum(dim=1)` → `[B,S]`; topk unchanged | **8.50×**, 17/17 PASSED (same Modal rtol/atol) | **Kept** — replaces B× `sum_out` on slices (~45% CUDA at idx 127); JIT `topk_cuda_cublas_bsum2`. |
+| 14 | 2026-03-30 | **Top-k prep (batched path):** `mask_scores_past_seq_len_kernel` writes `-inf` for `s≥sl` on `[B,max_seq_len]` scores (replaces host `fill_` loop) | **7.96×**, 17/17 PASSED | **Kept** — targets top-k path (~35% at idx 127); smoke geomean **below** row #13 one run (likely Modal noise). JIT `topk_cuda_cublas_maskscores`. Re-run smoke 2× or full 128 to confirm. |
 
 ## Next ideas (not run — billing / time)
 
