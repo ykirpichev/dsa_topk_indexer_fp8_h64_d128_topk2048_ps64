@@ -1,9 +1,11 @@
 """
 DSA Top-K indexer — pure PyTorch, paged flat layout + masks (deep_gemm-style).
 
-Perf:
-- Truncate matmul to min(context_slots, max(seq_lens)).
-- Batched matmul (no head expand), TF32, bf16 GEMM, optional torch.compile on large problems.
+Perf (Modal B200, vs tag pytorch-baseline-v1): ~7x on worst workloads (dominated by bf16
+GEMM + topk); small shapes ~1.5x. Further ~10x to match deep_gemm needs FP8 Tensor Core
+kernels, not a dense torch.matmul baseline.
+
+Tunables: FIB_MATMUL_BF16, FIB_TORCH_COMPILE, FIB_COMPILE_MIN_TOKENS, FIB_TORCH_COMPILE_MODE.
 """
 
 from __future__ import annotations
