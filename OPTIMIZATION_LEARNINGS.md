@@ -144,23 +144,40 @@ done
 
 ## Profiling: current bottleneck (Modal B200, `torch.profiler`)
 
-**Method:** `FIB_MODAL_PROFILE=1 modal run scripts/modal_profile.py` with `acc_events=True`, **`sort_by=cuda_time_total`**, after JIT warmup. Nsight Systems / NCU still unreliable on this Modal stack (see `scripts/modal_profile.py`).
+**Method:** `FIB_MODAL_PROFILE=1 modal run scripts/modal_profile.py` with `acc_events=True`, **`sort_by=cuda_time_total`**, after JIT warmup. **`FIB_PROFILE_WORKLOAD_INDEX`** is forwarded from the local entrypoint to the Modal worker** (fixed 2026-03-30 — previously the remote defaulted to 16). Nsight Systems / NCU still unreliable on this Modal stack.
 
-**Workloads:** **index 16** (smoke-scale T) and **index 127** (large T in trace order) — same **relative** split.
+### Small / medium **T** (workload index **16**, B=4 repeats)
 
-### Approximate **Self CUDA %** of one forward (aggregated over repeats)
-
-| Bucket | ~% of GPU time | Notes |
+| Bucket | ~% Self CUDA | Notes |
 |--------|----------------|--------|
-| **`aten::topk`** (+ radix / bitonic / `gatherTopK` children) | **~53–56%** | Dominant |
-| **`aten::sum`** over heads (`reduce_kernel`) | **~18–23%** | Second |
-| **`aten::bmm`** / CUTLASS SGEMM | **~5%** | Small at probed sizes |
-| **`gather_dequant_kernel`** | **~3.6%** | Custom gather |
-| **`Memcpy DtoH`** | **~2–3%** | Often tied to small copies / sync |
-| **`page_transform_batched_kernel`** | **~2.3–2.4%** | **Not** the hot kernel here |
-| **`relu_` / `mul_` / topk `fill_` path** | few % combined | Epilogue |
+| **`aten::topk`** | **~34%** | Many small batch rows |
+| **`aten::sum`** | **~34%** | Head reduction |
+| **`aten::bmm`** | **~7%** | |
+| **`gather_dequant_kernel`** | **~5%** | |
+| **`page_transform_batched_kernel`** | **~3%** | |
+| **`aten::copy_`** / DtoH | **~7–10%** combined | Host sync path |
 
-**Conclusion:** End-to-end for this kernel, **`page_transform` block size is a micro-optimization** compared to **`topk` + per-row `sum` over H`**. Tuning `BLOCK_T` can move Modal smoke geomean mostly through **noise**, not because the transform is the limiter.
+### Large **T** (workload index **127**, `FIB_PROFILE_REPEAT=6`)
+
+| Bucket | ~% Self CUDA | Notes |
+|--------|----------------|--------|
+| **`aten::sum`** over heads | **~44.6%** | **Dominant** — 150 `sum` ops in trace (batched path: per-row `sum_out` into padded buffer) |
+| **`aten::topk`** (`gatherTopK`) | **~34.6%** | 150 `topk` calls |
+| **`aten::bmm`** / CUTLASS | **~7.0%** | GEMM finally non-trivial vs sum+topk |
+| **`gather_dequant_kernel`** | **~7.0%** | Scales with tokens |
+| **`aten::mul_`** (relu×weights epilogue) | **~2.2%** | |
+
+**Conclusion:** At **large sequence length**, **head reduction (`sum`)** and **top-k** dominate (**~79%** combined). `page_transform` is still a small slice. **`bmm` and gather** are large enough that **Tensor Core / FP8 GEMM** and **fused gather→GEMM** are the main levers for **large jumps** in speedup—not micro-tuning `BLOCK_T`.
+
+### On **~30×** speedup at large **T**
+
+Contest **speedup** is vs the **Python reference**, not vs peak FLOPs. Hitting **30×** on the **largest-T** rows typically needs one or more of:
+
+1. **Make GEMM the story** — e.g. **FP8/TF32 Tensor Core** batched matmul with acceptable error under relaxed `rtol/atol`, or a fused path that avoids an extra full **[B,H,S]** materialization.
+2. **Cut top-k work** — **approximate top-k**, smaller effective **K** for hot paths, or a **fused** “score + select” kernel (only if eval allows).
+3. **Fuse gather + dot** — remove **`K_batched`** read/write cost (currently ~7% at idx 127; can dominate if GEMM is accelerated).
+
+None of these are “free”; each trades implementation cost and/or numerical policy vs the reference.
 
 ### What to optimize next (priority)
 
@@ -170,7 +187,7 @@ done
 4. **Gather** — vectorized loads / coalescing; only ~4% here but simpler than top-k.
 5. **`page_transform`** — low priority unless Nsight on **your** max workload shows otherwise.
 
-**Re-run profile:**
+**Re-run profile (large T):**
 
 ```bash
 FIB_MODAL_PROFILE=1 FIB_PROFILE_WORKLOAD_INDEX=127 FIB_PROFILE_REPEAT=6 modal run scripts/modal_profile.py

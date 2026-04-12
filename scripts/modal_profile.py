@@ -9,8 +9,11 @@ Run from repo root (after modal setup + trace volume):
 
     FIB_MODAL_PROFILE=1 modal run scripts/modal_profile.py
 
-    # Workload index in trace-set order (same order as smoke: first 17 → indices 0..16)
-    FIB_MODAL_PROFILE=1 FIB_PROFILE_WORKLOAD_INDEX=16 modal run scripts/modal_profile.py
+    # Workload index in trace-set order (128 workloads → indices 0..127; last is usually max T)
+    FIB_MODAL_PROFILE=1 FIB_PROFILE_WORKLOAD_INDEX=127 modal run scripts/modal_profile.py
+
+    # Repeats per profile (default 4); forward from local shell into the Modal worker:
+    FIB_MODAL_PROFILE=1 FIB_PROFILE_WORKLOAD_INDEX=127 FIB_PROFILE_REPEAT=8 modal run scripts/modal_profile.py
 """
 
 from __future__ import annotations
@@ -85,7 +88,11 @@ def _try_nsys_optional(tdir: Path, lines: list[str]) -> None:
 
 
 @app.function(image=image, gpu="B200:1", timeout=3600, volumes={TRACE_SET_PATH: trace_volume})
-def profile_gpu(solution: dict) -> str:
+def profile_gpu(
+    solution: dict,
+    workload_index: int | None = None,
+    repeat: int | None = None,
+) -> str:
     sol = Solution.model_validate(solution)
     trace_set = TraceSet.from_path(TRACE_SET_PATH)
     if sol.definition not in trace_set.definitions:
@@ -94,8 +101,9 @@ def profile_gpu(solution: dict) -> str:
     if not wlist:
         return "ERROR: no workloads"
 
-    idx_default = os.environ.get("FIB_PROFILE_WORKLOAD_INDEX", "16")
-    idx = _resolve_workload_index(idx_default, len(wlist))
+    if workload_index is None:
+        workload_index = int(os.environ.get("FIB_PROFILE_WORKLOAD_INDEX", "16"))
+    idx = _resolve_workload_index(str(workload_index), len(wlist))
     workload = wlist[idx].workload
     definition = trace_set.definitions[sol.definition]
 
@@ -121,8 +129,9 @@ def profile_gpu(solution: dict) -> str:
     torch.cuda.synchronize()
 
     # --- PyTorch profiler (reliable on Modal) ---
-    repeats = int(os.environ.get("FIB_PROFILE_REPEAT", "4"))
-    repeats = max(1, min(repeats, 32))
+    if repeat is None:
+        repeat = int(os.environ.get("FIB_PROFILE_REPEAT", "4"))
+    repeats = max(1, min(repeat, 32))
 
     with torch.profiler.profile(
         activities=[
@@ -193,8 +202,23 @@ def main():
 
     path = pack_solution()
     solution = Solution.model_validate_json(path.read_text())
-    print("Profiling on Modal B200 (torch.profiler)...")
-    print(profile_gpu.remote(solution.model_dump(mode="json")))
+    wl_idx_raw = os.environ.get("FIB_PROFILE_WORKLOAD_INDEX", "16")
+    try:
+        wl_idx = int(wl_idx_raw)
+    except ValueError:
+        wl_idx = 16
+    rep = int(os.environ.get("FIB_PROFILE_REPEAT", "4"))
+    print(
+        f"Profiling on Modal B200 (torch.profiler): "
+        f"FIB_PROFILE_WORKLOAD_INDEX={wl_idx}, FIB_PROFILE_REPEAT={rep}"
+    )
+    print(
+        profile_gpu.remote(
+            solution.model_dump(mode="json"),
+            workload_index=wl_idx,
+            repeat=rep,
+        )
+    )
 
 
 if __name__ == "__main__":
