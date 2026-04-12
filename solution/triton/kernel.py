@@ -6,7 +6,7 @@ Optimizations:
 - Optional chunked matmul + running top-k merge (FIB_CHUNK_TOKENS) to avoid peak [B,H,T] memory.
 
 Tunables: FIB_MATMUL_BF16, FIB_TORCH_COMPILE, FIB_COMPILE_MIN_TOKENS, FIB_TORCH_COMPILE_MODE,
-FIB_CHUNK_TOKENS (0 = one-shot matmul; default 4096 when t_eff larger).
+FIB_CHUNK_TOKENS (0 = one-shot; set e.g. 4096 only for very large t_eff if memory-bound).
 """
 
 from __future__ import annotations
@@ -19,8 +19,8 @@ import torch
 _USE_BF16_MATMUL = os.environ.get("FIB_MATMUL_BF16", "1").lower() not in ("0", "false", "no")
 _COMPILE_ENABLED = os.environ.get("FIB_TORCH_COMPILE", "1").lower() not in ("0", "false", "no")
 _COMPILE_MIN_TOKENS = int(os.environ.get("FIB_COMPILE_MIN_TOKENS", "256"))
-# Chunk token axis to cap peak activations; 0 disables chunking (always one-shot).
-_CHUNK_TOKENS = int(os.environ.get("FIB_CHUNK_TOKENS", "4096"))
+# Chunked streaming + running top-k merge (default off: Python/merge overhead often loses on B200).
+_CHUNK_TOKENS = int(os.environ.get("FIB_CHUNK_TOKENS", "0"))
 
 _compiled_hot: Optional[Callable] = None
 
