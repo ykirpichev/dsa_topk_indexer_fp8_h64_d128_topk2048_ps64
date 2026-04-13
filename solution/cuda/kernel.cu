@@ -2,7 +2,7 @@
  * Optimized CUDA Kernel for DSA TopK Indexer — B200 (sm_100)
  *
  * Pipeline:
- *   1. Fused FP8 page gather + dequant  (custom CUDA kernel)
+ *   1. Fused FP8 page gather + dequant  (vec4 loads when D=128; else 1 thread/dim)
  *   2. Batched GEMM: q @ K^T            (torch::bmm, float32)
  *   3. In-place relu_ + mul_(weights) on logits (bit-exact vs relu*weights)
  *   4. Invalid K rows zeroed in gather; batched sum over heads → [B,S]; topk
@@ -63,6 +63,59 @@ __global__ void gather_dequant_kernel(
 
     // NaN FP8 → float NaN → NaN * scale = NaN → relu(NaN) = 0 later.
     K_batched[token_idx * D + d] = static_cast<float>(fp8_val) * scale;
+}
+
+// Vectorized gather: D=128 → 32 threads × 4 FP8/uint32 load; one float scale in shared mem.
+// Same numerics as gather_dequant_kernel (per-byte FP8 → f32 × scale).
+// ============================================================================
+__global__ void gather_dequant_vec4_kernel(
+        const uint8_t* __restrict__ cache,
+        const int32_t* __restrict__ block_table,
+        const int32_t* __restrict__ seq_lens,
+        float* __restrict__ K_batched,
+        int B, int S, int D, int P, int PS, int HDS, int actual_pages)
+{
+    const int token_idx = blockIdx.x;
+    if (token_idx >= B * S) return;
+    const int b = token_idx / S;
+    const int s = token_idx % S;
+    const int tid = threadIdx.x;
+    const int base_d = tid * 4;
+
+    float* row_out = K_batched + (long long)token_idx * D;
+
+    if (s >= seq_lens[b]) {
+#pragma unroll
+        for (int i = 0; i < 4 && base_d + i < D; ++i) {
+            row_out[base_d + i] = 0.f;
+        }
+        return;
+    }
+
+    const int page_id = block_table[b * actual_pages + s / PS];
+    const int t = s % PS;
+    const size_t page_byte = (size_t)page_id * PS * HDS;
+    const size_t scale_byte = page_byte + (size_t)PS * D + (size_t)t * 4;
+
+    __shared__ float s_scale;
+    if (tid == 0) {
+        s_scale = *reinterpret_cast<const float*>(cache + scale_byte);
+    }
+    __syncthreads();
+
+    if (base_d >= D) return;
+
+    const size_t fp8_quad = page_byte + (size_t)t * D + (size_t)base_d;
+    const uint32_t w = *reinterpret_cast<const uint32_t*>(cache + fp8_quad);
+    const float sc = s_scale;
+
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const uint8_t u8 = (uint8_t)((w >> (i * 8)) & 0xffu);
+        __nv_fp8_e4m3 fp8_val;
+        *reinterpret_cast<uint8_t*>(&fp8_val) = u8;
+        row_out[base_d + i] = static_cast<float>(fp8_val) * sc;
+    }
 }
 
 // For batched topk: scores[b,s] = -inf for s >= seq_lens[b] (invalid positions).
@@ -168,12 +221,22 @@ void run(
     torch::Tensor K_batched = torch::empty({B, S, D},
             q_index_fp8.options().dtype(torch::kFloat32));
 
-    gather_dequant_kernel<<<num_tokens, D, 0, stream>>>(
-            cache_u8.data_ptr<uint8_t>(),
-            bt_i32.data_ptr<int32_t>(),
-            seq_lens_dev.data_ptr<int32_t>(),
-            K_batched.data_ptr<float>(),
-            B, S, D, P, PS, HDS, actual_pages);
+    if (D == 128 && (D % 4) == 0) {
+        constexpr int kGatherVecThreads = 32;
+        gather_dequant_vec4_kernel<<<num_tokens, kGatherVecThreads, 0, stream>>>(
+                cache_u8.data_ptr<uint8_t>(),
+                bt_i32.data_ptr<int32_t>(),
+                seq_lens_dev.data_ptr<int32_t>(),
+                K_batched.data_ptr<float>(),
+                B, S, D, P, PS, HDS, actual_pages);
+    } else {
+        gather_dequant_kernel<<<num_tokens, D, 0, stream>>>(
+                cache_u8.data_ptr<uint8_t>(),
+                bt_i32.data_ptr<int32_t>(),
+                seq_lens_dev.data_ptr<int32_t>(),
+                K_batched.data_ptr<float>(),
+                B, S, D, P, PS, HDS, actual_pages);
+    }
 
     // -------------------------------------------------------------------------
     // Phase 2 — batched GEMM: logits [B, H, S] = q @ K^T

@@ -38,7 +38,7 @@ def _extra_cuda_cflags() -> list:
 
 
 def _jit_name() -> str:
-    base = "topk_cuda_cublas_ptxo3"
+    base = "topk_cuda_cublas_gather_vec4"
     if os.environ.get("FIB_TOPK_FP16", "").lower() in ("1", "true", "yes"):
         return base + "_fp16topk"
     return base
