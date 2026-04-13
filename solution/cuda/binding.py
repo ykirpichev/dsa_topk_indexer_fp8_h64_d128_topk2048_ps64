@@ -7,6 +7,7 @@ Responsibilities of this file:
       per-batch cuBLAS Sgemm + ReLU/weighted-sum + Thrust top-K + page transform.
 """
 
+import os
 from pathlib import Path
 
 import torch
@@ -18,18 +19,44 @@ _THIS_DIR = Path(__file__).parent
 # Lazy load / JIT-compile kernel.cu
 # ---------------------------------------------------------------------------
 _ext = None
+_loaded_jit_name: str | None = None
+
+
+def _extra_cuda_cflags() -> list:
+    flags = [
+        "-O3",
+        "--expt-relaxed-constexpr",
+        "--ftz=true",
+        "--prec-div=false",
+        "-Xptxas",
+        "-O3",
+    ]
+    # FlashInfer baseline-style: fp16 scores into top-k (set in Modal / env before first load)
+    if os.environ.get("FIB_TOPK_FP16", "").lower() in ("1", "true", "yes"):
+        flags.append("-DFIB_TOPK_FP16")
+    return flags
+
+
+def _jit_name() -> str:
+    base = "topk_cuda_cublas_ptxo3"
+    if os.environ.get("FIB_TOPK_FP16", "").lower() in ("1", "true", "yes"):
+        return base + "_fp16topk"
+    return base
 
 
 def _load_ext():
-    global _ext
-    if _ext is None:
-        _ext = torch.utils.cpp_extension.load(
-            name="topk_cuda_cublas_ptxo3",
-            sources=[str(_THIS_DIR / "kernel.cu")],
-            extra_cuda_cflags=['-O3', '--expt-relaxed-constexpr', '--ftz=true', '--prec-div=false', '-Xptxas', '-O3'],
-            extra_ldflags=[],
-            verbose=False,
-        )
+    global _ext, _loaded_jit_name
+    jn = _jit_name()
+    if _ext is not None and _loaded_jit_name == jn:
+        return _ext
+    _ext = torch.utils.cpp_extension.load(
+        name=jn,
+        sources=[str(_THIS_DIR / "kernel.cu")],
+        extra_cuda_cflags=_extra_cuda_cflags(),
+        extra_ldflags=[],
+        verbose=False,
+    )
+    _loaded_jit_name = jn
     return _ext
 
 

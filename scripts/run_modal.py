@@ -30,6 +30,12 @@ Correctness thresholds (``BenchmarkConfig``; forwarded into the Modal worker)::
 
 Container deps match evaluation (``EVALUATION.md``): ``flashinfer/flashinfer-ci-cu132`` + FlashInfer + FlashInfer-Bench from GitHub main + ``cupti-python`` (see ``image =`` below).
 
+Optional baseline-style top-k input dtype::
+
+    FIB_TOPK_FP16=1 modal run scripts/run_modal.py
+
+Forwards to Modal worker; CUDA binding adds ``-DFIB_TOPK_FP16`` (fp16 ``at::topk`` on scores). Compare smoke geomean vs unset.
+
 Setup (one-time):
     modal setup
     modal volume create flashinfer-trace
@@ -121,12 +127,19 @@ def run_benchmark(
     max_workloads: int | None = None,
     rtol: float | None = None,
     atol: float | None = None,
+    fib_topk_fp16: bool = False,
 ) -> dict:
     """Run benchmark on Modal B200 and return results.
 
     rtol/atol are passed explicitly from the local entrypoint so the Modal worker
     uses the same thresholds as the invoking shell (remote env may not mirror local).
+    fib_topk_fp16: set FIB_TOPK_FP16=1 for CUDA binding (baseline-style fp16 top-k scores).
     """
+    if fib_topk_fp16:
+        os.environ["FIB_TOPK_FP16"] = "1"
+    else:
+        os.environ.pop("FIB_TOPK_FP16", None)
+
     if rtol is None:
         rtol = _default_rtol()
     if atol is None:
@@ -293,7 +306,10 @@ def main():
 
     rtol = float(os.environ.get("FIB_RTOL", "0.01"))
     atol = float(os.environ.get("FIB_ATOL", "0.01"))
+    fib_topk_fp16 = os.environ.get("FIB_TOPK_FP16", "").lower() in ("1", "true", "yes")
     print(f"\nCorrectness thresholds: rtol={rtol}, atol={atol}")
+    if fib_topk_fp16:
+        print("FIB_TOPK_FP16=1 (fp16 scores for at::topk, baseline-style)")
 
     if smoke:
         print("\nRunning smoke benchmark on Modal B200 (17 workloads, timed vs reference)...")
@@ -301,7 +317,14 @@ def main():
         print(f"\nRunning benchmark on Modal B200 (first {max_workloads} workloads)...")
     else:
         print("\nRunning full benchmark on Modal B200...")
-    results = run_benchmark.remote(solution, smoke=smoke, max_workloads=max_workloads, rtol=rtol, atol=atol)
+    results = run_benchmark.remote(
+        solution,
+        smoke=smoke,
+        max_workloads=max_workloads,
+        rtol=rtol,
+        atol=atol,
+        fib_topk_fp16=fib_topk_fp16,
+    )
 
     if not results:
         print("No results returned!")

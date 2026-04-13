@@ -6,6 +6,7 @@
  *   2. Batched GEMM: q @ K^T            (torch::bmm, float32)
  *   3. In-place relu_ + mul_(weights) on logits (bit-exact vs relu*weights)
  *   4. Invalid K rows zeroed in gather; batched sum over heads → [B,S]; topk
+ *      (optional -DFIB_TOPK_FP16: scores cast to fp16 before topk, FlashInfer baseline style)
  *   5. Batched page_transform: int64 top-k indices + device seq_lens → global int32
  *
  * NaN handling: FP8 E4M3 NaN bytes propagate as float NaN through K_batched
@@ -195,7 +196,12 @@ void run(
 
     auto opts_dev = q_index_fp8.options();
     torch::Tensor local_topk_long = torch::empty({B, K_topk}, opts_dev.dtype(torch::kInt64));
-    torch::Tensor topk_vals_buf = torch::empty({B, K_topk}, logits.options());
+#ifdef FIB_TOPK_FP16
+    auto vals_opts = logits.options().dtype(torch::kFloat16);
+#else
+    auto vals_opts = logits.options();
+#endif
+    torch::Tensor topk_vals_buf = torch::empty({B, K_topk}, vals_opts);
 
     int min_pos_sl = max_seq_len;
     for (int b = 0; b < B; ++b) {
@@ -215,10 +221,15 @@ void run(
                 B,
                 (long long)row_stride,
                 max_seq_len);
+#ifdef FIB_TOPK_FP16
+        torch::Tensor scores_h = scores_for_topk.to(torch::kFloat16);
+#else
+        torch::Tensor& scores_h = scores_for_topk;
+#endif
         at::topk_out(
                 topk_vals_buf,
                 local_topk_long,
-                scores_for_topk,
+                scores_h,
                 K_topk,
                 /*dim=*/-1,
                 /*largest=*/true,
@@ -229,12 +240,17 @@ void run(
             if (sl == 0) continue;
             const int k = std::min(K_topk, sl);
             auto row_scores = scores_2d.select(0, b).narrow(0, 0, sl);
+#ifdef FIB_TOPK_FP16
+            torch::Tensor row_h = row_scores.to(torch::kFloat16);
+#else
+            torch::Tensor row_h = row_scores;
+#endif
             auto topk_vals_slice = topk_vals_buf.select(0, b).narrow(0, 0, k);
             auto topk_idx_slice = local_topk_long.select(0, b).narrow(0, 0, k);
             at::topk_out(
                     topk_vals_slice,
                     topk_idx_slice,
-                    row_scores,
+                    row_h,
                     k,
                     /*dim=*/-1,
                     /*largest=*/true,
