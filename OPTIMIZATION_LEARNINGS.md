@@ -2,7 +2,9 @@
 
 **Policy:** Commit / tag **only** when a change shows a **clear win** on Modal smoke **or** full 128 (same harness config). Everything else lives here.
 
-**Submission `submission-v5`:** Full Modal **`modal run scripts/run_modal.py`**: **128/128 PASSED**, **geomean 12.66×** vs reference, **match 1.0000** all rows, **`FIB_RTOL`/`FIB_ATOL` = 0.01**. CUDA: invalid-K zeroing in gather + **`--ftz=true` `--prec-div=false`** (`topk_cuda_cublas_ftz`). Pack before eval: `python3 scripts/pack_solution.py` (`solution.json` gitignored; contest uses `config.toml` + `solution/` sources).
+**Submission `submission-v6`:** Full Modal **`modal run scripts/run_modal.py`**: **128/128 PASSED**, **geomean 12.53×** vs reference, **match 1.0000** all rows, **`FIB_RTOL`/`FIB_ATOL` = 0.01**. CUDA: gather-mask + **`--ftz=true` `--prec-div=false`** + **`-Xptxas -O3`** (`topk_cuda_cublas_ptxo3`). Pack: `python3 scripts/pack_solution.py`.
+
+**Earlier `submission-v5`:** same harness, **12.66×** geomean full 128, JIT `topk_cuda_cublas_ftz` (no PTX `-O3`).
 
 ### Profile + 10-idea smoke (idx **127**, then `FIB_MODAL_SMOKE=1`)
 
@@ -59,7 +61,7 @@ Ideas **not** auto-tried (need larger work): custom top-k, two-stage top-k, cuBL
 | 18 | 2026-03-30 | **`at::matmul`** instead of `torch::bmm` for logits | **7.54×**, 17/17 | **Reverted** — no win vs `bmm`+`contiguous()`. |
 | 19 | 2026-03-30 | **`page_transform_batched_kernel` `BLOCK_T` 256→128** | **8.54×**, 17/17 | **Kept** — best smoke this session; **re-run full 128** to confirm (BLOCK_T sweeps were noisy historically). |
 | 22 | 2026-03-30 | **nvcc `--ftz=true` `--prec-div=false`** + fused gather-mask (current stack) | **12.66×**, **128/128**, match **1.0** (full Modal, `rtol=atol=0.01`) | **Kept** — **`submission-v5`** @ tag commit (see top of file). JIT `topk_cuda_cublas_ftz`. |
-| 23 | 2026-03-30 | **`-Xptxas -O3`** in addition to `-O3`/`ftz`/`prec-div` (idea 1 from 10-way smoke) | **8.95×** smoke (best of 10); full 128 TBD | **Kept** — JIT `topk_cuda_cublas_ptxo3`. |
+| 23 | 2026-03-30 | **`-Xptxas -O3`** in addition to `-O3`/`ftz`/`prec-div` (idea 1 from 10-way smoke) | **8.95×** smoke; **12.53×** full **128** | **Kept** — **`submission-v6`**. JIT `topk_cuda_cublas_ptxo3`. |
 
 ## Next ideas (not run — billing / time)
 
