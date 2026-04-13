@@ -4,6 +4,27 @@
 
 **Submission `submission-v5`:** Full Modal **`modal run scripts/run_modal.py`**: **128/128 PASSED**, **geomean 12.66×** vs reference, **match 1.0000** all rows, **`FIB_RTOL`/`FIB_ATOL` = 0.01**. CUDA: invalid-K zeroing in gather + **`--ftz=true` `--prec-div=false`** (`topk_cuda_cublas_ftz`). Pack before eval: `python3 scripts/pack_solution.py` (`solution.json` gitignored; contest uses `config.toml` + `solution/` sources).
 
+### Profile + 10-idea smoke (idx **127**, then `FIB_MODAL_SMOKE=1`)
+
+**Profiler (workload 127):** **`aten::topk` ~63%** Self CUDA; **`bmm` ~11%**; **`gather_dequant` ~11%**; **`sum` ~2%**; **`page_transform` ~2–3%**.
+
+**`scripts/profile_ideas_smoke.py --id 1..10`** (Modal smoke, strict rtol/atol):
+
+| id | Change | Geomean | Result |
+|----|--------|---------|--------|
+| 1 | **`-Xptxas -O3`** added | **8.95×** | **Landed** — JIT `topk_cuda_cublas_ptxo3` |
+| 2 | `__launch_bounds__(128,4)` page_transform | 8.11× | no |
+| 3 | `__launch_bounds__(128,2)` gather | 8.26× | no |
+| 4 | mask_scores block **128** | 8.62× | no |
+| 5 | `BLOCK_T` **256** | 8.90× | no |
+| 6 | `sum_out` vs `sum(dim=1)` | 8.39× | no |
+| 7 | drop `--ftz`/`--prec-div` | 8.44× | no |
+| 8 | **`-O2`** instead of `-O3` | 8.63× | no |
+| 9 | combo: PTX O3 + lb_page + mask128 | 8.61× | no |
+| 10 | `allow_tf32 = False` in `_load_ext` | 7.89× | no |
+
+Ideas **not** auto-tried (need larger work): custom top-k, two-stage top-k, cuBLASLt, fused gather+GEMM, CUDA graph, vectorized gather beyond current path.
+
 **Modal harness (2026):** `scripts/run_modal.py` uses **`flashinfer/flashinfer-ci-cu132`** + **`pip install git+.../flashinfer.git`** + **`git+.../flashinfer-bench.git`** + **`cupti-python`** to mirror contest **EVALUATION.md**. Default **`FIB_RTOL`/`FIB_ATOL` = 0.01** (FlashInfer-Bench `BenchmarkConfig`); relaxed thresholds only via env.
 
 | 20 | 2026-03-30 | **Fused invalid-K in gather:** `gather_dequant_kernel` zeros `K[b,s,:]` when `s≥sl`; removed `mask_logits_past_seq_len_kernel` | **8.75×**, 17/17, **match 1.0** (strict `rtol/atol=0.01`) | **Kept** — JIT `topk_cuda_cublas_gather_mask`. Same logits as zeroing after bmm; saves one `[B,H,S]` mask kernel. |
@@ -38,6 +59,7 @@
 | 18 | 2026-03-30 | **`at::matmul`** instead of `torch::bmm` for logits | **7.54×**, 17/17 | **Reverted** — no win vs `bmm`+`contiguous()`. |
 | 19 | 2026-03-30 | **`page_transform_batched_kernel` `BLOCK_T` 256→128** | **8.54×**, 17/17 | **Kept** — best smoke this session; **re-run full 128** to confirm (BLOCK_T sweeps were noisy historically). |
 | 22 | 2026-03-30 | **nvcc `--ftz=true` `--prec-div=false`** + fused gather-mask (current stack) | **12.66×**, **128/128**, match **1.0** (full Modal, `rtol=atol=0.01`) | **Kept** — **`submission-v5`** @ tag commit (see top of file). JIT `topk_cuda_cublas_ftz`. |
+| 23 | 2026-03-30 | **`-Xptxas -O3`** in addition to `-O3`/`ftz`/`prec-div` (idea 1 from 10-way smoke) | **8.95×** smoke (best of 10); full 128 TBD | **Kept** — JIT `topk_cuda_cublas_ptxo3`. |
 
 ## Next ideas (not run — billing / time)
 
