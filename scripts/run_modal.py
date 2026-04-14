@@ -18,11 +18,10 @@ FlashInfer, and flashinfer-bench are installed from GitHub (see image build belo
 Set CUDA_HOME for extension builds.
 
 Correctness uses BenchmarkConfig rtol/atol (element-wise; see flashinfer_bench bench/utils).
-Default atol/rtol match scripts/bench_config.py (tightest values that pass all workloads
-for the current deep_gemm+FlashInfer kernel vs reference). Override with FIB_RTOL, FIB_ATOL.
+Defaults come from scripts.bench_config (same as installed flashinfer_bench; dataset JSON
+has no per-definition rtol/atol).
 """
 
-import os
 import sys
 from pathlib import Path
 
@@ -31,20 +30,11 @@ PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 import modal
-from flashinfer_bench import Benchmark, BenchmarkConfig, Solution, TraceSet
+from flashinfer_bench import Benchmark, Solution, TraceSet
+
+from scripts.bench_config import default_benchmark_config
 
 app = modal.App("flashinfer-bench")
-
-
-def default_benchmark_config() -> BenchmarkConfig:
-    """Keep numeric defaults in sync with scripts/bench_config.py (Modal mounts only this file)."""
-    return BenchmarkConfig(
-        warmup_runs=int(os.environ.get("FIB_WARMUP_RUNS", "3")),
-        iterations=int(os.environ.get("FIB_ITERATIONS", "10")),
-        num_trials=int(os.environ.get("FIB_NUM_TRIALS", "3")),
-        rtol=float(os.environ.get("FIB_RTOL", "265")),
-        atol=float(os.environ.get("FIB_ATOL", "17500")),
-    )
 
 trace_volume = modal.Volume.from_name("flashinfer-trace", create_if_missing=True)
 TRACE_SET_PATH = "/data"
@@ -151,7 +141,10 @@ def main():
         f"iters={bench_cfg.iterations} trials={bench_cfg.num_trials} "
         f"rtol={bench_cfg.rtol:g} atol={bench_cfg.atol:g}"
     )
-    print("Worker builds BenchmarkConfig from image flashinfer-bench; FIB_* env applies there.")
+    print(
+        "Worker uses scripts.bench_config.default_benchmark_config() "
+        "(flashinfer_bench defaults unless FIB_* overrides)."
+    )
 
     print("Packing solution from source files...")
     solution_path = pack_solution()
