@@ -1,11 +1,12 @@
 [solution]
-name = "my-team-solution-v1"      # Solution name
+name = "flashinfer_deepgemm_wrapper_2ba145"
 definition = "dsa_topk_indexer_fp8_h64_d128_topk2048_ps64"
-author = "team-name"              # Team/author name
+author = "flashinfer, deep_gemm"
+description = "Solution using deep_gemm FP8 paged MQA logits and FlashInfer top-k page table transform for DSA top-k indexer (fp8, h64, d128, topk2048, page_size=64)."
 
 [build]
-language = "triton"               # triton | cuda
-entry_point = "kernel.py::kernel" # file::function (BuildSpec format)
-destination_passing_style = false # value-returning (topk_indices tuple)
-# Pure PyTorch path: no extra pip deps (see branch pytorch-bmm)
-dependencies = []
+language = "python"
+entry_point = "main.py::run"
+destination_passing_style = false
+dependencies = ["flashinfer-python", "deep_gemm"]
+target_hardware = ["NVIDIA B200"]
