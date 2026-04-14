@@ -13,9 +13,9 @@ Troubleshooting:
 - safetensors "header too large" on the reference run: trace blobs are likely Git
   LFS pointers. Run git lfs pull locally, then scripts/refresh_contest_dataset_modal.sh.
 
-The remote image is flashinfer/flashinfer-ci-cu132 (CUDA 13.2 + FlashInfer stack);
-flashinfer-bench is installed on top. DeepGEMM is built from source (git + submodules);
-flashinfer-python is pinned for import flashinfer. Set CUDA_HOME for DeepGEMM's setup.py.
+The remote image is flashinfer/flashinfer-ci-cu132 (CUDA 13.2 + PyTorch). DeepGEMM,
+FlashInfer, and flashinfer-bench are installed from GitHub (see image build below).
+Set CUDA_HOME for extension builds.
 
 Correctness uses BenchmarkConfig rtol/atol (element-wise; see flashinfer_bench bench/utils).
 Default atol/rtol match scripts/bench_config.py (tightest values that pass all workloads
@@ -53,20 +53,27 @@ image = (
     modal.Image.from_registry("flashinfer/flashinfer-ci-cu132:latest")
     .apt_install("git")
     .env({"CUDA_HOME": "/usr/local/cuda"})
+    .pip_install("wheel", "setuptools")
     .run_commands(
         "git clone --recursive --depth 1 https://github.com/deepseek-ai/DeepGEMM.git /tmp/DeepGEMM",
         # PEP517 isolated build has no torch; DeepGEMM setup.py imports torch
         "pip install --no-build-isolation /tmp/DeepGEMM",
+        "git clone --recursive --depth 1 https://github.com/flashinfer-ai/flashinfer.git /tmp/flashinfer",
+        "pip install --no-build-isolation /tmp/flashinfer",
+        "git clone --depth 1 https://github.com/flashinfer-ai/flashinfer-bench.git /tmp/flashinfer-bench",
+        "pip install /tmp/flashinfer-bench",
     )
-    .pip_install("flashinfer-bench", "flashinfer-python", "wheel", "setuptools")
 )
 
 
 @app.function(image=image, gpu="B200:1", timeout=3600, volumes={TRACE_SET_PATH: trace_volume})
-def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
-    """Run benchmark on Modal B200 and return results."""
-    if config is None:
-        config = default_benchmark_config()
+def run_benchmark(solution: Solution) -> dict:
+    """Run benchmark on Modal B200 and return results.
+
+    BenchmarkConfig is created in the worker so it matches the image's flashinfer-bench
+    (avoid pickling a client BenchmarkConfig across different package versions).
+    """
+    config = default_benchmark_config()
 
     trace_set = TraceSet.from_path(TRACE_SET_PATH)
 
@@ -140,9 +147,11 @@ def main():
 
     bench_cfg = default_benchmark_config()
     print(
-        f"Benchmark config: warmup={bench_cfg.warmup_runs} iters={bench_cfg.iterations} "
-        f"trials={bench_cfg.num_trials} rtol={bench_cfg.rtol:g} atol={bench_cfg.atol:g}"
+        f"Benchmark config (local display): warmup={bench_cfg.warmup_runs} "
+        f"iters={bench_cfg.iterations} trials={bench_cfg.num_trials} "
+        f"rtol={bench_cfg.rtol:g} atol={bench_cfg.atol:g}"
     )
+    print("Worker builds BenchmarkConfig from image flashinfer-bench; FIB_* env applies there.")
 
     print("Packing solution from source files...")
     solution_path = pack_solution()
@@ -152,7 +161,7 @@ def main():
     print(f"Loaded: {solution.name} ({solution.definition})")
 
     print("\nRunning benchmark on Modal B200...")
-    results = run_benchmark.remote(solution, bench_cfg)
+    results = run_benchmark.remote(solution)
 
     if not results:
         print("No results returned!")
