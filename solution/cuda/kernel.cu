@@ -7,7 +7,7 @@
  *   3. In-place relu_ + mul_(weights) on logits (bit-exact vs relu*weights)
  *   4. Invalid K rows zeroed in gather; batched sum over heads → [B,S]; topk
  *      (optional -DFIB_TOPK_FP16: scores cast to fp16 before topk, FlashInfer baseline style)
- *   5. Batched page_transform: int64 top-k indices + device seq_lens → global int32
+ *   5. physical_flat[b,s]=page*PS+offset then lookup for top-k local idx (FlashInfer baseline style)
  *
  * NaN handling: FP8 E4M3 NaN bytes propagate as float NaN through K_batched
  * → logit NaN → relu(NaN) = 0 (CUDA fmaxf(0, NaN) = 0).  Matches reference.
@@ -138,19 +138,37 @@ __global__ void mask_scores_past_seq_len_kernel(
     }
 }
 
+// FlashInfer baseline-style: physical_flat[b,s] = page_id*PS + (s%PS) for flattened token s.
 // ============================================================================
-// Batched page-table transform: one block per batch row b.
-// local_long[b * K_topk + i] = top-k local indices (int64 from at::topk_out);
-// k = min(K_topk, seq_lens[b])
+__global__ void build_physical_flat_kernel(
+        const int32_t* __restrict__ block_table,
+        int32_t* __restrict__ physical_flat,
+        int B,
+        int S,
+        int actual_pages,
+        int PS)
+{
+    const long long idx =
+            (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    const long long total = (long long)B * S;
+    if (idx >= total) return;
+    const int b = (int)(idx / S);
+    const int s = (int)(idx % S);
+    const int page_idx = s / PS;
+    const int t = s % PS;
+    const int pid = block_table[(long long)b * actual_pages + page_idx];
+    physical_flat[idx] = pid * PS + t;
+}
+
+// Map local top-k index -> global token id using precomputed physical_flat[b, :].
 // ============================================================================
-__global__ void page_transform_batched_kernel(
+__global__ void page_transform_lookup_kernel(
         const int64_t* __restrict__ local_long,
         const int32_t* __restrict__ seq_lens,
-        const int32_t* __restrict__ block_table,
-        int32_t*       __restrict__ out_packed,
-        int actual_pages,
-        int K_topk,
-        int PS)
+        const int32_t* __restrict__ physical_flat,
+        int S,
+        int32_t* __restrict__ out_packed,
+        int K_topk)
 {
     const int b = blockIdx.x;
     const int sl = seq_lens[b];
@@ -158,12 +176,12 @@ __global__ void page_transform_batched_kernel(
     const int k = (K_topk < sl) ? K_topk : sl;
 
     const int64_t* loc = local_long + (long long)b * K_topk;
-    const int32_t* bt  = block_table + (long long)b * actual_pages;
+    const int32_t* phys_row = physical_flat + (long long)b * S;
     int32_t* o = out_packed + (long long)b * K_topk;
 
     for (int i = threadIdx.x; i < k; i += blockDim.x) {
-        int local = (int)loc[i];
-        o[i] = bt[local / PS] * PS + (local % PS);
+        const int local = (int)loc[i];
+        o[i] = phys_row[local];
     }
 }
 
@@ -321,14 +339,27 @@ void run(
         }
     }
 
-    page_transform_batched_kernel<<<B, BLOCK_T, 0, stream>>>(
+    // Baseline-style flattened page table: one int32 per (b,s) → global physical token index
+    torch::Tensor physical_flat = torch::empty({B, S}, torch::dtype(torch::kInt32).device(q_index_fp8.device()));
+    {
+        const int threads = 256;
+        const int blocks = (int)(((long long)B * S + threads - 1) / threads);
+        build_physical_flat_kernel<<<blocks, threads, 0, stream>>>(
+                bt_i32.data_ptr<int32_t>(),
+                physical_flat.data_ptr<int32_t>(),
+                B,
+                S,
+                actual_pages,
+                PS);
+    }
+
+    page_transform_lookup_kernel<<<B, BLOCK_T, 0, stream>>>(
             local_topk_long.data_ptr<int64_t>(),
             seq_lens_dev.data_ptr<int32_t>(),
-            bt_i32.data_ptr<int32_t>(),
+            physical_flat.data_ptr<int32_t>(),
+            S,
             out_ptr,
-            actual_pages,
-            K_topk,
-            PS);
+            K_topk);
 }
 
 // ============================================================================

@@ -9,6 +9,7 @@ Source: [flashinfer_deepgemm_wrapper](https://huggingface.co/datasets/flashinfer
 | **A. FP16 top-k scores** | `FIB_TOPK_FP16=1` → `-DFIB_TOPK_FP16` in `binding.py`; `scores.to(kHalf)` before `topk_out` | **8.51×**, 17/17, match 1.0 (vs **8.24×** without flag, same session order) | Optional A/B; default remains FP32 |
 | **B. PTX `-O3` + ftz** | already default in `binding.py` | prior full 128 **12.53×** | **Yes** — keep as default |
 | **C. Gather-mask** | already in `kernel.cu` | prior | **Yes** — keep |
+| **E. `physical_flat` + lookup transform** (Python baseline: `physical = block_table * PS + arange`, flatten) | `build_physical_flat_kernel` + `page_transform_lookup_kernel` replaces div/mod in transform | **8.27×** smoke, 17/17, match 1.0 | **Yes** — same global indices; JIT `topk_cuda_cublas_physflat` |
 | **D. Vectorized FP8 gather** (paged-FP8 style) | `gather_dequant_vec4_kernel`: 32 thr/token, **uint32** load ×4 FP8, **scale** in shared mem; **D=128** only | **8.20×**, 17/17, match 1.0 | **Yes** — inspired by paged FP8 kernels; JIT `topk_cuda_cublas_gather_vec4` |
 
 ## Not in CUDA repo (needs Python deps / different entry)
