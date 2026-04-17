@@ -4,10 +4,10 @@
  * Pipeline:
  *   1. Fused FP8 page gather + dequant  (vec4 loads when D=128; else 1 thread/dim)
  *   2. Batched GEMM: q @ K^T            (torch::bmm, float32)
- *   3. In-place relu_ + mul_(weights) on logits (bit-exact vs relu*weights)
+ *   3. Fused relu + mul(weights) on logits [B,H,S] (matches relu_ then mul_; NaN→0)
  *   4. Invalid K rows zeroed in gather; batched sum over heads → [B,S]; topk
  *      (optional -DFIB_TOPK_FP16: scores cast to fp16 before topk, FlashInfer baseline style)
- *   5. physical_flat[b,s]=page*PS+offset then lookup for top-k local idx (FlashInfer baseline style)
+ *   5. physical_flat[b,0:max_seq_len) only; lookup maps local top-k idx → global token
  *
  * NaN handling: FP8 E4M3 NaN bytes propagate as float NaN through K_batched
  * → logit NaN → relu(NaN) = 0 (CUDA fmaxf(0, NaN) = 0).  Matches reference.
@@ -138,22 +138,44 @@ __global__ void mask_scores_past_seq_len_kernel(
     }
 }
 
-// FlashInfer baseline-style: physical_flat[b,s] = page_id*PS + (s%PS) for flattened token s.
+// Fused in-place: logits[b,h,s] = relu(logits[b,h,s]) * weights[b,h] (contiguous [B,H,S], [B,H]).
+// ============================================================================
+__global__ void relu_mul_weights_kernel(
+        float* __restrict__ logits,
+        const float* __restrict__ weights,
+        int B,
+        int H,
+        int S)
+{
+    const long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    const long long total = (long long)B * H * S;
+    if (idx >= total) return;
+    const int HS = H * S;
+    const int b = (int)(idx / HS);
+    const int rem = (int)(idx % HS);
+    const int h = rem / S;
+    float v = logits[idx];
+    v = fmaxf(0.f, v);
+    v *= weights[(long long)b * H + h];
+    logits[idx] = v;
+}
+
+// FlashInfer baseline-style: physical_flat[b,s] = page_id*PS + (s%PS) for s in [0, max_seq_len).
 // ============================================================================
 __global__ void build_physical_flat_kernel(
         const int32_t* __restrict__ block_table,
         int32_t* __restrict__ physical_flat,
         int B,
-        int S,
+        int max_seq_len,
         int actual_pages,
         int PS)
 {
     const long long idx =
             (long long)blockIdx.x * blockDim.x + threadIdx.x;
-    const long long total = (long long)B * S;
+    const long long total = (long long)B * max_seq_len;
     if (idx >= total) return;
-    const int b = (int)(idx / S);
-    const int s = (int)(idx % S);
+    const int b = (int)(idx / max_seq_len);
+    const int s = (int)(idx % max_seq_len);
     const int page_idx = s / PS;
     const int t = s % PS;
     const int pid = block_table[(long long)b * actual_pages + page_idx];
@@ -166,7 +188,7 @@ __global__ void page_transform_lookup_kernel(
         const int64_t* __restrict__ local_long,
         const int32_t* __restrict__ seq_lens,
         const int32_t* __restrict__ physical_flat,
-        int S,
+        int max_seq_len,
         int32_t* __restrict__ out_packed,
         int K_topk)
 {
@@ -176,7 +198,7 @@ __global__ void page_transform_lookup_kernel(
     const int k = (K_topk < sl) ? K_topk : sl;
 
     const int64_t* loc = local_long + (long long)b * K_topk;
-    const int32_t* phys_row = physical_flat + (long long)b * S;
+    const int32_t* phys_row = physical_flat + (long long)b * max_seq_len;
     int32_t* o = out_packed + (long long)b * K_topk;
 
     for (int i = threadIdx.x; i < k; i += blockDim.x) {
@@ -263,14 +285,21 @@ void run(
     auto logits  = torch::bmm(q_float, K_batched.transpose(1, 2)).contiguous();  // [B, H, S]
 
     // -------------------------------------------------------------------------
-    // Phase 3 — in-place relu then mul (same as relu()*w broadcast; one fewer [B,H,S] temp)
+    // Phase 3 — fused relu + mul(weights) (matches relu_ + mul_; NaN → 0)
     // Phase 4 — topk
     // Phase 5 — page-table transform → global token indices
     // -------------------------------------------------------------------------
     constexpr int BLOCK_T = 128;
-    auto w_bcast = weights.contiguous().unsqueeze(2);
-    logits.relu_();
-    logits.mul_(w_bcast);
+    auto w_cont = weights.contiguous();
+    {
+        const int threads = 256;
+        const long long total_el = (long long)B * H * S;
+        const int blocks = (int)((total_el + threads - 1) / threads);
+        relu_mul_weights_kernel<<<blocks, threads, 0, stream>>>(
+                logits.data_ptr<float>(),
+                w_cont.data_ptr<float>(),
+                B, H, S);
+    }
 
     // One batched reduction over heads (replaces B× sum_out on [H,sl] slices in profiler).
     auto scores_2d = logits.sum(/*dim=*/1);
@@ -339,16 +368,19 @@ void run(
         }
     }
 
-    // Baseline-style flattened page table: one int32 per (b,s) → global physical token index
-    torch::Tensor physical_flat = torch::empty({B, S}, torch::dtype(torch::kInt32).device(q_index_fp8.device()));
+    // Baseline-style: one int32 per (b,s) for s < max_seq_len → global physical token index
+    torch::Tensor physical_flat = torch::empty(
+            {B, max_seq_len},
+            torch::dtype(torch::kInt32).device(q_index_fp8.device()));
     {
         const int threads = 256;
-        const int blocks = (int)(((long long)B * S + threads - 1) / threads);
+        const long long total_pf = (long long)B * max_seq_len;
+        const int blocks = (int)((total_pf + threads - 1) / threads);
         build_physical_flat_kernel<<<blocks, threads, 0, stream>>>(
                 bt_i32.data_ptr<int32_t>(),
                 physical_flat.data_ptr<int32_t>(),
                 B,
-                S,
+                max_seq_len,
                 actual_pages,
                 PS);
     }
@@ -357,7 +389,7 @@ void run(
             local_topk_long.data_ptr<int64_t>(),
             seq_lens_dev.data_ptr<int32_t>(),
             physical_flat.data_ptr<int32_t>(),
-            S,
+            max_seq_len,
             out_ptr,
             K_topk);
 }
