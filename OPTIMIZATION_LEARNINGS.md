@@ -62,7 +62,7 @@ Ideas **not** auto-tried (need larger work): custom top-k, two-stage top-k, cuBL
 | 19 | 2026-03-30 | **`page_transform_batched_kernel` `BLOCK_T` 256→128** | **8.54×**, 17/17 | **Kept** — best smoke this session; **re-run full 128** to confirm (BLOCK_T sweeps were noisy historically). |
 | 22 | 2026-03-30 | **nvcc `--ftz=true` `--prec-div=false`** + fused gather-mask (current stack) | **12.66×**, **128/128**, match **1.0** (full Modal, `rtol=atol=0.01`) | **Kept** — **`submission-v5`** @ tag commit (see top of file). JIT `topk_cuda_cublas_ftz`. |
 | 23 | 2026-03-30 | **`-Xptxas -O3`** in addition to `-O3`/`ftz`/`prec-div` (idea 1 from 10-way smoke) | **8.95×** smoke; **12.53×** full **128** | **Kept** — **`submission-v6`**. JIT `topk_cuda_cublas_ptxo3`. |
-| 24 | 2026-03-30 | **`physical_flat` only `[B, max_seq_len]`** (not full padded `S`) + **CUDA `relu_mul_weights_kernel`** (`fmaxf(0,x)*w[b,h]`, matches `relu_`+`mul_` NaN→0) | *(pending Modal smoke)* | **Landed in code** — JIT `topk_cuda_cublas_reluwm_pfmax`; reduces `physical_flat` int32 footprint and fuses two elementwise passes on logits. |
+| 24 | 2026-03-30 | **`physical_flat` only `[B, max_seq_len]`** (not full padded `S`) + **CUDA `relu_mul_weights_kernel`** (`fmaxf(0,x)*w[b,h]`, matches `relu_`+`mul_` NaN→0) | Smoke **9.46×** (17/17); full **12.49×** (**128/128** PASSED, match **1.0**, `rtol=atol=0.01`) | **Kept** — JIT `topk_cuda_cublas_reluwm_pfmax`. |
 
 ## Next ideas (not run — billing / time)
 
