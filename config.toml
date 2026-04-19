@@ -1,12 +1,12 @@
 [solution]
-name = "flashinfer_deepgemm_wrapper_2ba145"
+name = "cuda_fp8_mqa_logits_v1"
 definition = "dsa_topk_indexer_fp8_h64_d128_topk2048_ps64"
-author = "flashinfer, deep_gemm"
-description = "Solution using deep_gemm FP8 paged MQA logits and FlashInfer top-k page table transform for DSA top-k indexer (fp8, h64, d128, topk2048, page_size=64)."
+author = "cuda_fp8_mqa"
+description = "Custom CUDA kernel for FP8 paged MQA logits + FlashInfer top-k page table transform."
 
 [build]
 language = "python"
 entry_point = "main.py::run"
 destination_passing_style = false
-dependencies = ["flashinfer-python", "deep_gemm"]
+dependencies = ["flashinfer-python"]
 target_hardware = ["NVIDIA B200"]

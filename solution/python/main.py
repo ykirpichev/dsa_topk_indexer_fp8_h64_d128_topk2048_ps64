@@ -1,62 +1,82 @@
-import torch
-import deep_gemm
+"""
+DSA top-K indexer — custom CUDA FP8 paged MQA logits + FlashInfer top-k.
+
+Pipeline:
+  1. kernel.cu::fp8_paged_mqa_logits  (compiled at first call via torch.cpp_extension)
+  2. flashinfer.top_k_page_table_transform
+
+K-cache layout per token: 128 fp8_e4m3 bytes + 1 float32 scale  (132 bytes total).
+"""
+
+import os
+
 import flashinfer
+import torch
+import torch.utils.cpp_extension as _ext
+
+_SRC_DIR = os.path.dirname(os.path.abspath(__file__))
+_MODULE = None
+
+
+def _load_module():
+    global _MODULE
+    if _MODULE is None:
+        _MODULE = _ext.load(
+            name="cuda_fp8_mqa_logits",
+            sources=[os.path.join(_SRC_DIR, "kernel.cu")],
+            extra_cuda_cflags=["-O3", "-arch=sm_100"],
+            verbose=False,
+        )
+    return _MODULE
 
 
 @torch.no_grad()
 def run(q_index_fp8, k_index_cache_fp8, weights, seq_lens, block_table):
     """
-    DeepSeek sparse attention top-K indexer using deep_gemm FP8 kernel + FlashInfer.
-    
-    Pipeline: deep_gemm.fp8_paged_mqa_logits -> flashinfer.top_k_page_table_transform
+    Args:
+        q_index_fp8        : [B, H=64, D=128]           float8_e4m3fn
+        k_index_cache_fp8  : [num_pages, PS=64, 1, 132] float8_e4m3fn
+        weights            : [B, H=64]                   float32
+        seq_lens           : [B]                         int32
+        block_table        : [B, max_num_pages]          int32
+    Returns:
+        (topk_indices,)    : [B, 2048]                   int32
     """
-    batch_size, num_index_heads, index_head_dim = q_index_fp8.shape
-    num_pages, page_size, _, _ = k_index_cache_fp8.shape
-    topk = 2048
-
-    # Check constants
-    assert num_index_heads == 64
-    assert index_head_dim == 128
-    assert page_size == 64
-
-    device = q_index_fp8.device
+    batch_size    = q_index_fp8.shape[0]
+    page_size     = k_index_cache_fp8.shape[1]   # 64
+    topk          = 2048
+    device        = q_index_fp8.device
     max_num_pages = block_table.shape[1]
     max_context_len = max_num_pages * page_size
 
-    # deep_gemm expects q shape: [batch, next_n, heads, head_dim]
-    q_index_fp8_4d = q_index_fp8.unsqueeze(1)  # [batch, 1, heads, head_dim]
-    k_index_cache_uint8 = k_index_cache_fp8.view(torch.uint8)
+    mod = _load_module()
 
-    # Get schedule metadata for deep_gemm
-    num_sms = torch.cuda.get_device_properties(device).multi_processor_count
-    schedule_meta = deep_gemm.get_paged_mqa_logits_metadata(seq_lens, page_size, num_sms)
+    logits = torch.empty(batch_size, max_context_len, dtype=torch.float32, device=device)
 
-    # Compute FP8 attention scores using deep_gemm
-    logits = deep_gemm.fp8_paged_mqa_logits(
-        q_index_fp8_4d,
-        k_index_cache_uint8,
+    mod.fp8_paged_mqa_logits(
+        q_index_fp8,
+        k_index_cache_fp8.view(torch.uint8),
         weights,
         seq_lens,
         block_table,
-        schedule_meta,
+        logits,
         max_context_len,
-        clean_logits=False,
+        max_num_pages,
     )
 
-    # Build token-level page table for FlashInfer
+    # Build token-level page table for FlashInfer:
+    #   token_page_table[b, t] = physical token index (page_id * PS + offset)
     offsets = torch.arange(page_size, device=device, dtype=torch.int32)
-    physical = block_table.unsqueeze(-1) * page_size + offsets  # [batch, max_num_pages, page_size]
-    physical_flat = physical.reshape(batch_size, -1)  # [batch, max_num_pages * page_size]
-    token_indices = torch.arange(max_num_pages * page_size, device=device)
+    physical = block_table.unsqueeze(-1) * page_size + offsets   # [B, max_pages, PS]
+    physical_flat = physical.reshape(batch_size, -1)              # [B, max_context_len]
+    token_indices = torch.arange(max_context_len, device=device)
     mask = token_indices.unsqueeze(0) < seq_lens.unsqueeze(1)
     token_page_table = torch.where(mask, physical_flat, torch.zeros_like(physical_flat))
 
-    # Run FlashInfer top-k selection
     topk_indices = flashinfer.top_k_page_table_transform(
-        input=logits.to(torch.float16), 
-        src_page_table=token_page_table, 
-        lengths=seq_lens, 
-        k=topk
+        input=logits,
+        src_page_table=token_page_table,
+        lengths=seq_lens,
+        k=topk,
     )
-
     return (topk_indices,)
