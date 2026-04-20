@@ -16,8 +16,11 @@
  */
 
 #include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
 #include <cuda_runtime.h>
 #include <cuda_fp8.h>
+#include <cub/device/device_segmented_radix_sort.cuh>
+#include <cmath>
 
 /* ------------------------------------------------------------------ */
 /* Compile-time constants                                               */
@@ -177,7 +180,151 @@ void fp8_paged_mqa_logits(
     TORCH_CHECK(_err == cudaSuccess, "fp8_paged_mqa_logits kernel error: ", cudaGetErrorString(_err));
 }
 
+/* ====================================================================== */
+/* Top-K page table transform                                               */
+/*                                                                          */
+/* For each batch b of logits[B, M]:                                        */
+/*   - effective_k = min(k, seq_lens[b])                                    */
+/*   - pick effective_k largest logits (positions in [0, seq_lens[b]))      */
+/*   - sort descending by value                                             */
+/*   - output_page_table[b, i] =                                            */
+/*        block_table[b, pos/PS] * PS + (pos % PS)   if i < effective_k     */
+/*        -1                                         otherwise              */
+/*                                                                          */
+/* Matches the reference semantics (`torch.topk` per batch with -1 padding) */
+/* ====================================================================== */
+
+/* Build per-batch (key, value) pairs for segmented radix sort.
+ *   key   = logits[b, t]    if t < seq_lens[b]     else -inf
+ *   value = physical token  if t < seq_lens[b]     else -1
+ *   (physical token = block_table[b, t/PS] * PS + (t % PS))
+ */
+__global__ void topk_prepare_kernel(
+    const float* __restrict__ logits,        /* [B, M]              */
+    const int*   __restrict__ block_table,   /* [B, max_pages]      */
+    const int*   __restrict__ seq_lens,      /* [B]                 */
+    float*       __restrict__ keys_out,      /* [B*M]               */
+    int*         __restrict__ values_out,    /* [B*M]               */
+    int M,
+    int max_pages
+) {
+    const int b = blockIdx.y;
+    const int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= M) return;
+
+    const int sl = seq_lens[b];
+    const size_t off = (size_t)b * M + t;
+
+    if (t < sl) {
+        keys_out[off] = logits[off];
+        const int page_idx       = t / PS;
+        const int off_in_page    = t % PS;
+        const int page_id        = block_table[b * max_pages + page_idx];
+        values_out[off] = page_id * PS + off_in_page;
+    } else {
+        keys_out[off] = -INFINITY;
+        values_out[off] = -1;
+    }
+}
+
+/* Gather first k entries of each segment (already sorted descending).
+ * If k > M, pad with -1. */
+__global__ void topk_gather_kernel(
+    const int* __restrict__ sorted_values,   /* [B*M]           */
+    int*       __restrict__ out,              /* [B, k]          */
+    int M,
+    int k
+) {
+    const int b = blockIdx.y;
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= k) return;
+    out[b * k + i] = (i < M) ? sorted_values[(size_t)b * M + i] : -1;
+}
+
+torch::Tensor topk_page_table_transform(
+    torch::Tensor logits,       /* [B, M]              float32 */
+    torch::Tensor block_table,  /* [B, max_pages]      int32   */
+    torch::Tensor seq_lens,     /* [B]                 int32   */
+    int k
+) {
+    TORCH_CHECK(logits.is_cuda(), "logits must be CUDA");
+    TORCH_CHECK(logits.scalar_type() == torch::kFloat32, "logits must be float32");
+    TORCH_CHECK(block_table.is_cuda() && block_table.scalar_type() == torch::kInt32,
+                "block_table must be int32 on CUDA");
+    TORCH_CHECK(seq_lens.is_cuda() && seq_lens.scalar_type() == torch::kInt32,
+                "seq_lens must be int32 on CUDA");
+
+    const int B         = static_cast<int>(logits.size(0));
+    const int M         = static_cast<int>(logits.size(1));
+    const int max_pages = static_cast<int>(block_table.size(1));
+    const auto device   = logits.device();
+    auto stream         = at::cuda::getCurrentCUDAStream();
+
+    auto f32 = torch::TensorOptions().dtype(torch::kFloat32).device(device);
+    auto i32 = torch::TensorOptions().dtype(torch::kInt32).device(device);
+    auto u8  = torch::TensorOptions().dtype(torch::kUInt8).device(device);
+
+    auto keys_in    = torch::empty({(long)B * M}, f32);
+    auto values_in  = torch::empty({(long)B * M}, i32);
+    auto keys_out   = torch::empty_like(keys_in);
+    auto values_out = torch::empty_like(values_in);
+    auto output     = torch::empty({B, k}, i32);
+
+    /* 1. Prepare keys / values. */
+    {
+        const int threads = 256;
+        const dim3 grid((M + threads - 1) / threads, B);
+        topk_prepare_kernel<<<grid, threads, 0, stream>>>(
+            logits.data_ptr<float>(),
+            block_table.data_ptr<int>(),
+            seq_lens.data_ptr<int>(),
+            keys_in.data_ptr<float>(),
+            values_in.data_ptr<int>(),
+            M, max_pages
+        );
+    }
+
+    /* 2. Segment offsets [0, M, 2M, ..., B*M]. */
+    auto offsets = torch::arange(0, (long)(B + 1) * M, M, i32);
+
+    /* 3. CUB segmented radix sort (descending). */
+    size_t temp_storage_bytes = 0;
+    cub::DeviceSegmentedRadixSort::SortPairsDescending(
+        nullptr, temp_storage_bytes,
+        keys_in.data_ptr<float>(),   keys_out.data_ptr<float>(),
+        values_in.data_ptr<int>(),   values_out.data_ptr<int>(),
+        B * M, B,
+        offsets.data_ptr<int>(),     offsets.data_ptr<int>() + 1,
+        0, sizeof(float) * 8, stream.stream()
+    );
+    auto temp_storage = torch::empty({(long)temp_storage_bytes}, u8);
+    cub::DeviceSegmentedRadixSort::SortPairsDescending(
+        temp_storage.data_ptr(), temp_storage_bytes,
+        keys_in.data_ptr<float>(),   keys_out.data_ptr<float>(),
+        values_in.data_ptr<int>(),   values_out.data_ptr<int>(),
+        B * M, B,
+        offsets.data_ptr<int>(),     offsets.data_ptr<int>() + 1,
+        0, sizeof(float) * 8, stream.stream()
+    );
+
+    /* 4. Gather top-k. */
+    {
+        const int threads = 256;
+        const dim3 grid((k + threads - 1) / threads, B);
+        topk_gather_kernel<<<grid, threads, 0, stream>>>(
+            values_out.data_ptr<int>(), output.data_ptr<int>(), M, k
+        );
+    }
+
+    auto err = cudaGetLastError();
+    TORCH_CHECK(err == cudaSuccess,
+                "topk_page_table_transform kernel error: ", cudaGetErrorString(err));
+    return output;
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("fp8_paged_mqa_logits", &fp8_paged_mqa_logits,
           "FP8 paged MQA logits (custom CUDA)");
+    m.def("topk_page_table_transform", &topk_page_table_transform,
+          "Top-K page table transform (custom CUDA, CUB segmented sort)");
 }

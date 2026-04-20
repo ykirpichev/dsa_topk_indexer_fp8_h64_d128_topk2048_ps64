@@ -1,16 +1,16 @@
 """
-DSA top-K indexer — custom CUDA FP8 paged MQA logits + FlashInfer top-k.
+DSA top-K indexer — custom CUDA FP8 paged MQA logits + custom CUDA top-K.
 
-Pipeline:
-  1. kernel.cu::fp8_paged_mqa_logits  (compiled at first call via torch.cpp_extension)
-  2. flashinfer.top_k_page_table_transform
+Pipeline (all CUDA, no FlashInfer at runtime):
+  1. kernel.cu::fp8_paged_mqa_logits         — FP8 paged MQA logits
+  2. kernel.cu::topk_page_table_transform    — CUB segmented radix top-K
 
-K-cache layout per token: 128 fp8_e4m3 bytes + 1 float32 scale  (132 bytes total).
+K-cache layout per page (deep_gemm format):
+  [page_size * 128 FP8 bytes] [page_size * 4 scale bytes] = 8448 bytes / page.
 """
 
 import os
 
-import flashinfer
 import torch
 import torch.utils.cpp_extension as _ext
 
@@ -42,11 +42,11 @@ def run(q_index_fp8, k_index_cache_fp8, weights, seq_lens, block_table):
     Returns:
         (topk_indices,)    : [B, 2048]                   int32
     """
-    batch_size    = q_index_fp8.shape[0]
-    page_size     = k_index_cache_fp8.shape[1]   # 64
-    topk          = 2048
-    device        = q_index_fp8.device
-    max_num_pages = block_table.shape[1]
+    batch_size      = q_index_fp8.shape[0]
+    page_size       = k_index_cache_fp8.shape[1]   # 64
+    topk            = 2048
+    device          = q_index_fp8.device
+    max_num_pages   = block_table.shape[1]
     max_context_len = max_num_pages * page_size
 
     mod = _load_module()
@@ -64,19 +64,10 @@ def run(q_index_fp8, k_index_cache_fp8, weights, seq_lens, block_table):
         max_num_pages,
     )
 
-    # Build token-level page table for FlashInfer:
-    #   token_page_table[b, t] = physical token index (page_id * PS + offset)
-    offsets = torch.arange(page_size, device=device, dtype=torch.int32)
-    physical = block_table.unsqueeze(-1) * page_size + offsets   # [B, max_pages, PS]
-    physical_flat = physical.reshape(batch_size, -1)              # [B, max_context_len]
-    token_indices = torch.arange(max_context_len, device=device)
-    mask = token_indices.unsqueeze(0) < seq_lens.unsqueeze(1)
-    token_page_table = torch.where(mask, physical_flat, torch.zeros_like(physical_flat))
-
-    topk_indices = flashinfer.top_k_page_table_transform(
-        input=logits,
-        src_page_table=token_page_table,
-        lengths=seq_lens,
-        k=topk,
+    topk_indices = mod.topk_page_table_transform(
+        logits,
+        block_table,
+        seq_lens,
+        topk,
     )
     return (topk_indices,)
