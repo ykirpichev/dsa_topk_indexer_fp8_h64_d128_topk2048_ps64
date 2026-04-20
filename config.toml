@@ -1,8 +1,9 @@
 [solution]
-name = "my-team-solution-v1"      # Solution name
-definition = "fused_moe"          # Track: fused_moe | sparse_attention | gated_delta_net
-author = "team-name"              # Team/author name
+name = "dsa_topk_indexer_fp8_b200_v1"
+definition = "dsa_topk_indexer_fp8_h64_d128_topk2048_ps64"
+author = "Wombat"
 
 [build]
-language = "triton"               # triton | cuda
-entry_point = "kernel"            # Kernel function name
+language = "cuda"
+entry_point = "kernel.cu::kernel"
+destination_passing_style = true

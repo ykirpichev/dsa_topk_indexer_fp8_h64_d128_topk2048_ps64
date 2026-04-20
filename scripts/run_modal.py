@@ -13,7 +13,6 @@ Setup (one-time):
 import sys
 from pathlib import Path
 
-# Add project root to path for imports
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
@@ -25,9 +24,22 @@ app = modal.App("flashinfer-bench")
 trace_volume = modal.Volume.from_name("flashinfer-trace", create_if_missing=True)
 TRACE_SET_PATH = "/data"
 
+# FlashInfer CI image (CUDA 13.2 + nvcc) required to build the CUDA extension
+# at runtime via tvm_ffi.cpp.build. The upstream starter-kit
+# `debian_slim + pip install torch` image does not ship nvcc.
 image = (
-    modal.Image.debian_slim(python_version="3.12")
-    .pip_install("flashinfer-bench", "torch", "triton", "numpy")
+    modal.Image.from_registry("flashinfer/flashinfer-ci-cu132:latest")
+    .apt_install("git")
+    .env({"CUDA_HOME": "/usr/local/cuda"})
+    .pip_install("wheel", "setuptools")
+    .run_commands(
+        "git clone --recursive --depth 1 https://github.com/deepseek-ai/DeepGEMM.git /tmp/DeepGEMM",
+        "pip install --no-build-isolation /tmp/DeepGEMM",
+        "git clone --recursive --depth 1 https://github.com/flashinfer-ai/flashinfer.git /tmp/flashinfer",
+        "pip install --no-build-isolation /tmp/flashinfer",
+        "git clone --depth 1 https://github.com/flashinfer-ai/flashinfer-bench.git /tmp/flashinfer-bench",
+        "pip install /tmp/flashinfer-bench",
+    )
 )
 
 

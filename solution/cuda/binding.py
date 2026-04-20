@@ -1,25 +1,23 @@
 """
-TVM FFI Bindings Template for CUDA Kernels.
+TVM FFI bindings template for the CUDA FP8 MQA Logits + Top-K kernel.
 
-This file provides Python bindings for your CUDA kernel using TVM FFI.
-The entry point function name should match the `entry_point` setting in config.toml.
+With `language = "cuda"` and the default TVM-FFI binding, ``flashinfer-bench``
+compiles ``kernel.cu`` directly (via ``tvm_ffi.cpp.build``) and looks up the
+exported symbol named ``kernel`` — see ``TVM_FFI_DLL_EXPORT_TYPED_FUNC(kernel, kernel_fn)``
+in ``kernel.cu``. This Python file is kept alongside the sources to match the
+starter-kit layout but is not loaded by the CUDA builder.
 
-See the track definition for required function signature and semantics.
+See:
+  https://github.com/flashinfer-ai/flashinfer-bench-starter-kit/blob/main/solution/cuda/binding.py
 """
 
-import ctypes
 from tvm.ffi import register_func
 
 
 @register_func("flashinfer.kernel")
 def kernel():
-    """
-    Python binding for your CUDA kernel.
-
-    TODO: Implement the binding according to the track definition.
-    This function should:
-    1. Accept the inputs as specified by the track definition
-    2. Launch your CUDA kernel with appropriate grid/block dimensions
-    3. Return outputs as specified by the track definition
-    """
-    pass
+    """Placeholder: the actual entry point lives in kernel.cu (TVM-FFI C++)."""
+    raise NotImplementedError(
+        "binding.py::kernel is a placeholder; use kernel.cu::kernel "
+        "(the compiled TVM-FFI symbol)."
+    )
