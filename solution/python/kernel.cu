@@ -35,13 +35,26 @@ constexpr int kRadix           = 256;
 constexpr int kRadixRounds     = 2;
 constexpr int kOrderedBits     = 16;
 
+// Rank 1 (size-aware launch): two Stage-1 kernels are compiled, the host
+// dispatcher picks between them based on per-row workload size.
+//
+//   * paged_mqa_logits_umma_kernel_short    — 1 page per UMMA, grid =
+//       (max_num_pages, B). Lowest launch overhead, best for small workloads.
+//   * paged_mqa_logits_umma_kernel_persistent — 2 pages per UMMA (kUMMA_M=128
+//       both halves real), persistent CTAs that loop over tiles_per_cta
+//       tile-pairs while Q/TMEM/mbar are loaded/alloc'd once. Double-buffered
+//       K via cp.async. Best for large workloads.
+constexpr int kPagesPerUMMA = 2;
+
 
 // ============================================================================
-// Stage 1: Paged MQA logits via tcgen05.mma.kind::f8f6f4 (SM100a UMMA)
+// Stage 1 (short path): 1 page per UMMA tile, 1 tile per CTA.
+// Kept verbatim from submission-v8; used for workloads where the persistent
+// path's setup costs dominate.
 // ============================================================================
 
 __global__ __launch_bounds__(128)
-void paged_mqa_logits_umma_kernel(
+void paged_mqa_logits_umma_kernel_short(
     const __nv_fp8_e4m3* __restrict__ q_fp8,
     const uint8_t*       __restrict__ kv_cache,
     const float*         __restrict__ weights,
@@ -199,6 +212,263 @@ void paged_mqa_logits_umma_kernel(
         const int   kv_abs = kv_base + tid;
         const float scaled = acc_relu * smem_kscale[tid];
         logits_b[kv_abs]   = (kv_abs < seq_len) ? __float2half_rn(scaled) : kHalfNegInf;
+    }
+}
+
+
+// ============================================================================
+// Stage 1 (persistent path): 2 pages per UMMA, persistent CTAs.
+//
+// Grid: (num_splits, B).  Each CTA owns tile-pairs
+//   [cta_x * tiles_per_cta, min((cta_x+1) * tiles_per_cta, max_kv_tile_pairs)).
+// Q, weights, TMEM, and mbarrier are allocated/loaded ONCE per CTA and reused
+// across the inner tile-pair loop; with typical num_pages >> 1 this amortises
+// the Q load cost dramatically vs the short path.
+//
+// smem_k is 2-way double-buffered; at iteration i UMMA consumes buf (i&1)
+// while a cp.async prefetch for tile i+1 fills the OPPOSITE buffer
+// ((i+1)&1). That keeps exactly one cp.async group in flight at a time
+// without the buffer-aliasing race that a 2-buffer / i+2 prefetch would
+// create (tile i+2 and tile i share the same buffer).  kscale is
+// double-buffered alongside K.
+// ============================================================================
+
+__global__ __launch_bounds__(128)
+void paged_mqa_logits_umma_kernel_persistent(
+    const __nv_fp8_e4m3* __restrict__ q_fp8,
+    const uint8_t*       __restrict__ kv_cache,
+    const float*         __restrict__ weights,
+    const int*           __restrict__ seq_lens,
+    const int*           __restrict__ block_table,
+    int                               max_num_pages,
+    int                               max_kv_tile_pairs,
+    int                               tiles_per_cta,
+    __half*              __restrict__ logits_out)
+{
+    constexpr int kUMMA_M    = kPagesPerUMMA * kBlockKv;  // 128
+    constexpr int kUMMA_N    = kNumHeads;                 // 64
+    constexpr int kUMMA_K_B  = 32;
+    constexpr int kKIters    = kHeadDim / kUMMA_K_B;
+    constexpr int kThreads   = 128;
+    constexpr int kTmemCols  = kUMMA_N;
+    constexpr uint32_t kSboBytes = 1024u;
+
+    const int cta_x     = blockIdx.x;
+    const int b         = blockIdx.y;
+    const int tid       = threadIdx.x;
+    const int warp_id   = tid / 32;
+    const int lane      = tid % 32;
+
+    const int seq_len = seq_lens[b];
+
+    const int tile_pair_begin = cta_x * tiles_per_cta;
+    int tile_pair_end         = tile_pair_begin + tiles_per_cta;
+    if (tile_pair_end > max_kv_tile_pairs) tile_pair_end = max_kv_tile_pairs;
+
+    __half* logits_b = logits_out + static_cast<size_t>(b) *
+                                    static_cast<size_t>(max_kv_tile_pairs * kUMMA_M);
+
+    const __half kHalfNegInf = __ushort_as_half(static_cast<unsigned short>(0xFC00));
+
+    if (tile_pair_begin >= max_kv_tile_pairs) return;
+
+    __shared__ __align__(1024) __nv_fp8_e4m3 smem_q[kNumHeads * kHeadDim];
+    __shared__ __align__(1024) __nv_fp8_e4m3 smem_k[2][kUMMA_M * kHeadDim];
+    __shared__ float    smem_kscale[2][kUMMA_M];
+    __shared__ float    smem_w[kNumHeads];
+    __shared__ uint32_t smem_tmem_ptr;
+    __shared__ __align__(8) uint64_t smem_mbar;
+
+    auto kSwizzle16B = [] (int idx) {
+        return idx ^ ((idx >> 3) & 7);
+    };
+
+    struct TileDesc {
+        bool           any_valid;
+        bool           page1_valid;
+        const uint8_t* page_ptr_0;
+        const uint8_t* page_ptr_1;
+    };
+
+    auto describe_tile = [&](int tp) -> TileDesc {
+        TileDesc d{};
+        if (tp < tile_pair_begin || tp >= tile_pair_end) return d;
+        const int kv_base = tp * kUMMA_M;
+        if (kv_base >= seq_len) return d;
+        d.any_valid = true;
+        const int page0_btidx = tp * kPagesPerUMMA;
+        const int page1_btidx = tp * kPagesPerUMMA + 1;
+        d.page1_valid = (page1_btidx < max_num_pages) &&
+                        (kv_base + kBlockKv < seq_len);
+        const int page0_idx = block_table[b * max_num_pages + page0_btidx];
+        const int page1_idx = d.page1_valid
+            ? block_table[b * max_num_pages + page1_btidx] : 0;
+        d.page_ptr_0 = kv_cache + static_cast<size_t>(page0_idx) * kPageBytes;
+        d.page_ptr_1 = kv_cache + static_cast<size_t>(page1_idx) * kPageBytes;
+        return d;
+    };
+
+    // Async K prefetch for tile `tp` into double-buffer slot `buf`.  Always
+    // closes a commit group so the caller's wait_group accounting stays
+    // simple, regardless of whether the tile is in range.
+    auto prefetch_tile = [&](int buf, int tp) {
+        const TileDesc d = describe_tile(tp);
+        if (d.any_valid) {
+            constexpr int kVecHalf  = (kBlockKv * kHeadDim) / 16;
+            constexpr int kVecTotal = (kUMMA_M  * kHeadDim) / 16;
+            const uint32_t smem_k_base = dsa_ptx::smem_ptr_to_uint(&smem_k[buf][0]);
+            const uint4* src0 = reinterpret_cast<const uint4*>(d.page_ptr_0);
+#pragma unroll 4
+            for (int i = tid; i < kVecHalf; i += kThreads) {
+                const int swz = kSwizzle16B(i);
+                dsa_ptx::cp_async_16B(smem_k_base + swz * 16u, &src0[i]);
+            }
+            if (d.page1_valid) {
+                const uint4* src1 = reinterpret_cast<const uint4*>(d.page_ptr_1);
+#pragma unroll 4
+                for (int i = tid; i < kVecHalf; i += kThreads) {
+                    const int swz = kSwizzle16B(i + kVecHalf);
+                    dsa_ptx::cp_async_16B(smem_k_base + swz * 16u, &src1[i]);
+                }
+            } else {
+                const uint4 zero4 = make_uint4(0u, 0u, 0u, 0u);
+                uint4* k_dst = reinterpret_cast<uint4*>(&smem_k[buf][0]);
+#pragma unroll 4
+                for (int i = tid; i < (kVecTotal - kVecHalf); i += kThreads)
+                    k_dst[kSwizzle16B(i + kVecHalf)] = zero4;
+            }
+
+            if (tid < kBlockKv) {
+                smem_kscale[buf][tid] = reinterpret_cast<const float*>(
+                    d.page_ptr_0 + kScaleOffsetBytes)[tid];
+                smem_kscale[buf][tid + kBlockKv] = d.page1_valid
+                    ? reinterpret_cast<const float*>(
+                          d.page_ptr_1 + kScaleOffsetBytes)[tid]
+                    : 0.0f;
+            }
+        }
+        dsa_ptx::cp_async_commit_group();
+    };
+
+    // -------- one-shot setup: Q, weights, TMEM alloc, mbar init --------
+    {
+        const uint4* src = reinterpret_cast<const uint4*>(
+            q_fp8 + static_cast<size_t>(b) * kNumHeads * kHeadDim);
+        uint4* dst = reinterpret_cast<uint4*>(smem_q);
+        constexpr int kVec = (kNumHeads * kHeadDim) / 16;
+#pragma unroll 4
+        for (int i = tid; i < kVec; i += kThreads) dst[kSwizzle16B(i)] = src[i];
+    }
+
+    if (tid < kNumHeads) smem_w[tid] = weights[b * kNumHeads + tid];
+
+    if (warp_id == 0) {
+        const uint32_t tmem_ptr_smem = dsa_ptx::smem_ptr_to_uint(&smem_tmem_ptr);
+        dsa_ptx::tcgen05_alloc_1sm(tmem_ptr_smem, kTmemCols);
+        dsa_ptx::tcgen05_relinquish_alloc_permit_1sm();
+        if (lane == 0)
+            dsa_ptx::mbarrier_init(dsa_ptx::smem_ptr_to_uint(&smem_mbar), 1);
+        dsa_ptx::fence_barrier_init();
+    }
+
+    prefetch_tile(0, tile_pair_begin);
+
+    __syncthreads();
+
+    const uint32_t tmem_addr = smem_tmem_ptr;
+
+    const auto instr = dsa_umma::make_instr_desc_f8f6f4(
+        dsa_umma::F8F6F4Format::E4M3, dsa_umma::F8F6F4Format::E4M3,
+        dsa_umma::CFormat::F32,
+        dsa_umma::Major::K, dsa_umma::Major::K,
+        kUMMA_M, kUMMA_N);
+
+    const auto make_kmajor_desc = [&](const void* smem_base) {
+        dsa_umma::SmemDescriptor d{};
+        d.desc_                = 0;
+        d.version_             = 1;
+        d.lbo_mode_            = 0;
+        d.base_offset_         = 0;
+        d.layout_type_         = static_cast<uint8_t>(dsa_umma::LayoutType::SWIZZLE_128B);
+        d.leading_byte_offset_ = 0;
+        d.stride_byte_offset_  = static_cast<uint16_t>(kSboBytes >> 4);
+        d.start_address_       = static_cast<uint16_t>(
+            dsa_ptx::smem_ptr_to_uint(smem_base) >> 4);
+        return d;
+    };
+    dsa_umma::SmemDescriptor a_desc_base[2] = {
+        make_kmajor_desc(&smem_k[0][0]),
+        make_kmajor_desc(&smem_k[1][0]),
+    };
+    const auto b_desc_base = make_kmajor_desc(smem_q);
+
+    uint32_t parity = 0u;
+
+    const int num_tiles = tile_pair_end - tile_pair_begin;
+
+    for (int i = 0; i < num_tiles; ++i) {
+        const int tp      = tile_pair_begin + i;
+        const int buf     = i & 1;
+        const int kv_base = tp * kUMMA_M;
+
+        dsa_ptx::cp_async_wait_group<0>();
+        __syncthreads();
+
+        if (i + 1 < num_tiles) {
+            prefetch_tile((i + 1) & 1, tp + 1);
+        }
+
+        if (kv_base >= seq_len) {
+            for (int j = tid; j < kUMMA_M; j += kThreads)
+                logits_b[kv_base + j] = kHalfNegInf;
+            continue;
+        }
+
+        if (warp_id == 0) {
+            dsa_ptx::tcgen05_fence_after_thread_sync();
+            if (lane == 0) {
+#pragma unroll
+                for (int k = 0; k < kKIters; ++k) {
+                    dsa_umma::SmemDescriptor a = a_desc_base[buf];
+                    dsa_umma::SmemDescriptor b = b_desc_base;
+                    const uint16_t k_step_shifted =
+                        static_cast<uint16_t>((k * kUMMA_K_B) >> 4);
+                    a.start_address_ = static_cast<uint16_t>(a.start_address_ + k_step_shifted);
+                    b.start_address_ = static_cast<uint16_t>(b.start_address_ + k_step_shifted);
+                    dsa_ptx::tcgen05_mma_f8f6f4_ss(
+                        tmem_addr, a, b, instr, (k == 0) ? 0u : 1u);
+                }
+                dsa_ptx::tcgen05_commit_1sm(dsa_ptx::smem_ptr_to_uint(&smem_mbar));
+            }
+        }
+
+        dsa_ptx::mbarrier_wait_parity(dsa_ptx::smem_ptr_to_uint(&smem_mbar), parity);
+        parity ^= 1u;
+        dsa_ptx::tcgen05_fence_after_thread_sync();
+
+        uint32_t regs[kUMMA_N];
+        dsa_ptx::tcgen05_ld_32x32b_x64_b32(tmem_addr, regs);
+        dsa_ptx::tcgen05_wait_ld();
+        (void)warp_id; (void)lane;
+
+        if (tid < kUMMA_M) {
+            const float* acc = reinterpret_cast<const float*>(regs);
+            float acc_relu = 0.0f;
+#pragma unroll
+            for (int h = 0; h < kNumHeads; ++h) {
+                const float r = acc[h] > 0.0f ? acc[h] : 0.0f;
+                acc_relu = fmaf(r, smem_w[h], acc_relu);
+            }
+            const int   kv_abs = kv_base + tid;
+            const float scaled = acc_relu * smem_kscale[buf][tid];
+            logits_b[kv_abs] = (kv_abs < seq_len) ? __float2half_rn(scaled) : kHalfNegInf;
+        }
+    }
+
+    __syncthreads();
+    if (warp_id == 0) {
+        dsa_ptx::tcgen05_fence_before_thread_sync();
+        dsa_ptx::tcgen05_dealloc_1sm(tmem_addr, kTmemCols);
     }
 }
 
@@ -368,26 +638,74 @@ void dsa_topk_indexer_cuda(
     TORCH_CHECK(block_table.is_cuda() && block_table.is_contiguous() && block_table.dtype() == torch::kInt32);
     TORCH_CHECK(topk_indices.is_cuda() && topk_indices.is_contiguous() && topk_indices.dtype() == torch::kInt32);
 
-    const int B            = (int)q_index_fp8.size(0);
-    const int max_num_pages= (int)block_table.size(1);
-    const int max_kv_tiles = max_num_pages;
-    const int max_len      = max_kv_tiles * kPageSize;
+    const int B             = (int)q_index_fp8.size(0);
+    const int max_num_pages = (int)block_table.size(1);
+
+    // Size-aware Stage 1 dispatch (Rank 1 improvement).
+    //
+    // Empirically, on B200 the submission-v8 "short" kernel wins on small
+    // per-row workloads (max_num_pages <= ~32) where the persistent kernel's
+    // one-shot setup (Q/TMEM/mbar + first K prefetch) is a big fraction of
+    // total time and where the grid already saturates the SMs.  On larger
+    // rows the persistent kernel wins because it (a) halves the UMMA count
+    // (2 pages per UMMA), (b) eliminates redundant Q reads, and (c) overlaps
+    // K fetches with UMMA via cp.async double-buffering.
+    //
+    // Threshold chosen on the conservative side of measured data — tunable.
+    constexpr int kPersistentPageThreshold = 40;
+    const bool use_persistent = (max_num_pages >= kPersistentPageThreshold);
+
+    const int max_kv_tile_pairs =
+        (max_num_pages + kPagesPerUMMA - 1) / kPagesPerUMMA;
+
+    // Logits tensor layout must match whatever Stage 1 writes.  The
+    // persistent kernel writes max_kv_tile_pairs * kUMMA_M = 2-page-rounded
+    // columns per row; the short kernel writes exactly max_num_pages *
+    // kPageSize.  The rounded form is always >= the exact form, so Stage 2
+    // (which iterates up to seq_len anyway) works with either.
+    const int max_len = use_persistent
+        ? max_kv_tile_pairs * (kPagesPerUMMA * kBlockKv)
+        : max_num_pages * kPageSize;
 
     auto logits = torch::empty({B, max_len},
         torch::TensorOptions().dtype(torch::kFloat16).device(q_index_fp8.device()));
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-    {
-        dim3 grid(max_kv_tiles, B);
+    if (use_persistent) {
+        // Pick tiles_per_cta so (a) we have enough CTAs to keep ~132 SMs
+        // busy and (b) each CTA amortises Q load over many tile-pairs.
+        constexpr int kSmTarget = 132 * 4;
+        constexpr int kMinTiles = 4;
+        constexpr int kMaxTiles = 64;
+        int num_splits = (kSmTarget + B - 1) / B;
+        if (num_splits < 1) num_splits = 1;
+        if (num_splits > max_kv_tile_pairs) num_splits = max_kv_tile_pairs;
+        int tiles_per_cta = (max_kv_tile_pairs + num_splits - 1) / num_splits;
+        if (tiles_per_cta < kMinTiles) tiles_per_cta = kMinTiles;
+        if (tiles_per_cta > kMaxTiles) tiles_per_cta = kMaxTiles;
+        num_splits = (max_kv_tile_pairs + tiles_per_cta - 1) / tiles_per_cta;
+
+        dim3 grid(num_splits, B);
         dim3 block(128);
-        paged_mqa_logits_umma_kernel<<<grid, block, 0, stream>>>(
+        paged_mqa_logits_umma_kernel_persistent<<<grid, block, 0, stream>>>(
             reinterpret_cast<const __nv_fp8_e4m3*>(q_index_fp8.data_ptr()),
             reinterpret_cast<const uint8_t*>(k_index_cache_fp8.data_ptr()),
             weights.data_ptr<float>(),
             seq_lens.data_ptr<int>(),
             block_table.data_ptr<int>(),
-            max_num_pages, max_kv_tiles,
+            max_num_pages, max_kv_tile_pairs, tiles_per_cta,
+            reinterpret_cast<__half*>(logits.data_ptr()));
+    } else {
+        dim3 grid(max_num_pages, B);
+        dim3 block(128);
+        paged_mqa_logits_umma_kernel_short<<<grid, block, 0, stream>>>(
+            reinterpret_cast<const __nv_fp8_e4m3*>(q_index_fp8.data_ptr()),
+            reinterpret_cast<const uint8_t*>(k_index_cache_fp8.data_ptr()),
+            weights.data_ptr<float>(),
+            seq_lens.data_ptr<int>(),
+            block_table.data_ptr<int>(),
+            max_num_pages, max_num_pages,
             reinterpret_cast<__half*>(logits.data_ptr()));
     }
 
