@@ -53,6 +53,10 @@ constexpr int kPagesPerUMMA = 2;
 // other two buffers — fully hides HBM load latency for large num_tiles.
 // 3 stages costs +16 KB smem vs 2 stages (~57 KB total, still well under the
 // B200's 228 KB budget per CTA).
+//
+// We evaluated kKVStages=4 (mnp 40–63: 19.27 → 19.45 µs, +0.9%, other buckets
+// flat) and found no benefit — the math path (TMEM readout + weighted sum +
+// emit) is the current bottleneck, not producer latency. Staying at 3.
 constexpr int kKVStages = 3;
 
 
@@ -694,7 +698,7 @@ void paged_mqa_logits_umma_kernel_persistent_ws(
             dsa_ptx::cp_async_commit_group();
         };
 
-        uint32_t done_parity[kKVStages] = {0u, 0u, 0u};
+        uint32_t done_parity[kKVStages] = {};
 
         for (int i = 0; i < num_tiles; ++i) {
             const int buf = i % kKVStages;
@@ -757,7 +761,7 @@ void paged_mqa_logits_umma_kernel_persistent_ws(
         const auto b_desc_base = make_kmajor_desc(smem_q);
 
         uint32_t umma_parity = 0u;
-        uint32_t ready_parity[kKVStages] = {0u, 0u, 0u};
+        uint32_t ready_parity[kKVStages] = {};
 
         for (int i = 0; i < num_tiles; ++i) {
             const int tp      = tile_pair_begin + i;

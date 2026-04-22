@@ -239,6 +239,9 @@ Expected cumulative mean after (1)+(2)+(3)+(5): ~11–13 µs (vs current
 | A1| Stage-1 per-CTA early-return on `seq_len ≤ kTopK` | **shipped** |
 | A2| Host-side `seq_lens.max()` sync to extend fast path | **rejected** |
 | R3| Warp specialisation — producer + math warpgroups   | **shipped** |
+|TMB| TMEM double-buffering (prev-iter deferred processing) | **rejected** (no MMA compute to hide) |
+|R5d| Deeper K pipeline: kKVStages 3 → 4         | **rejected** (producer not the bottleneck) |
+|AC4| 4-way accumulator split in the 64-FMA reduction | **rejected** (no change; FMA chain not critical) |
 
 Current state (after R3):
 - mean 12.4 µs, p50 6.6 µs, p95 22.4 µs, min 6.3 µs, max 23.1 µs
@@ -284,27 +287,124 @@ because they take the static fast path.
   · weighted sum, emit, arrive `K_done[(i-1)%kKVStages]`).  Expected
   gain: overlap MMA compute with TMEM_ld + HBM emit.  Actual: 128/128
   still correct, but mnp 40-63 = 19.27 → 19.62 (+1.8 %) and
-  mnp ≥ 64 = 22.18 → 22.59 (+1.8 %).  Two reasons this lost:
-  1. `tcgen05.mma` **issue** is nearly free (few cycles); the MMA
-     pipeline itself already runs async behind the next `K_ready`
-     wait.  What we gained by hiding MMA compute behind the emit was
-     smaller than the extra mbarrier + parity + lambda-state overhead.
-  2. K_done release is delayed by one iter — `K_done[i]` now arrives
-     in iter `i+1`'s body instead of iter `i`'s — so the producer's
-     kKVStages=3 pipeline has less headroom and starts to stall on
-     mnp ≥ 40 workloads where prefetch latency matters.
+  mnp ≥ 64 = 22.18 → 22.59 (+1.8 %).  Original diagnosis: two causes —
+  (1) `tcgen05.mma` issue is nearly free, so hiding it behind emit was
+  a small win, and (2) delayed `K_done` release starves the producer
+  pipeline.
 
-  Triple-buffered TMEM would hit the same root cause + even more
-  delayed `K_done` release.  Not worth trying unless we first change
-  the emit path (so MMA compute becomes a real bottleneck to hide).
+  **Updated diagnosis after kKVStages=4 A/B (see below):** cause (2)
+  is wrong — producer is not starved.  Cause (1) is the real story:
+  there is no useful MMA compute to hide behind emit, because the math
+  path (TMEM_ld + per-head ReLU·w sum + emit) *is* what's keeping us
+  above ~20 µs on mnp ≥ 40, not MMA compute.  Triple-buffering would
+  hit the same wall.
 
-- **Warp-specialised emit.**  Pulling the `logits_b[...] = ...` store
-  into a dedicated math warp would let the rest of the math warpgroup
-  start the next iteration's TMEM readout.  This is the *actual*
-  lever for overlap — HBM emit is a bigger chunk of the critical path
-  than UMMA compute.  Not yet attempted.
-- **2-CTA cluster UMMA (Rank 2).**  Biggest remaining lever for the
-  mnp ≥ 64 tail; needs cluster-dim launch and multicast Q.
+- **kKVStages 3 → 4 (deeper K pipeline) — tried, rejected.**  Hypothesis
+  was that bumping to 4 stages would give the producer more prefetch
+  headroom and unlock TMEM double-buffering as a follow-on.  Bench
+  (vs R3 baseline in same Modal session):
+
+  | bucket        | n  | R3 (3 stages) | 4 stages | Δ       |
+  |---------------|----|---------------|----------|---------|
+  | mnp ≤ 32      | 69 |  6.44 µs      | 6.29 µs  | −2.3 %  |
+  | mnp 33–39     | 22 | 16.71 µs      | 16.70 µs | ≈       |
+  | mnp 40–63     | 17 | 19.27 µs      | **19.45 µs** | **+0.9 %** |
+  | mnp ≥ 64      | 20 | 22.18 µs      | 22.11 µs | −0.3 %  |
+  | overall mean  |128 | 12.4  µs      | 12.30 µs | −0.8 %  |
+  | overall p95   |    | 22.4  µs      | 22.20 µs | −0.9 %  |
+
+  The 40-63 bucket — the one we expected to benefit if producer was
+  the limiter — flat-to-slightly-worse.  Overall 0.8 % reduction is
+  within run-to-run noise (±1-2 %).  Conclusion: **producer is not
+  currently the bottleneck on mnp ≥ 40**; 16 KB extra SMEM buys no
+  real headroom.  Stays at 3 stages.
+
+  This reshapes the next-lever picture — see below.
+
+### Where the math path actually spends its time (current hypothesis)
+
+After iter i's `wait umma_done`, every math thread does:
+1. `tcgen05_ld_32x32b_x64_b32` — 64 regs (256 B per thread) from TMEM.
+2. ReLU + per-head weighted sum — 64 FMAs, needs `smem_w` and 64
+   accumulator regs in flight.
+3. `st.global` — 1 FP16 value (2 B/thread, 128 threads = 256 B total
+   per tile).
+4. `named_barrier_sync` on the math warpgroup.
+5. Thread 0 arrives `K_done[buf]`.
+
+The emit itself (step 3) is tiny — just 256 B to HBM per tile, fully
+pipelined behind step 4/5.  Steps 1 + 2 are the bulk: TMEM_ld is
+roughly 200 cycles of memory latency + 64 FMAs at ~1 cycle each but
+all dependent through `acc_relu`, so compute is ~64 serial cycles.
+
+### What we tried to verify this, and what's left
+
+1. **4-way accumulator split in the ReLU·w sum loop — tried, rejected.**
+   Original loop is a 64-FMA serial dep chain through `acc_relu`.
+   Hypothesis: at ~4-cycle FMA latency → ~256 cycle critical path.
+   Split into 4 independent accumulators (16 FMAs each) + a 3-add
+   reduction at the end.
+
+   Bench (same Modal session, vs R3 baseline):
+
+   | bucket        | n  | R3    | 4-way split | Δ      |
+   |---------------|----|-------|-------------|--------|
+   | mnp ≤ 32      | 69 |  6.44 | 6.33        | −1.7 % |
+   | mnp 33–39     | 22 | 16.71 | 16.77       | +0.4 % |
+   | mnp 40–63     | 17 | 19.27 | 19.48       | +1.1 % |
+   | mnp ≥ 64      | 20 | 22.18 | 22.27       | +0.4 % |
+   | overall mean  |128 | 12.4  | 12.36       | −0.3 % |
+
+   All within run-to-run noise (~±1-2 %).  Either ptxas already
+   schedules the FMAs with sufficient ILP, or (more likely) the FMA
+   chain is already hidden behind `tcgen05_wait_ld` latency.
+
+   **Combined evidence from kKVStages=4 + 4-way-split — both no-ops**:
+   neither producer prefetch depth nor ReLU-sum critical path moves
+   the needle.  The per-tile bottleneck must be further upstream.
+
+### The actual per-tile dominator (current best guess)
+
+`tcgen05_ld_32x32b_x64_b32` transfers 64 × 4 B = 256 B per thread from
+TMEM to registers, and `tcgen05_wait_ld` is a hard per-thread stall
+until the entire load retires.  TMEM→register latency on Blackwell
+is in the ~150-250 cycle range; because our consumers (ReLU, FMAs)
+start immediately after `wait_ld`, the load latency is on the
+critical path and is NOT overlapped with anything useful — the MMA
+for the next tile can't start because we only have single-buffer
+TMEM, and the load from this tile must finish before we overwrite
+TMEM.  The 64-FMA chain runs *after* `wait_ld`, never during it.
+
+That reframes the shortlist:
+
+1. **TMEM double-buffer + warp-specialised MMA issue**.  This IS the
+   fix — but the naïve double-buffer (tried, rejected) didn't pay
+   off because MMA issue+commit is fast enough that freeing TMEM a
+   tile earlier didn't translate to real overlap.  The version that
+   *would* pay off: keep MMA issue in warp 0 as today, but start
+   `UMMA[i+1]` into `TMEM[(i+1)%2]` the instant iter i's
+   `tcgen05_wait_ld` returns (not after emit).  That overlaps MMA
+   compute for iter i+1 with ReLU·sum + emit of iter i.  Earlier
+   attempt deferred the *post-processing*, not the *MMA issue* — so
+   we hid the wrong thing.
+
+2. **2-CTA cluster UMMA (Rank 2).**  Halves per-SM K-cache reads
+   *and* halves the TMEM footprint per SM — so `tcgen05_ld`
+   transfers half as many bytes per thread, shortening the per-tile
+   critical path directly.  Biggest structural win for mnp ≥ 64.
+
+3. **Block-scaled UMMA (Rank 8).**  Folds `smem_kscale` into the MMA
+   itself; eliminates the `* smem_kscale[...]` multiply on the
+   accumulator and one smem load per tile — a few cycles per tile,
+   but it stacks with (1).
+
+De-prioritised:
+
+- **Warp-specialised emit.**  Emit is 256 B/tile, already hidden
+  behind named-barrier → isolation into a dedicated warp cannot save
+  more than a handful of cycles per tile.  Not worth the complexity.
+- **Deeper K pipeline (kKVStages > 3).**  A/B said no, and makes the
+  hot loop bigger in SMEM without touching the real critical path.
 
 ### A2 rejection — why host-side sync is too expensive
 
