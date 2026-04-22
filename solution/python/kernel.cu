@@ -1181,7 +1181,18 @@ void dsa_topk_indexer_cuda(
     // K fetches with UMMA via cp.async double-buffering.
     //
     // Threshold chosen on the conservative side of measured data — tunable.
-    constexpr int kPersistentPageThreshold = 40;
+    // Bumped from 40 -> 64 after the v2 merge (2x runs, Apr 2026):
+    //   mnp 40-63:  18.75 -> 17.08 us   (-8.9%)
+    //   mnp >= 64:  22.12 -> 21.78 us   (-1.5%, within noise)
+    //   mnp 33-39:  16.48 -> 16.41 us   (flat)
+    //   mnp <= 32:  6.11  -> 6.37  us   (fast-path only, run-to-run noise)
+    // With the R3 warp-specialised persistent kernel the per-tile critical
+    // path is `tcgen05_wait_ld -> ReLU.w -> scale -> emit`; for modest
+    // tile counts (mnp 40-63 yields 20-32 tile-pairs/row) the WS setup
+    // (Q/TMEM alloc, mbar init, first K prefetch) + the `wait_ld`
+    // serialisation don't amortise, and the simpler "short" kernel's
+    // grid-per-tile saturation wins.
+    constexpr int kPersistentPageThreshold = 64;
     const bool use_persistent = (max_num_pages >= kPersistentPageThreshold);
 
     const int max_kv_tile_pairs =

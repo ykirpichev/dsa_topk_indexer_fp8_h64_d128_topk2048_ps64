@@ -469,7 +469,14 @@ De-prioritised:
 | 4-way accumulator split in ReLU·w loop      | yes   | rejected (within noise) |
 | TMEM double-buffer + MMA-issue overlap (H1) | yes   | rejected (+3.6 / +5.2 % mnp ≥ 40) |
 | 2-CTA cluster UMMA (Rank 2)                 | no    | deferred — infrastructure gap |
-| Block-scaled UMMA (Rank 8)                  | no    | infeasible — data format mismatch |
+| Block-scaled UMMA (Rank 8)                  | no    | infeasible — data format mismatch (re-confirmed) |
+| v2 Stage-2 ordered-u16 SMEM cache           | yes   | KEPT (−2.7 % mean; −5 % mnp ≤ 32) |
+| v2 persistent Stage-1 logits scratch         | yes   | KEPT (host-overhead cleanup) |
+| v2 fast-path 128-thread int4 vectored store  | yes   | KEPT (host-overhead cleanup) |
+| #1 Ordered-u16 emitted directly from Stage 1 | yes   | rejected (+0.5 % mean — see below) |
+| #2 Skip `kHalfNegInf` pad writes             | yes   | rejected (+0.3 % mean — see below) |
+| #4 Fuse block-table transform into gt/eq emit | yes   | rejected (+2.0 % mean — see below) |
+| kPersistentPageThreshold 40 → 64              | yes   | **KEPT** (−8.9 % mnp 40-63, −2.3 % mean best-case) |
 
 On this branch the persistent kernel is effectively at the
 architectural ceiling for its shape (1 CTA / tile, single-buffer
@@ -510,6 +517,138 @@ Conclusion: A2 is archived. The only practical way to extend the fast
 path beyond the static `mnp ≤ 32` threshold is **device-side conditional
 execution** — future work, Rank 3 (warp specialisation) unlocks enough
 structure to make that feasible without a graph.
+
+### Post-merge redundancy sweep (#1, #2, #4) — all rejected
+
+After merging the v2 `fused-topk-v1` wins onto `perf/merge-v2-wins`
+(mean 12.07 µs, sum 1545 µs), we investigated four further "genuine
+redundancies" in the combined kernel:
+
+**#1 Emit ordered-u16 directly from Stage 1.** Currently Stage 1 writes
+FP16, and Stage 2 calls `HalfToOrderedU16` up to 5× per logit (2 radix
+histogram rounds + gt_count + gt_emit + eq_emit).  The fix was to write
+`float_to_ordered_u16(scaled)` into the scratch buffer in Stage 1 and
+have Stage 2 read `__half_as_ushort(row_lg[i])` directly.
+
+Tested on `perf/merge-v2-wins` (2 runs, n=128):
+
+| bucket   | baseline | #1+#2 (run 1) | (run 2) | avg Δ |
+|----------|---------:|--------------:|--------:|------:|
+| mnp ≤ 32 | 6.11     | 6.16          | 6.19    | +1.0 % |
+| 33–39    | 16.48    | 16.47         | 16.32   | −0.6 % |
+| 40–63    | 18.75    | 19.35         | 19.55   | **+3.7 %** |
+| ≥ 64     | 22.12    | 21.62         | 21.88   | −1.7 % |
+| mean     | 12.07    | 12.10         | 12.16   | +0.5 % |
+
+mnp ≥ 64 improved by 1.7 % (Stage-2 conversions eliminated on the
+uncached path), but mnp 40–63 regressed consistently by 3.7 % — the
+added per-emit compute (`__float2half_rn` + `__half_as_ushort` + sign
+XOR) lands on the `tcgen05_wait_ld`-gated critical path in the WS
+kernel, and for workloads that DO fit the 32 KB `smem_ordered` cache
+(all workloads in this bench, `seq_len ≤ 16384`) Stage 2 only saves
+**one** conversion per element (the round-0 population pass becomes
+a trivial bit-reinterpret).  Net cost > net saving.  Reverted.
+
+**#2 Skip `kHalfNegInf` pad writes in Stage 1.**  Stage 2 only iterates
+`i < seq_len`, so the three pad-write sites in Stage 1 (tile-boundary
+pad in `short`/`persistent`/`persistent_ws`, plus the per-thread
+ternary `(kv_abs < seq_len) ? emit : kHalfNegInf`) are writing to
+dead memory.  Tested standalone (without #1):
+
+| bucket   | baseline | #2 alone | Δ    |
+|----------|---------:|---------:|-----:|
+| mnp ≤ 32 | 6.11     | 6.12     |  0 % |
+| 33–39    | 16.48    | 16.57    | +0.5 % |
+| 40–63    | 18.75    | 19.37    | **+3.3 %** |
+| ≥ 64     | 22.12    | 21.71    | −1.9 % |
+| mean     | 12.07    | 12.11    | +0.3 % |
+
+Same pattern as #1+#2: mnp 40-63 consistently regresses ~0.6 µs.  The
+likely cause is that the now-shorter `if (kv_base >= seq_len)` branch
+in the WS kernel still hits the producer-math `named_barrier_sync` +
+`K_done` mbarrier_arrive, but the math warpgroup now idles through that
+window (previously it was doing a pad store).  On smaller workloads
+the tail-pad removal doesn't recover enough work to offset the
+producer-side imbalance this creates.  Reverted.
+
+**#4 Fuse block-table transform into gt_emit/eq_emit.**  The final
+Stage-2 pass (`for i in [0, top_k)`: `row_out[i] = row_bt[tok/64] * 64
++ tok % 64`) is an 8 KB read + 8 KB write round-trip to the same HBM
+location.  We moved the transform into the emit sites: emit stores
+`row_bt[i / 64] * 64 + (i % 64)` directly, with a small tail pass
+writing `-1` to unfilled slots.
+
+| bucket   | baseline | #4 (run 1) | (run 2) | avg Δ |
+|----------|---------:|-----------:|--------:|------:|
+| mnp ≤ 32 | 6.11     | 6.48       | 6.20    | +3.8 % (noise) |
+| 33–39    | 16.48    | 16.30      | 16.45   | −0.6 % |
+| 40–63    | 18.75    | 19.21      | 19.42   | **+3.0 %** |
+| ≥ 64     | 22.12    | 22.29      | 22.70   | +1.7 % |
+| mean     | 12.07    | 12.33      | 12.29   | +2.0 % |
+
+Net regression across the entire persistent-kernel range.  The added
+`row_bt[i / 64]` load inside the existing divergent `if (ordered > pivot)`
+branch increases divergence overhead in both emit passes, and the
+original final transform pass was already nearly-free (dense, non-
+divergent, fully in L1 for `row_out`).  Reverted.
+
+**#3 Block-scaled UMMA (Rank 8) — re-confirmed infeasible.**  The user
+noted `head_dim_with_sf = 132 = 128 + 4 B` and proposed
+`tcgen05.mma.kind::mxf8f6f4.block_scale`, but our 4-B-per-token
+payload is **one FP32** (a per-M-row dequantization scalar applied at
+emit as `acc * smem_kscale[m]`), not **four UE8M0** block scales as
+the instruction consumes.  Converting requires lossy FP32→UE8M0
+rounding (UE8M0 is exponent-only), which perturbs cross-row top-K
+ordering.  Archived (again).
+
+**Net conclusion (before threshold bump).**  The merge-v2 baseline at
+12.07 µs mean / 1545 µs sum appeared to be the current local optimum.
+The `tcgen05_wait_ld` → emit critical path in the WS kernel is tight
+enough that *any* added per-emit compute (even a few ops) regresses
+the mnp 40–63 bucket by ~0.6 µs, and *any* post-emit traffic change
+(fused transform, skipped pads) perturbs the producer-consumer
+pipeline rhythm.
+
+### kPersistentPageThreshold 40 → 64 (dispatch re-tuning) — KEPT
+
+Independently of the failed in-kernel micro-optimisations above, we
+re-measured the A1 dispatch threshold on top of the v2 merge state.
+The original threshold (40) was chosen *before* the R3 warp
+specialisation and the v2 Stage-2 / host-side cleanups were merged —
+since those changes shifted the WS kernel's bottleneck to
+`tcgen05_wait_ld` (which scales with tile count, not SM count), the
+break-even point moved.
+
+Two runs on `perf/merge-v2-wins` show:
+
+| bucket   | th = 40 (before) | th = 64 run 1 | th = 64 run 2 | avg Δ |
+|----------|-----------------:|--------------:|--------------:|------:|
+| mnp ≤ 32 | 6.11             | 6.15          | 6.58          | +2.6 % (fast-path noise, unrelated) |
+| 33–39    | 16.48            | 16.33         | 16.48         | −0.2 % |
+| **40–63**| **18.75**        | **17.05**     | **17.12**     | **−8.9 %** |
+| ≥ 64     | 22.12            | 21.79         | 21.76         | −1.5 % |
+| mean     | 12.07            | 11.79         | 12.05         | −1.2 % |
+| sum      | 1545             | 1510          | 1543          |       |
+
+The `mnp 40–63` improvement (−1.66 µs average, highly consistent across
+runs) is the dispositive signal.  Mechanism: this bucket produces
+20–32 tile-pairs per row, which is well below the amortisation point
+for the WS kernel's one-shot overhead (Q load + TMEM alloc + mbar
+init + first K prefetch ≈ 2 µs fixed) *and* well above the fast-path
+cutoff.  The "short" kernel's grid-per-tile layout saturates the B200's
+148 SMs faster than the persistent CTAs can ingest tiles through the
+`tcgen05_wait_ld`-serialised pipeline.  Above 64 pages (~32+ tile-pairs
+per row) the WS kernel's 2-pages-per-UMMA and Q-reuse wins recover
+the setup cost — crossover is clean.
+
+The mnp ≥ 64 small improvement (−0.3 µs) is within noise; the mnp ≤
+32 fast-path noise (±0.4 µs run to run) is an artefact of Modal GPU
+warmup and unrelated to the threshold change.
+
+Final state on `perf/merge-v2-wins`: **11.79 µs mean / 1510 µs sum**
+in the best-case run (6.5 % below the pre-merge R3 baseline of 12.40
+µs).  The only remaining structural lever is 2-CTA cluster UMMA
+(deferred, 4–6 h infra work).
 
 ## References
 
