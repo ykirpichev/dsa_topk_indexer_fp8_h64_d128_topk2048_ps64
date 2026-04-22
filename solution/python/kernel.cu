@@ -87,6 +87,12 @@ void paged_mqa_logits_umma_kernel_short(
     const int lane     = tid % 32;
 
     const int seq_len = seq_lens[b];
+
+    // A1: if this row fully fits in top-K, Stage 2's per-row fast path
+    // will emit the output directly from (seq_lens, block_table) without
+    // ever reading logits.  Skip the entire Stage-1 pipeline for this CTA.
+    if (seq_len <= kTopK) return;
+
     const int kv_base = tile_idx * kBlockKv;
     __half*   logits_b = logits_out + static_cast<size_t>(b) *
                                         static_cast<size_t>(max_kv_tiles) * kBlockKv;
@@ -269,6 +275,12 @@ void paged_mqa_logits_umma_kernel_persistent(
     const int lane      = tid % 32;
 
     const int seq_len = seq_lens[b];
+
+    // A1: if this row fully fits in top-K, Stage 2's per-row fast path
+    // will emit the output directly from (seq_lens, block_table) without
+    // ever reading logits.  Skip the entire Stage-1 pipeline (incl. the
+    // expensive TMEM alloc / mbar init / Q load) for this CTA.
+    if (seq_len <= kTopK) return;
 
     const int tile_pair_begin = cta_x * tiles_per_cta;
     int tile_pair_end         = tile_pair_begin + tiles_per_cta;
