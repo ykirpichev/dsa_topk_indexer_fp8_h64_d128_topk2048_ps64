@@ -14,9 +14,12 @@
 #include <cuda_runtime.h>
 #include <cstdint>
 #include <cstdlib>
+#include <array>
+#include <mutex>
 
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAStream.h>
 
 #include "umma_desc.h"
 #include "tcgen05_ptx.h"
@@ -1035,33 +1038,63 @@ void topk_page_table_transform_kernel(
 // the inner write loop is a pure gather without repeated gmem reads.
 // ============================================================================
 
-__global__ __launch_bounds__(256)
+// Merged from v2 fused-topk-v1 (commit 65866ae, "Fast-path host-overhead
+// cleanup").  The kernel itself moves from 256 threads / scalar int stores
+// to 128 threads / 4 vectorised int4 stores per thread (512 int4 = 2048
+// ints total = kTopK).  The 128-thread variant has lower launch overhead
+// on B200 (half the warp-scheduler init) and the int4 stores halve HBM
+// transactions on the inner loop.  Out-of-bounds block-table reads are
+// avoided by zero-padding smem_bt[] up to kMaxPagesInFastPath (those
+// lanes always emit -1 because their token index i >= max_num_pages *
+// kPageSize >= seq_len).
+__global__ __launch_bounds__(128)
 void topk_fast_path_kernel(
     const int* __restrict__ seq_lens,
     const int* __restrict__ block_table,
-    int max_num_pages, int top_k,
+    int max_num_pages,
+    int /*top_k*/,                // kTopK is a compile-time constant
     int* __restrict__ out_indices)
 {
-    constexpr int kMaxPagesInFastPath = 32;   // = kTopK / kPageSize
+    constexpr int kMaxPagesInFastPath = kTopK / kPageSize;   // 32
+    constexpr int kInts4PerRow        = kTopK / 4;           // 512 int4 per row
+    constexpr int kInt4PerThread      = kInts4PerRow / 128;  // 4 int4 per thread
+
     const int b   = blockIdx.x;
     const int tid = threadIdx.x;
 
     __shared__ int smem_bt[kMaxPagesInFastPath];
-    if (tid < max_num_pages) smem_bt[tid] = block_table[b * max_num_pages + tid];
+    if (tid < kMaxPagesInFastPath) {
+        smem_bt[tid] = (tid < max_num_pages)
+            ? block_table[b * max_num_pages + tid]
+            : 0;
+    }
 
     const int seq_len = seq_lens[b];
-    int*      row_out = out_indices + static_cast<size_t>(b) * top_k;
+    int4*     out4    = reinterpret_cast<int4*>(
+        out_indices + static_cast<size_t>(b) * kTopK);
+
     __syncthreads();
 
-#pragma unroll 4
-    for (int i = tid; i < top_k; i += blockDim.x) {
-        int v = -1;
-        if (i < seq_len) {
-            const int page = i / kPageSize;
-            const int slot = i - page * kPageSize;
-            v = smem_bt[page] * kPageSize + slot;
-        }
-        row_out[i] = v;
+#pragma unroll
+    for (int s = 0; s < kInt4PerThread; ++s) {
+        const int i4   = tid + s * 128;                     // 0..511
+        const int base = i4 << 2;                            // 0..2044, stride 4
+
+        const int page0 = (base + 0) >> 6;                   // / 64
+        const int page1 = (base + 1) >> 6;
+        const int page2 = (base + 2) >> 6;
+        const int page3 = (base + 3) >> 6;
+        const int slot0 = (base + 0) & 63;
+        const int slot1 = (base + 1) & 63;
+        const int slot2 = (base + 2) & 63;
+        const int slot3 = (base + 3) & 63;
+
+        int4 v;
+        v.x = (base + 0 < seq_len) ? (smem_bt[page0] << 6) + slot0 : -1;
+        v.y = (base + 1 < seq_len) ? (smem_bt[page1] << 6) + slot1 : -1;
+        v.z = (base + 2 < seq_len) ? (smem_bt[page2] << 6) + slot2 : -1;
+        v.w = (base + 3 < seq_len) ? (smem_bt[page3] << 6) + slot3 : -1;
+        out4[i4] = v;
     }
 }
 
@@ -1080,17 +1113,38 @@ void dsa_topk_indexer_cuda(
     torch::Tensor block_table,
     torch::Tensor topk_indices)
 {
-    TORCH_CHECK(q_index_fp8.is_cuda() && q_index_fp8.is_contiguous());
-    TORCH_CHECK(k_index_cache_fp8.is_cuda() && k_index_cache_fp8.is_contiguous());
-    TORCH_CHECK(weights.is_cuda() && weights.is_contiguous() && weights.dtype() == torch::kFloat32);
-    TORCH_CHECK(seq_lens.is_cuda() && seq_lens.is_contiguous() && seq_lens.dtype() == torch::kInt32);
-    TORCH_CHECK(block_table.is_cuda() && block_table.is_contiguous() && block_table.dtype() == torch::kInt32);
-    TORCH_CHECK(topk_indices.is_cuda() && topk_indices.is_contiguous() && topk_indices.dtype() == torch::kInt32);
+    // Merged from v2 fused-topk-v1 (commit 65866ae, "Fast-path host-overhead
+    // cleanup").  69/128 bench workloads hit the fast path; on those
+    // workloads every nanosecond of host-side CPU overhead between
+    // torch.cuda.Event(start).record() and the kernel launch is charged
+    // to the measurement.  So we only run the TORCH_CHECKs strictly
+    // needed for the fast path here and defer Q / K / weights validation
+    // to the slow-path section below.  Overhead budget (pre-cleanup):
+    //   cudaGetDeviceProperties: 2-4 us   -> behind std::call_once
+    //   12 TORCH_CHECKs + 6 data_ptr: ~1 us -> 4 checks + 3 data_ptr here
+    //   <<<>>> launch: ~2.5 us
+    //   kernel exec: ~0.3-0.5 us
+    TORCH_CHECK(block_table.is_cuda() && block_table.is_contiguous() &&
+                    block_table.scalar_type() == torch::kInt32,
+                "block_table must be int32 contiguous CUDA");
+    TORCH_CHECK(seq_lens.is_cuda() && seq_lens.is_contiguous() &&
+                    seq_lens.scalar_type() == torch::kInt32,
+                "seq_lens must be int32 contiguous CUDA");
+    TORCH_CHECK(topk_indices.is_cuda() && topk_indices.is_contiguous() &&
+                    topk_indices.scalar_type() == torch::kInt32,
+                "topk_indices must be int32 contiguous CUDA");
 
-    const int B             = (int)q_index_fp8.size(0);
-    const int max_num_pages = (int)block_table.size(1);
+    const int B             = static_cast<int>(block_table.size(0));
+    const int max_num_pages = static_cast<int>(block_table.size(1));
+    TORCH_CHECK(topk_indices.size(0) == B && topk_indices.size(1) == kTopK,
+                "topk_indices shape must be [B, 2048]");
 
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const c10::DeviceIndex dev_index = block_table.get_device();
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream(dev_index).stream();
+
+    const int* sl_ptr  = seq_lens.data_ptr<int32_t>();
+    const int* bt_ptr  = block_table.data_ptr<int32_t>();
+    int*       out_ptr = topk_indices.data_ptr<int32_t>();
 
     // Fast path: when the full paged context fits in top-K, the output is
     // the block-table-transformed indices 0..seq_len-1 padded with -1 —
@@ -1101,14 +1155,20 @@ void dsa_topk_indexer_cuda(
     constexpr int kFastPathMaxPages = kTopK / kPageSize;   // 32
     if (max_num_pages <= kFastPathMaxPages) {
         dim3 grid(B);
-        dim3 block(256);
+        dim3 block(128);
         topk_fast_path_kernel<<<grid, block, 0, stream>>>(
-            seq_lens.data_ptr<int>(),
-            block_table.data_ptr<int>(),
-            max_num_pages, kTopK,
-            topk_indices.data_ptr<int>());
+            sl_ptr, bt_ptr, max_num_pages, kTopK, out_ptr);
         return;
     }
+
+    // --- Slow-path validation (mnp > 32): only paid when we need UMMA.
+    TORCH_CHECK(q_index_fp8.is_cuda() && q_index_fp8.is_contiguous(),
+                "q_index_fp8 must be contiguous CUDA");
+    TORCH_CHECK(k_index_cache_fp8.is_cuda() && k_index_cache_fp8.is_contiguous(),
+                "k_index_cache_fp8 must be contiguous CUDA");
+    TORCH_CHECK(weights.is_cuda() && weights.is_contiguous() &&
+                    weights.scalar_type() == torch::kFloat32,
+                "weights must be float32 contiguous CUDA");
 
     // Size-aware Stage 1 dispatch (Rank 1 improvement).
     //
@@ -1136,8 +1196,45 @@ void dsa_topk_indexer_cuda(
         ? max_kv_tile_pairs * (kPagesPerUMMA * kBlockKv)
         : max_num_pages * kPageSize;
 
-    auto logits = torch::empty({B, max_len},
-        torch::TensorOptions().dtype(torch::kFloat16).device(q_index_fp8.device()));
+    // Merged from v2 fused-topk-v1 (commit aacdc8b, "Persistent Stage-1
+    // logits scratch (phase-3)").  PyTorch's caching allocator usually
+    // reuses the same block across identically-sized calls, but the
+    // FlashInfer-Bench sweep issues many different (B, max_len) per
+    // session, which forces the allocator to walk its free-list (and
+    // sometimes cudaMalloc) on every transition.  Hoisting the Stage-1
+    // output buffer to per-device function-static state with a
+    // power-of-two grow policy pays torch::empty() once per size-class
+    // and reuses the pointer for all subsequent calls.  Both Stage-1
+    // kernels (short and persistent WS / non-WS) write into the same
+    // workspace; they are serialised on the same CUDA stream so no
+    // aliasing concern.  Keyed by device index so multi-GPU setups each
+    // latch their own max-size block.
+    __half* logits_ptr;
+    {
+        static std::array<torch::Tensor, 8> s_scratch;
+        static std::array<size_t, 8>        s_scratch_bytes = {};
+        static std::array<std::mutex, 8>    s_scratch_mu;
+        const int idx = (dev_index >= 0 && dev_index < 8) ? int(dev_index) : 0;
+        const size_t needed_bytes = static_cast<size_t>(B) *
+                                    static_cast<size_t>(max_len) *
+                                    sizeof(__half);
+        std::lock_guard<std::mutex> g(s_scratch_mu[idx]);
+        if (s_scratch_bytes[idx] < needed_bytes) {
+            size_t new_bytes = s_scratch_bytes[idx] ? s_scratch_bytes[idx]
+                                                    : needed_bytes;
+            while (new_bytes < needed_bytes) new_bytes <<= 1;
+            const int64_t new_elems =
+                static_cast<int64_t>(new_bytes / sizeof(__half));
+            s_scratch[idx] = torch::empty(
+                {new_elems},
+                torch::TensorOptions()
+                    .dtype(torch::kFloat16)
+                    .device(q_index_fp8.device()));
+            s_scratch_bytes[idx] = new_bytes;
+        }
+        logits_ptr = reinterpret_cast<__half*>(
+            s_scratch[idx].data_ptr<at::Half>());
+    }
 
     if (use_persistent) {
         // Pick tiles_per_cta so (a) we have enough CTAs to keep ~132 SMs
@@ -1165,26 +1262,21 @@ void dsa_topk_indexer_cuda(
         }();
         const bool use_ws = !disable_ws;
 
+        const auto* q_ptr  = reinterpret_cast<const __nv_fp8_e4m3*>(q_index_fp8.data_ptr());
+        const auto* kv_ptr = reinterpret_cast<const uint8_t*>(k_index_cache_fp8.data_ptr());
+        const float* w_ptr = weights.data_ptr<float>();
         if (use_ws) {
             dim3 block(256);
             paged_mqa_logits_umma_kernel_persistent_ws<<<grid, block, 0, stream>>>(
-                reinterpret_cast<const __nv_fp8_e4m3*>(q_index_fp8.data_ptr()),
-                reinterpret_cast<const uint8_t*>(k_index_cache_fp8.data_ptr()),
-                weights.data_ptr<float>(),
-                seq_lens.data_ptr<int>(),
-                block_table.data_ptr<int>(),
+                q_ptr, kv_ptr, w_ptr, sl_ptr, bt_ptr,
                 max_num_pages, max_kv_tile_pairs, tiles_per_cta,
-                reinterpret_cast<__half*>(logits.data_ptr()));
+                logits_ptr);
         } else {
             dim3 block(128);
             paged_mqa_logits_umma_kernel_persistent<<<grid, block, 0, stream>>>(
-                reinterpret_cast<const __nv_fp8_e4m3*>(q_index_fp8.data_ptr()),
-                reinterpret_cast<const uint8_t*>(k_index_cache_fp8.data_ptr()),
-                weights.data_ptr<float>(),
-                seq_lens.data_ptr<int>(),
-                block_table.data_ptr<int>(),
+                q_ptr, kv_ptr, w_ptr, sl_ptr, bt_ptr,
                 max_num_pages, max_kv_tile_pairs, tiles_per_cta,
-                reinterpret_cast<__half*>(logits.data_ptr()));
+                logits_ptr);
         }
     } else {
         dim3 grid(max_num_pages, B);
@@ -1193,21 +1285,17 @@ void dsa_topk_indexer_cuda(
             reinterpret_cast<const __nv_fp8_e4m3*>(q_index_fp8.data_ptr()),
             reinterpret_cast<const uint8_t*>(k_index_cache_fp8.data_ptr()),
             weights.data_ptr<float>(),
-            seq_lens.data_ptr<int>(),
-            block_table.data_ptr<int>(),
+            sl_ptr, bt_ptr,
             max_num_pages, max_num_pages,
-            reinterpret_cast<__half*>(logits.data_ptr()));
+            logits_ptr);
     }
 
     {
         dim3 grid(B);
         dim3 block(kStage2Threads);
         topk_page_table_transform_kernel<<<grid, block, 0, stream>>>(
-            reinterpret_cast<const __half*>(logits.data_ptr()),
-            seq_lens.data_ptr<int>(),
-            block_table.data_ptr<int>(),
-            max_len, max_num_pages, kTopK,
-            topk_indices.data_ptr<int>());
+            logits_ptr, sl_ptr, bt_ptr,
+            max_len, max_num_pages, kTopK, out_ptr);
     }
 }
 
