@@ -106,8 +106,12 @@ def _collect_results(result_trace_set, definition_name: str) -> dict:
 @app.function(image=image, gpu="B200:1", timeout=3600,
               volumes={TRACE_SET_PATH: trace_volume})
 def run_benchmark(solution: Solution, smoke: bool = False,
-                  n_workloads: int = 0, compare_fi: bool = False) -> dict:
+                  n_workloads: int = 0, compare_fi: bool = False,
+                  disable_ws: bool = False) -> dict:
     """Run ours (+ optionally every other registered solution) on B200."""
+    import os
+    if disable_ws:
+        os.environ["DSA_TOPK_DISABLE_WS"] = "1"
     config = _worker_benchmark_config(smoke=smoke)
 
     trace_set = TraceSet.from_path(TRACE_SET_PATH)
@@ -262,10 +266,13 @@ def _print_report(payload: dict):
 
 
 @app.local_entrypoint()
-def main(smoke: bool = False, n_workloads: int = 0, compare_fi: bool = True):
+def main(smoke: bool = False, n_workloads: int = 0, compare_fi: bool = True,
+         disable_ws: bool = False):
     """Pack the solution from solution/ and run on Modal B200.
 
     Defaults to --compare-fi=True. Pass --compare-fi False to run ours only.
+    Pass --disable-ws to fall back to the single-warpgroup persistent
+    kernel (A/B profiling of the warp-specialised path, Rank 3).
     """
     from scripts.pack_solution import pack_solution
 
@@ -277,6 +284,8 @@ def main(smoke: bool = False, n_workloads: int = 0, compare_fi: bool = True):
     print(f"Loaded: {solution.name} ({solution.definition})")
     if compare_fi:
         print("compare-fi: will include every other solution in the trace set.")
+    if disable_ws:
+        print("disable-ws: warp-specialised persistent kernel (Rank 3) DISABLED.")
     if smoke:
         print("Smoke mode: 1 workload, warmup=1, iterations=1, trials=1.")
     elif n_workloads > 0:
@@ -285,7 +294,8 @@ def main(smoke: bool = False, n_workloads: int = 0, compare_fi: bool = True):
         print("Full mode: all workloads in the trace set.")
 
     payload = run_benchmark.remote(
-        solution, smoke=smoke, n_workloads=n_workloads, compare_fi=compare_fi
+        solution, smoke=smoke, n_workloads=n_workloads,
+        compare_fi=compare_fi, disable_ws=disable_ws,
     )
     if not payload:
         print("No results returned!")

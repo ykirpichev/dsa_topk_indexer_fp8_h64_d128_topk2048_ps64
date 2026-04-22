@@ -44,8 +44,12 @@ image = (
 
 
 @app.function(image=image, gpu="B200:1", timeout=3600, volumes={TRACE_SET_PATH: trace_volume})
-def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
+def run_benchmark(solution: Solution, config: BenchmarkConfig = None,
+                  disable_ws: bool = False) -> dict:
     """Run benchmark on Modal B200 and return results."""
+    import os
+    if disable_ws:
+        os.environ["DSA_TOPK_DISABLE_WS"] = "1"
     if config is None:
         config = BenchmarkConfig(warmup_runs=3, iterations=100, num_trials=5)
 
@@ -115,7 +119,7 @@ def print_results(results: dict):
 
 
 @app.local_entrypoint()
-def main():
+def main(disable_ws: bool = False):
     """Pack solution and run benchmark on Modal."""
     from scripts.pack_solution import pack_solution
 
@@ -125,9 +129,11 @@ def main():
     print("\nLoading solution...")
     solution = Solution.model_validate_json(solution_path.read_text())
     print(f"Loaded: {solution.name} ({solution.definition})")
+    if disable_ws:
+        print("disable-ws: warp-specialised persistent kernel (Rank 3) DISABLED.")
 
     print("\nRunning benchmark on Modal B200...")
-    results = run_benchmark.remote(solution)
+    results = run_benchmark.remote(solution, disable_ws=disable_ws)
 
     if not results:
         print("No results returned!")

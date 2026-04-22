@@ -238,11 +238,57 @@ Expected cumulative mean after (1)+(2)+(3)+(5): ~11–13 µs (vs current
 | B | Stage-1+2 static fast path (mnp ≤ 32)      | **shipped** |
 | A1| Stage-1 per-CTA early-return on `seq_len ≤ kTopK` | **shipped** |
 | A2| Host-side `seq_lens.max()` sync to extend fast path | **rejected** |
+| R3| Warp specialisation — producer + math warpgroups   | **shipped** |
 
-Current state (after A1):
-- mean 12.4 µs, p50 6.2 µs, p95 22.9 µs, min 6.1 µs, max 23.4 µs
+Current state (after R3):
+- mean 12.4 µs, p50 6.6 µs, p95 22.4 µs, min 6.3 µs, max 23.1 µs
 - 128/0/0 vs FlashInfer
-- Per bucket: mnp≤32 = 6.1 µs; 33–39 = 16.6 µs; 40–63 = 20.5 µs; ≥64 = 22.8 µs
+- Per bucket: mnp≤32 = 6.5 µs; 33–39 = 16.6 µs; 40–63 = 19.3 µs; ≥64 = 22.2 µs
+- `DSA_TOPK_DISABLE_WS=1` falls back to the single-warpgroup kernel (A/B toggle).
+
+### R3 what landed
+
+- `paged_mqa_logits_umma_kernel_persistent_ws` — 256 threads / CTA, split
+  into a math warpgroup (warps 0-3) and a producer warpgroup (warps 4-7).
+- Producer owns `cp.async` for K + kscale; math owns Q load, UMMA issue,
+  TMEM readout, ReLU·weighted sum, and emit.
+- Per-stage `K_ready` and `K_done` mbarriers drive the handoff; the
+  two warpgroups run on opposite phases of the kKVStages=3 pipeline.
+- Register reconfig: math claims 232 regs/thread (`setmaxnreg.inc`),
+  producer surrenders down to 40 regs/thread (`setmaxnreg.dec`).
+- Critical correctness fix during bring-up: `cp.async.wait_group` is
+  per-thread, so a producer-warpgroup `bar.sync` is needed BEFORE the
+  single-thread `mbarrier.arrive` on `K_ready[buf]` — otherwise math
+  can consume `smem_k` before threads 1-127's cp.asyncs are visible
+  from thread 0's release fence.  Without this sync we hit 24/128
+  INCORRECT_NUMERICAL; with it, 128/128 PASS.
+
+### R3 measured gains (vs A1 baseline, same Modal session)
+
+| bucket          | A1 baseline | +R3   | Δ       |
+|-----------------|-------------|-------|---------|
+| mnp ≤ 32 (69)   |  6.44 µs    | 6.48  |  ~=     |
+| mnp 33–39 (22)  | 16.71 µs    |16.55  | −1 %    |
+| mnp 40–63 (17)  | 20.69 µs    |19.27  | **−6.9 %** |
+| mnp ≥ 64  (20)  | 23.52 µs    |22.18  | **−5.7 %** |
+
+Mean −3.1 %, p95 −4.7 %, max −2.1 %.  The gain is concentrated where
+Stage 1 actually dominates (mnp ≥ 40); small buckets are unaffected
+because they take the static fast path.
+
+### R3 what we did NOT try (and why)
+
+- **TMEM double-buffering.**  Without it, the math warpgroup still
+  serialises `UMMA[i] → wait → TMEM_ld[i] → emit[i] → UMMA[i+1]` per
+  tile.  Doubling TMEM columns (kUMMA_N → 2×kUMMA_N) would let math
+  issue `UMMA[i+1]` before reading `TMEM[i]`, overlapping HBM emit
+  with MMA compute.  Expected additional gain: another 5–10 % on
+  mnp ≥ 40.  Not yet attempted.
+- **Warp-specialised emit.**  Pulling the `logits_b[...] = ...` store
+  into a dedicated math warp would let the rest of the math warpgroup
+  start the next iteration's TMEM readout.  Minor gain expected.
+- **2-CTA cluster UMMA (Rank 2).**  Biggest remaining lever for the
+  mnp ≥ 64 tail; needs cluster-dim launch and multicast Q.
 
 ### A2 rejection — why host-side sync is too expensive
 

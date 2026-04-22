@@ -181,6 +181,45 @@ cp_async_mbarrier_arrive_noinc(uint32_t mbar_smem_addr) {
 }
 
 // ---------------------------------------------------------------------------
+// Warpgroup register reconfiguration (SM_90+)
+// ---------------------------------------------------------------------------
+//
+// `setmaxnreg.inc/dec.sync.aligned.u32 N;` — request the compiler+HW to
+// reassign up to N 32-bit registers per thread in the issuing warpgroup.
+// Must be issued by all 128 threads of one warpgroup simultaneously.
+// N must be in [24, 256] with step 8.
+//
+// Used by warp-specialised kernels to give the math warpgroup more
+// registers (for accumulators / spill-avoidance) while producer warps
+// surrender registers they don't need.
+
+template <uint32_t N>
+__device__ __forceinline__ void warpgroup_reg_alloc() {
+#if __CUDA_ARCH__ >= 900
+    asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;\n" :: "n"(N));
+#endif
+}
+
+template <uint32_t N>
+__device__ __forceinline__ void warpgroup_reg_dealloc() {
+#if __CUDA_ARCH__ >= 900
+    asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\n" :: "n"(N));
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// Named barrier sync — `bar.sync id, num_threads;` (SM_80+)
+// ---------------------------------------------------------------------------
+//
+// Per-warpgroup synchronization: `num_threads` must collectively arrive
+// at the barrier identified by `id` (0..15) before any can proceed.
+// Used to sync a single warpgroup without stalling the other.
+
+__device__ __forceinline__ void named_barrier_sync(int id, int num_threads) {
+    asm volatile("bar.sync %0, %1;\n" :: "r"(id), "r"(num_threads));
+}
+
+// ---------------------------------------------------------------------------
 // TMEM allocation (SM_100a)
 // ---------------------------------------------------------------------------
 //
