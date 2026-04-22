@@ -377,26 +377,77 @@ TMEM.  The 64-FMA chain runs *after* `wait_ld`, never during it.
 
 That reframes the shortlist:
 
-1. **TMEM double-buffer + warp-specialised MMA issue**.  This IS the
-   fix — but the naïve double-buffer (tried, rejected) didn't pay
-   off because MMA issue+commit is fast enough that freeing TMEM a
-   tile earlier didn't translate to real overlap.  The version that
-   *would* pay off: keep MMA issue in warp 0 as today, but start
-   `UMMA[i+1]` into `TMEM[(i+1)%2]` the instant iter i's
-   `tcgen05_wait_ld` returns (not after emit).  That overlaps MMA
-   compute for iter i+1 with ReLU·sum + emit of iter i.  Earlier
-   attempt deferred the *post-processing*, not the *MMA issue* — so
-   we hid the wrong thing.
+1. **TMEM double-buffer + early MMA-issue overlap — TRIED, REJECTED.**
+   Implemented exactly as the previous section proposed: kept MMA issue
+   in warp 0 lane 0, bumped `kTmemCols` to `2 × kUMMA_N`, added a
+   per-slot `smem_umma_done[2]` barrier, and restructured the math
+   loop so that inside iter i's body — *after* `tcgen05_wait_ld` for
+   TMEM[i%2] returns — warp 0 lane 0 waits on `K_ready[(i+1)%kKVStages]`
+   and issues `UMMA[i+1]` into `TMEM[(i+1)%2]`.  That way the MMA
+   compute for iter i+1 runs in parallel with ReLU·sum + emit of iter
+   i, without delaying `K_done[i]` by a tile (the bug in the original
+   TMEM-DB attempt).
+
+   128 / 128 correctness, but bench (same Modal session, vs R3
+   baseline):
+
+   | bucket        | n  | R3    | H1 (TMEM DB + issue-overlap) | Δ       |
+   |---------------|----|-------|------------------------------|---------|
+   | mnp ≤ 32      | 69 |  6.44 | 6.18                         | −4.0 %  |
+   | mnp 33–39     | 22 | 16.71 | 16.62                        | −0.5 %  |
+   | mnp 40–63     | 17 | 19.27 | **19.96**                    | **+3.6 %** |
+   | mnp ≥ 64      | 20 | 22.18 | **23.34**                    | **+5.2 %** |
+   | overall mean  |128 | 12.4  | 12.48                        | +0.6 %  |
+
+   The mnp ≤ 32 improvement is from the static fast-path kernel (which
+   we don't touch here) — pure session-to-session variance.  The
+   **real** target buckets (mnp ≥ 40, where the persistent WS kernel
+   runs) regressed 3.6 % and 5.2 %.
+
+   **What this proves:** the diagnosis in the previous section was
+   *wrong*.  Overlapping MMA compute with post-processing does not
+   help, because MMA compute is already not on the critical path.
+   The true critical-path dominator really is `tcgen05_wait_ld`
+   itself — the TMEM→register transfer — and that is a per-thread
+   operation every math thread must complete before it can use its
+   accumulator registers.  Nothing we can issue in parallel (another
+   MMA, another TMEM_ld into a different slot, more compute) makes
+   this thread's registers arrive any sooner.  The only way to shrink
+   `wait_ld` is to transfer fewer bytes per thread — i.e. shrink
+   `kUMMA_N` — which is the 2-CTA cluster path.
 
 2. **2-CTA cluster UMMA (Rank 2).**  Halves per-SM K-cache reads
    *and* halves the TMEM footprint per SM — so `tcgen05_ld`
    transfers half as many bytes per thread, shortening the per-tile
    critical path directly.  Biggest structural win for mnp ≥ 64.
 
-3. **Block-scaled UMMA (Rank 8).**  Folds `smem_kscale` into the MMA
-   itself; eliminates the `* smem_kscale[...]` multiply on the
-   accumulator and one smem load per tile — a few cycles per tile,
-   but it stacks with (1).
+   **Not attempted in this session — deferred as future work.**
+   Requires (a) new PTX wrappers for `tcgen05.alloc/mma/commit/dealloc.cta_group::2.*`
+   (none exist in `tcgen05_ptx.h` today, which only has `cta_group::1`
+   variants), (b) kernel launch with `__cluster_dims__(2, 1, 1)` and
+   cooperative launch attributes, (c) DSMEM setup so CTA0 and CTA1 can
+   see each other's K-cache and scales via `mapa.shared::cluster`,
+   (d) cluster-scoped mbarriers with multicast arrive, and (e) a
+   rework of the producer→math handshake to be 2-CTA-wide.  It's a
+   4–6 hour implementation + debug cycle; out of scope here.  Based
+   on the analysis above this is the single most promising remaining
+   lever for mnp ≥ 64, and should be the first thing tried next.
+
+3. **Block-scaled UMMA (Rank 8) — INFEASIBLE with this benchmark's
+   data format.**  `tcgen05.mma.kind::mxf8f6f4.block_scale` consumes
+   UE8M0 scales at a granularity of 32 K-elements along the K
+   dimension of A or B.  Our packed KV cache stores **one FP32 scale
+   per row** of K (i.e. a per-M-row scalar that multiplies the whole
+   MMA result for that row, `head_dim_with_sf=132 = 128 FP8 + 4 B FP32
+   scale`).  The two layouts are fundamentally incompatible:
+   - The MMA's block_scale axis is wrong (per-K-block, not per-M-row).
+   - The scale format is wrong (FP32 vs UE8M0).
+
+   Using `block_scale` here would require lossily converting the
+   FP32 row scales into replicated UE8M0 K-block scales, which
+   changes numerics and is not guaranteed to pass the tester.
+   Since the benchmark fixes the input format, there's no way to
+   get this scale into the MMA natively.  Archived.
 
 De-prioritised:
 
@@ -405,6 +456,27 @@ De-prioritised:
   more than a handful of cycles per tile.  Not worth the complexity.
 - **Deeper K pipeline (kKVStages > 3).**  A/B said no, and makes the
   hot loop bigger in SMEM without touching the real critical path.
+
+### Summary — where every post-v8 lever landed
+
+| lever                                       | tried | outcome   |
+|---------------------------------------------|-------|-----------|
+| A1 — size-aware dispatch (R1)               | yes   | KEPT      |
+| A2 — dynamic fast-path extension            | yes   | rejected (host-sync too expensive) |
+| B / R3 — warp-specialised persistent kernel | yes   | KEPT (−6.9 % mnp 40-63, −5.7 % mnp ≥ 64) |
+| TMEM double-buffer (original, post-proc overlap) | yes   | rejected (+1.8 % mnp ≥ 40) |
+| kKVStages 3 → 4                             | yes   | rejected (flat-to-worse) |
+| 4-way accumulator split in ReLU·w loop      | yes   | rejected (within noise) |
+| TMEM double-buffer + MMA-issue overlap (H1) | yes   | rejected (+3.6 / +5.2 % mnp ≥ 40) |
+| 2-CTA cluster UMMA (Rank 2)                 | no    | deferred — infrastructure gap |
+| Block-scaled UMMA (Rank 8)                  | no    | infeasible — data format mismatch |
+
+On this branch the persistent kernel is effectively at the
+architectural ceiling for its shape (1 CTA / tile, single-buffer
+TMEM, 128-row × 64-col MMA).  Every micro-optimisation we tried
+agrees that the per-tile critical path is the TMEM → register
+transfer itself, which is tied to `kUMMA_N = 64` — the only
+remaining way to move it is to shrink `kUMMA_N` via 2-CTA cluster.
 
 ### A2 rejection — why host-side sync is too expensive
 
