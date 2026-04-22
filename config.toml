@@ -1,5 +1,5 @@
 [solution]
-name = "dsa_topk_indexer_fp8_b200_v1"
+name = "dsa_topk_indexer_fp8_b200_v2"
 definition = "dsa_topk_indexer_fp8_h64_d128_topk2048_ps64"
 author = "Wombat"
 
