@@ -637,6 +637,47 @@ void topk_page_table_transform_kernel(
     }
 }
 
+// ============================================================================
+// Stage 1+2 fast path: when max_num_pages * kPageSize <= kTopK, every
+// seq_len in the batch is guaranteed <= kTopK, so the top-K output is
+// simply the block-table-transformed indices [0, seq_len) padded with -1.
+// The values do NOT depend on Q, K, or weights — we can skip Stage 1 and
+// the full Stage 2 entirely and emit directly.
+//
+// Block-table slice (max_num_pages <= 32 here) is cached in SMEM once so
+// the inner write loop is a pure gather without repeated gmem reads.
+// ============================================================================
+
+__global__ __launch_bounds__(256)
+void topk_fast_path_kernel(
+    const int* __restrict__ seq_lens,
+    const int* __restrict__ block_table,
+    int max_num_pages, int top_k,
+    int* __restrict__ out_indices)
+{
+    constexpr int kMaxPagesInFastPath = 32;   // = kTopK / kPageSize
+    const int b   = blockIdx.x;
+    const int tid = threadIdx.x;
+
+    __shared__ int smem_bt[kMaxPagesInFastPath];
+    if (tid < max_num_pages) smem_bt[tid] = block_table[b * max_num_pages + tid];
+
+    const int seq_len = seq_lens[b];
+    int*      row_out = out_indices + static_cast<size_t>(b) * top_k;
+    __syncthreads();
+
+#pragma unroll 4
+    for (int i = tid; i < top_k; i += blockDim.x) {
+        int v = -1;
+        if (i < seq_len) {
+            const int page = i / kPageSize;
+            const int slot = i - page * kPageSize;
+            v = smem_bt[page] * kPageSize + slot;
+        }
+        row_out[i] = v;
+    }
+}
+
 }  // anonymous namespace
 
 
@@ -661,6 +702,26 @@ void dsa_topk_indexer_cuda(
 
     const int B             = (int)q_index_fp8.size(0);
     const int max_num_pages = (int)block_table.size(1);
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    // Fast path: when the full paged context fits in top-K, the output is
+    // the block-table-transformed indices 0..seq_len-1 padded with -1 —
+    // independent of Q, K, and weights.  Skip Stage 1 and the full Stage 2
+    // entirely and launch only a tiny gather kernel.
+    //
+    // max_num_pages * kPageSize <= kTopK  <=>  max_num_pages <= kTopK/kPageSize.
+    constexpr int kFastPathMaxPages = kTopK / kPageSize;   // 32
+    if (max_num_pages <= kFastPathMaxPages) {
+        dim3 grid(B);
+        dim3 block(256);
+        topk_fast_path_kernel<<<grid, block, 0, stream>>>(
+            seq_lens.data_ptr<int>(),
+            block_table.data_ptr<int>(),
+            max_num_pages, kTopK,
+            topk_indices.data_ptr<int>());
+        return;
+    }
 
     // Size-aware Stage 1 dispatch (Rank 1 improvement).
     //
@@ -690,8 +751,6 @@ void dsa_topk_indexer_cuda(
 
     auto logits = torch::empty({B, max_len},
         torch::TensorOptions().dtype(torch::kFloat16).device(q_index_fp8.device()));
-
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
     if (use_persistent) {
         // Pick tiles_per_cta so (a) we have enough CTAs to keep ~132 SMs
