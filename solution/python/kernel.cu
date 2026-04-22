@@ -855,6 +855,16 @@ __device__ __forceinline__ uint16_t HalfToOrderedU16(__half h) {
                             : static_cast<uint16_t>(bits ^ 0x8000u);
 }
 
+// Merged from v2 `fused-topk-v1` (Stage-2 ordered-key SMEM cache): when
+// `seq_len <= kStage2MaxCachedLen` (16384 tokens, 32 KB), we populate
+// `smem_ordered[i] = HalfToOrderedU16(row_logits[i])` on round 0 and read
+// the cache on rounds 1+, the gt-count pass, and both emit passes.
+// Saves 4x HBM reads of `row_logits` per element + 4x fp16->ordered-u16
+// conversions for every workload whose Stage-1 output fits in 32 KB
+// (basically all of them given kTopK=2048, since the persistent kernel's
+// `max_kv_tile_pairs * 128` is almost always <= 16384 in this bench).
+constexpr int kStage2MaxCachedLen = 16384;
+
 __global__ __launch_bounds__(kStage2Threads)
 void topk_page_table_transform_kernel(
     const __half* __restrict__ logits,
@@ -879,6 +889,7 @@ void topk_page_table_transform_kernel(
     __shared__ uint32_t smem_found_remaining;
     __shared__ int      smem_gt_count;
     __shared__ int      smem_emit_counter;
+    __shared__ uint16_t smem_ordered[kStage2MaxCachedLen];
 
     if (seq_len <= top_k) {
         for (int i = tid; i < top_k; i += blockDim.x) {
@@ -893,6 +904,9 @@ void topk_page_table_transform_kernel(
     if (tid == 0) { smem_prefix = 0u; smem_remaining = (uint32_t)top_k; }
     __syncthreads();
 
+    const bool use_ordered_cache = (seq_len <= kStage2MaxCachedLen);
+    const int  cached_len        = use_ordered_cache ? seq_len : 0;
+
 #pragma unroll
     for (int round = 0; round < kRadixRounds; ++round) {
         const int shift = kOrderedBits - 8 - round * 8;
@@ -904,11 +918,28 @@ void topk_page_table_transform_kernel(
         __syncthreads();
 
         const uint16_t prefix = smem_prefix;
-#pragma unroll 4
-        for (int i = tid; i < seq_len; i += blockDim.x) {
-            const uint16_t ordered = HalfToOrderedU16(row_lg[i]);
-            if ((uint16_t)(ordered & prefix_mask) == prefix)
+        if (round == 0 && use_ordered_cache) {
+            // Round 0: convert and cache, unconditionally bucketize
+            // (prefix_mask == 0, so the filter trivially accepts all).
+            for (int i = tid; i < seq_len; i += blockDim.x) {
+                const uint16_t ordered = HalfToOrderedU16(row_lg[i]);
+                smem_ordered[i] = ordered;
                 atomicAdd(&smem_hist[(ordered >> shift) & 0xFFu], 1u);
+            }
+        } else if (use_ordered_cache) {
+#pragma unroll 4
+            for (int i = tid; i < cached_len; i += blockDim.x) {
+                const uint16_t ordered = smem_ordered[i];
+                if ((uint16_t)(ordered & prefix_mask) == prefix)
+                    atomicAdd(&smem_hist[(ordered >> shift) & 0xFFu], 1u);
+            }
+        } else {
+#pragma unroll 4
+            for (int i = tid; i < seq_len; i += blockDim.x) {
+                const uint16_t ordered = HalfToOrderedU16(row_lg[i]);
+                if ((uint16_t)(ordered & prefix_mask) == prefix)
+                    atomicAdd(&smem_hist[(ordered >> shift) & 0xFFu], 1u);
+            }
         }
         __syncthreads();
 
@@ -950,10 +981,15 @@ void topk_page_table_transform_kernel(
     if (tid == 0) { smem_gt_count = 0; smem_emit_counter = 0; }
     __syncthreads();
 
+    auto ordered_at = [&](int i) -> uint16_t {
+        return use_ordered_cache ? smem_ordered[i]
+                                 : HalfToOrderedU16(row_lg[i]);
+    };
+
     {
         int local = 0;
         for (int i = tid; i < seq_len; i += blockDim.x)
-            if (HalfToOrderedU16(row_lg[i]) > pivot) local++;
+            if (ordered_at(i) > pivot) local++;
 #pragma unroll
         for (int off = 16; off > 0; off >>= 1)
             local += __shfl_xor_sync(0xffffffffu, local, off);
@@ -964,7 +1000,7 @@ void topk_page_table_transform_kernel(
     const int gt_total = smem_gt_count;
 
     for (int i = tid; i < seq_len; i += blockDim.x) {
-        if (HalfToOrderedU16(row_lg[i]) > pivot) {
+        if (ordered_at(i) > pivot) {
             const int pos = atomicAdd(&smem_emit_counter, 1);
             if (pos < gt_total) row_out[pos] = i;
         }
@@ -972,7 +1008,7 @@ void topk_page_table_transform_kernel(
     __syncthreads();
 
     for (int i = tid; i < seq_len; i += blockDim.x) {
-        if (HalfToOrderedU16(row_lg[i]) == pivot) {
+        if (ordered_at(i) == pivot) {
             const int pos = atomicAdd(&smem_emit_counter, 1);
             if (pos < top_k) row_out[pos] = i;
         }
