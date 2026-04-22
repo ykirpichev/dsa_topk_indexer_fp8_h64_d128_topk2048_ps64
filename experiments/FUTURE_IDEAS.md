@@ -231,6 +231,52 @@ e. **Opt 4 histogram** (saved in experiment) is correct and useful if
 Expected cumulative mean after (1)+(2)+(3)+(5): ~11–13 µs (vs current
 16 µs), with p95/max around 18–22 µs (vs current 30 µs).
 
+## Shipped post-v8 (current branch state)
+
+| # | Idea                                       | Result      |
+|---|--------------------------------------------|-------------|
+| B | Stage-1+2 static fast path (mnp ≤ 32)      | **shipped** |
+| A1| Stage-1 per-CTA early-return on `seq_len ≤ kTopK` | **shipped** |
+| A2| Host-side `seq_lens.max()` sync to extend fast path | **rejected** |
+
+Current state (after A1):
+- mean 12.4 µs, p50 6.2 µs, p95 22.9 µs, min 6.1 µs, max 23.4 µs
+- 128/0/0 vs FlashInfer
+- Per bucket: mnp≤32 = 6.1 µs; 33–39 = 16.6 µs; 40–63 = 20.5 µs; ≥64 = 22.8 µs
+
+### A2 rejection — why host-side sync is too expensive
+
+Tried two implementations, both regressed the 33–39 bucket from 16.6 µs
+to ~36 µs (+20 µs overhead per call):
+
+1. `seq_lens.max().item<int>()` — PyTorch launches a reduction kernel,
+   then does a blocking D→H copy. Cost: ~20 µs.
+2. `cudaMemcpyAsync` of the full `seq_lens` vector + `cudaStreamSynchronize`
+   + CPU-side max. Cost: ~20 µs — same as (1), so the overhead is
+   dominated by the stream sync itself, not by the PyTorch reduction.
+
+On B200 in this benchmark harness, any `cudaStreamSynchronize` (or
+equivalent event wait) on the submission stream is ~15–20 µs of
+wall-clock time — likely because the stream has in-flight bookkeeping
+from prior iterations. That's larger than the ~12 µs saving the fast
+path would unlock, so A2 is net-negative on every qualifying workload.
+
+**When A2 would actually win**:
+- If the sync could be hidden behind the launch (it can't — we need the
+  answer *before* deciding which kernel to launch).
+- If we built CUDA-graph conditional nodes (CUDA 12.4+ feature): launch
+  both fast path and full pipeline into a graph, let the GPU pick based
+  on a device-resident flag written by a tiny reduction kernel. Skips
+  host sync entirely. **Effort: high (graph capture infra).**
+- If we accepted a speculative "assume fast path works" execution with
+  a device-resident validation kernel and a fallback recompute. Too
+  complex and correctness-hostile for this benchmark.
+
+Conclusion: A2 is archived. The only practical way to extend the fast
+path beyond the static `mnp ≤ 32` threshold is **device-side conditional
+execution** — future work, Rank 3 (warp specialisation) unlocks enough
+structure to make that feasible without a graph.
+
 ## References
 
 1. FlashAttention-4 paper (Dao et al., arXiv 2603.05451, Mar 2026) and
