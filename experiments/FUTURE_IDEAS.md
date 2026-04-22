@@ -276,17 +276,33 @@ Mean −3.1 %, p95 −4.7 %, max −2.1 %.  The gain is concentrated where
 Stage 1 actually dominates (mnp ≥ 40); small buckets are unaffected
 because they take the static fast path.
 
-### R3 what we did NOT try (and why)
+### R3 what we did NOT ship (and why)
 
-- **TMEM double-buffering.**  Without it, the math warpgroup still
-  serialises `UMMA[i] → wait → TMEM_ld[i] → emit[i] → UMMA[i+1]` per
-  tile.  Doubling TMEM columns (kUMMA_N → 2×kUMMA_N) would let math
-  issue `UMMA[i+1]` before reading `TMEM[i]`, overlapping HBM emit
-  with MMA compute.  Expected additional gain: another 5–10 % on
-  mnp ≥ 40.  Not yet attempted.
+- **TMEM double-buffering — tried, rejected.**  Allocated 2 × kUMMA_N
+  TMEM cols and restructured the math loop to issue `UMMA[i]` early,
+  then process `iter (i-1)` (wait `UMMA_done[(i-1)%2]`, TMEM_ld, ReLU
+  · weighted sum, emit, arrive `K_done[(i-1)%kKVStages]`).  Expected
+  gain: overlap MMA compute with TMEM_ld + HBM emit.  Actual: 128/128
+  still correct, but mnp 40-63 = 19.27 → 19.62 (+1.8 %) and
+  mnp ≥ 64 = 22.18 → 22.59 (+1.8 %).  Two reasons this lost:
+  1. `tcgen05.mma` **issue** is nearly free (few cycles); the MMA
+     pipeline itself already runs async behind the next `K_ready`
+     wait.  What we gained by hiding MMA compute behind the emit was
+     smaller than the extra mbarrier + parity + lambda-state overhead.
+  2. K_done release is delayed by one iter — `K_done[i]` now arrives
+     in iter `i+1`'s body instead of iter `i`'s — so the producer's
+     kKVStages=3 pipeline has less headroom and starts to stall on
+     mnp ≥ 40 workloads where prefetch latency matters.
+
+  Triple-buffered TMEM would hit the same root cause + even more
+  delayed `K_done` release.  Not worth trying unless we first change
+  the emit path (so MMA compute becomes a real bottleneck to hide).
+
 - **Warp-specialised emit.**  Pulling the `logits_b[...] = ...` store
   into a dedicated math warp would let the rest of the math warpgroup
-  start the next iteration's TMEM readout.  Minor gain expected.
+  start the next iteration's TMEM readout.  This is the *actual*
+  lever for overlap — HBM emit is a bigger chunk of the critical path
+  than UMMA compute.  Not yet attempted.
 - **2-CTA cluster UMMA (Rank 2).**  Biggest remaining lever for the
   mnp ≥ 64 tail; needs cluster-dim launch and multicast Q.
 
