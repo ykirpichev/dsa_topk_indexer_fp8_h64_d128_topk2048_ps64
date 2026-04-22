@@ -42,9 +42,17 @@ constexpr int kOrderedBits     = 16;
 //       (max_num_pages, B). Lowest launch overhead, best for small workloads.
 //   * paged_mqa_logits_umma_kernel_persistent — 2 pages per UMMA (kUMMA_M=128
 //       both halves real), persistent CTAs that loop over tiles_per_cta
-//       tile-pairs while Q/TMEM/mbar are loaded/alloc'd once. Double-buffered
-//       K via cp.async. Best for large workloads.
+//       tile-pairs while Q/TMEM/mbar are loaded/alloc'd once. Multi-stage
+//       cp.async K pipeline. Best for large workloads.
 constexpr int kPagesPerUMMA = 2;
+
+// Rank 5 (deeper K pipeline): persistent kernel uses a 3-stage cp.async
+// pipeline for K / kscale. At iteration `i` UMMA consumes buf (i % kKVStages)
+// while two newer prefetches (for tiles i+1 and i+2) are in flight into the
+// other two buffers — fully hides HBM load latency for large num_tiles.
+// 3 stages costs +16 KB smem vs 2 stages (~57 KB total, still well under the
+// B200's 228 KB budget per CTA).
+constexpr int kKVStages = 3;
 
 
 // ============================================================================
@@ -225,12 +233,13 @@ void paged_mqa_logits_umma_kernel_short(
 // across the inner tile-pair loop; with typical num_pages >> 1 this amortises
 // the Q load cost dramatically vs the short path.
 //
-// smem_k is 2-way double-buffered; at iteration i UMMA consumes buf (i&1)
-// while a cp.async prefetch for tile i+1 fills the OPPOSITE buffer
-// ((i+1)&1). That keeps exactly one cp.async group in flight at a time
-// without the buffer-aliasing race that a 2-buffer / i+2 prefetch would
-// create (tile i+2 and tile i share the same buffer).  kscale is
-// double-buffered alongside K.
+// smem_k is `kKVStages`-way buffered; at iteration i UMMA consumes buf
+// (i % kKVStages) while cp.async prefetches for tiles i+1 .. i+(kKVStages-1)
+// are in flight into the other buffers.  Each iteration issues exactly one
+// prefetch (possibly empty, past the end) and calls
+// cp.async.wait_group<kKVStages-1> to drain the oldest — this gives a clean
+// sliding-window pipeline with no buffer aliasing.  kscale is buffered
+// alongside K.
 // ============================================================================
 
 __global__ __launch_bounds__(128)
@@ -273,8 +282,8 @@ void paged_mqa_logits_umma_kernel_persistent(
     if (tile_pair_begin >= max_kv_tile_pairs) return;
 
     __shared__ __align__(1024) __nv_fp8_e4m3 smem_q[kNumHeads * kHeadDim];
-    __shared__ __align__(1024) __nv_fp8_e4m3 smem_k[2][kUMMA_M * kHeadDim];
-    __shared__ float    smem_kscale[2][kUMMA_M];
+    __shared__ __align__(1024) __nv_fp8_e4m3 smem_k[kKVStages][kUMMA_M * kHeadDim];
+    __shared__ float    smem_kscale[kKVStages][kUMMA_M];
     __shared__ float    smem_w[kNumHeads];
     __shared__ uint32_t smem_tmem_ptr;
     __shared__ __align__(8) uint64_t smem_mbar;
@@ -371,7 +380,14 @@ void paged_mqa_logits_umma_kernel_persistent(
         dsa_ptx::fence_barrier_init();
     }
 
-    prefetch_tile(0, tile_pair_begin);
+    // Pre-launch prefetches for the first (kKVStages - 1) tile-pairs.
+    // Each call commits a group unconditionally (possibly empty past the
+    // end), so the loop's wait_group<kKVStages-1> has a steady rhythm: it
+    // always drains the single oldest group.
+#pragma unroll
+    for (int s = 0; s < kKVStages - 1; ++s) {
+        prefetch_tile(s % kKVStages, tile_pair_begin + s);
+    }
 
     __syncthreads();
 
@@ -396,10 +412,11 @@ void paged_mqa_logits_umma_kernel_persistent(
             dsa_ptx::smem_ptr_to_uint(smem_base) >> 4);
         return d;
     };
-    dsa_umma::SmemDescriptor a_desc_base[2] = {
-        make_kmajor_desc(&smem_k[0][0]),
-        make_kmajor_desc(&smem_k[1][0]),
-    };
+    dsa_umma::SmemDescriptor a_desc_base[kKVStages];
+#pragma unroll
+    for (int s = 0; s < kKVStages; ++s) {
+        a_desc_base[s] = make_kmajor_desc(&smem_k[s][0]);
+    }
     const auto b_desc_base = make_kmajor_desc(smem_q);
 
     uint32_t parity = 0u;
@@ -408,15 +425,19 @@ void paged_mqa_logits_umma_kernel_persistent(
 
     for (int i = 0; i < num_tiles; ++i) {
         const int tp      = tile_pair_begin + i;
-        const int buf     = i & 1;
+        const int buf     = i % kKVStages;
         const int kv_base = tp * kUMMA_M;
 
-        dsa_ptx::cp_async_wait_group<0>();
-        __syncthreads();
+        // Issue the prefetch for tile (i + kKVStages - 1) BEFORE waiting,
+        // so we always have (kKVStages - 1) newer groups in flight while
+        // UMMA consumes tile i.  prefetch_tile commits an (empty) group
+        // past the end, which keeps the in-flight count steady so
+        // wait_group<kKVStages-1> drains exactly one group per iteration.
+        const int prefetch_i = i + kKVStages - 1;
+        prefetch_tile(prefetch_i % kKVStages, tile_pair_begin + prefetch_i);
 
-        if (i + 1 < num_tiles) {
-            prefetch_tile((i + 1) & 1, tp + 1);
-        }
+        dsa_ptx::cp_async_wait_group<kKVStages - 1>();
+        __syncthreads();
 
         if (kv_base >= seq_len) {
             for (int j = tid; j < kUMMA_M; j += kThreads)
