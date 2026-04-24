@@ -13,7 +13,7 @@
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 #include <cstdint>
-#include <cstdlib>
+#include <cstring>
 #include <array>
 #include <mutex>
 
@@ -1098,6 +1098,106 @@ void topk_fast_path_kernel(
     }
 }
 
+// ============================================================================
+// CUDA graph cache (hand-rolled graph replay for host-overhead reduction).
+// ============================================================================
+//
+// flashinfer-bench's `do_bench` times each workload with a hot loop whose
+// `setup=_clone_args(args)` callback clones every tensor on every iteration,
+// so input pointers change every call but their shapes (and therefore our
+// entire dispatch plan) stay fixed.  On the small workloads where the
+// kernel itself is 2-10 us, the ~2.5 us per `cudaLaunchKernel` dominates.
+//
+// Strategy:
+//   - Key the cache by SHAPE ONLY: (caller-stream, dispatch path, grid-
+//     defining scalars).  Pointers are NOT part of the key.
+//   - Capture via `cudaStreamBeginCapture` on a DEDICATED thread-local
+//     stream (the harness hands us the legacy NULL default stream on
+//     which capture returns cudaErrorIllegalState; `Relaxed` mode scopes
+//     capture to this stream and lets Torch's allocator do its thing on
+//     other streams in parallel).  The captured graph is topology-only,
+//     so we cudaGraphLaunch it on the caller's stream.
+//   - Cache HIT: capture a fresh template graph with current pointers,
+//     feed it to `cudaGraphExecUpdate` to splice the new kernel-node
+//     params into the cached exec in place.  Cheap (~1-2 us for a 1-2
+//     node graph) vs full re-instantiate (hundreds of us).
+//   - Cache MISS: `cudaGraphInstantiate` and stash the exec in a 32-slot
+//     LRU.  The evaluator only sees ~128 workloads and each one hits a
+//     single (path, scalars) tuple, so the LRU never churns.
+//   - On BeginCapture failure for any reason: fall back to direct
+//     `dispatch(caller_stream)` so we still return a valid result.
+//
+// Scratch / persistent-kernel attribute setup runs OUTSIDE the capture
+// region; those APIs aren't graph-safe.
+
+struct GraphKey {
+    cudaStream_t stream;        // caller stream for which exec was instantiated
+    uint8_t      path;          // 0=fast, 1=short, 2=persistent, 3=persistent_ws
+    uint8_t      _pad0 = 0;
+    uint8_t      _pad1 = 0;
+    uint8_t      _pad2 = 0;
+    int32_t      B;
+    int32_t      max_num_pages;
+    int32_t      max_kv_arg;    // short: max_num_pages; persistent: max_kv_tile_pairs
+    int32_t      tiles_per_cta; // persistent only
+    int32_t      num_splits;    // persistent only (grid.x)
+    int32_t      max_len;       // Stage-2 stride (bytes-per-row)
+    int32_t      _pad3 = 0;
+
+    bool operator==(const GraphKey& o) const noexcept {
+        return std::memcmp(this, &o, sizeof(GraphKey)) == 0;
+    }
+};
+static_assert(sizeof(GraphKey) % 8 == 0, "GraphKey must be 8-byte aligned for memcmp");
+
+struct GraphEntry {
+    GraphKey        key{};
+    cudaGraphExec_t exec  = nullptr;
+    bool            valid = false;
+};
+
+class GraphCache {
+public:
+    static constexpr int N = 32;
+
+    ~GraphCache() {
+        for (auto& e : e_) {
+            if (e.exec) cudaGraphExecDestroy(e.exec);
+        }
+    }
+
+    GraphEntry* find_slot(const GraphKey& k) {
+        std::lock_guard<std::mutex> lk(mu_);
+        for (auto& e : e_) {
+            if (e.valid && e.key == k) return &e;
+        }
+        return nullptr;
+    }
+
+    void insert(const GraphKey& k, cudaGraphExec_t x) {
+        std::lock_guard<std::mutex> lk(mu_);
+        auto& slot = e_[head_];
+        if (slot.valid && slot.exec) cudaGraphExecDestroy(slot.exec);
+        slot.key   = k;
+        slot.exec  = x;
+        slot.valid = true;
+        head_ = (head_ + 1) % N;
+    }
+
+    void invalidate(GraphEntry* slot) {
+        std::lock_guard<std::mutex> lk(mu_);
+        slot->valid = false;
+        slot->exec  = nullptr;
+    }
+
+private:
+    GraphEntry e_[N];
+    int        head_ = 0;
+    std::mutex mu_;
+};
+
+static GraphCache g_graph_cache;
+
 }  // anonymous namespace
 
 
@@ -1153,161 +1253,229 @@ void dsa_topk_indexer_cuda(
     //
     // max_num_pages * kPageSize <= kTopK  <=>  max_num_pages <= kTopK/kPageSize.
     constexpr int kFastPathMaxPages = kTopK / kPageSize;   // 32
-    if (max_num_pages <= kFastPathMaxPages) {
-        dim3 grid(B);
-        dim3 block(128);
-        topk_fast_path_kernel<<<grid, block, 0, stream>>>(
-            sl_ptr, bt_ptr, max_num_pages, kTopK, out_ptr);
-        return;
-    }
+    const bool is_fast_path = (max_num_pages <= kFastPathMaxPages);
 
-    // --- Slow-path validation (mnp > 32): only paid when we need UMMA.
-    TORCH_CHECK(q_index_fp8.is_cuda() && q_index_fp8.is_contiguous(),
-                "q_index_fp8 must be contiguous CUDA");
-    TORCH_CHECK(k_index_cache_fp8.is_cuda() && k_index_cache_fp8.is_contiguous(),
-                "k_index_cache_fp8 must be contiguous CUDA");
-    TORCH_CHECK(weights.is_cuda() && weights.is_contiguous() &&
-                    weights.scalar_type() == torch::kFloat32,
-                "weights must be float32 contiguous CUDA");
+    // Dispatch parameters resolved during non-graph-safe setup.  `path`
+    // encodes the kernel choice and `max_kv_tile_pairs/tiles_per_cta/
+    // num_splits` the persistent-path grid — all go into the GraphKey.
+    uint8_t              path          = 0;   // 0=fast, 1=short, 2=persistent, 3=persistent_ws
+    int                  max_kv_tile_pairs = 0;
+    int                  tiles_per_cta     = 0;
+    int                  num_splits        = 0;
+    int                  max_len           = 0;
+    __half*              logits_ptr        = nullptr;
+    const __nv_fp8_e4m3* q_ptr             = nullptr;
+    const uint8_t*       kv_ptr            = nullptr;
+    const float*         w_ptr             = nullptr;
 
-    // Size-aware Stage 1 dispatch (Rank 1 improvement).
-    //
-    // Empirically, on B200 the submission-v8 "short" kernel wins on small
-    // per-row workloads (max_num_pages <= ~32) where the persistent kernel's
-    // one-shot setup (Q/TMEM/mbar + first K prefetch) is a big fraction of
-    // total time and where the grid already saturates the SMs.  On larger
-    // rows the persistent kernel wins because it (a) halves the UMMA count
-    // (2 pages per UMMA), (b) eliminates redundant Q reads, and (c) overlaps
-    // K fetches with UMMA via cp.async double-buffering.
-    //
-    // Threshold chosen on the conservative side of measured data — tunable.
-    // Bumped from 40 -> 64 after the v2 merge (2x runs, Apr 2026):
-    //   mnp 40-63:  18.75 -> 17.08 us   (-8.9%)
-    //   mnp >= 64:  22.12 -> 21.78 us   (-1.5%, within noise)
-    //   mnp 33-39:  16.48 -> 16.41 us   (flat)
-    //   mnp <= 32:  6.11  -> 6.37  us   (fast-path only, run-to-run noise)
-    // With the R3 warp-specialised persistent kernel the per-tile critical
-    // path is `tcgen05_wait_ld -> ReLU.w -> scale -> emit`; for modest
-    // tile counts (mnp 40-63 yields 20-32 tile-pairs/row) the WS setup
-    // (Q/TMEM alloc, mbar init, first K prefetch) + the `wait_ld`
-    // serialisation don't amortise, and the simpler "short" kernel's
-    // grid-per-tile saturation wins.
-    constexpr int kPersistentPageThreshold = 64;
-    const bool use_persistent = (max_num_pages >= kPersistentPageThreshold);
+    if (!is_fast_path) {
+        // --- Slow-path validation (mnp > 32): only paid when we need UMMA.
+        TORCH_CHECK(q_index_fp8.is_cuda() && q_index_fp8.is_contiguous(),
+                    "q_index_fp8 must be contiguous CUDA");
+        TORCH_CHECK(k_index_cache_fp8.is_cuda() && k_index_cache_fp8.is_contiguous(),
+                    "k_index_cache_fp8 must be contiguous CUDA");
+        TORCH_CHECK(weights.is_cuda() && weights.is_contiguous() &&
+                        weights.scalar_type() == torch::kFloat32,
+                    "weights must be float32 contiguous CUDA");
 
-    const int max_kv_tile_pairs =
-        (max_num_pages + kPagesPerUMMA - 1) / kPagesPerUMMA;
+        // Size-aware Stage 1 dispatch (Rank 1 improvement).  See history
+        // in docs/OPTIMIZATION_LOG.md for the 40 -> 64 threshold move.
+        constexpr int kPersistentPageThreshold = 64;
+        const bool use_persistent = (max_num_pages >= kPersistentPageThreshold);
 
-    // Logits tensor layout must match whatever Stage 1 writes.  The
-    // persistent kernel writes max_kv_tile_pairs * kUMMA_M = 2-page-rounded
-    // columns per row; the short kernel writes exactly max_num_pages *
-    // kPageSize.  The rounded form is always >= the exact form, so Stage 2
-    // (which iterates up to seq_len anyway) works with either.
-    const int max_len = use_persistent
-        ? max_kv_tile_pairs * (kPagesPerUMMA * kBlockKv)
-        : max_num_pages * kPageSize;
+        max_kv_tile_pairs = (max_num_pages + kPagesPerUMMA - 1) / kPagesPerUMMA;
 
-    // Merged from v2 fused-topk-v1 (commit aacdc8b, "Persistent Stage-1
-    // logits scratch (phase-3)").  PyTorch's caching allocator usually
-    // reuses the same block across identically-sized calls, but the
-    // FlashInfer-Bench sweep issues many different (B, max_len) per
-    // session, which forces the allocator to walk its free-list (and
-    // sometimes cudaMalloc) on every transition.  Hoisting the Stage-1
-    // output buffer to per-device function-static state with a
-    // power-of-two grow policy pays torch::empty() once per size-class
-    // and reuses the pointer for all subsequent calls.  Both Stage-1
-    // kernels (short and persistent WS / non-WS) write into the same
-    // workspace; they are serialised on the same CUDA stream so no
-    // aliasing concern.  Keyed by device index so multi-GPU setups each
-    // latch their own max-size block.
-    __half* logits_ptr;
-    {
-        static std::array<torch::Tensor, 8> s_scratch;
-        static std::array<size_t, 8>        s_scratch_bytes = {};
-        static std::array<std::mutex, 8>    s_scratch_mu;
-        const int idx = (dev_index >= 0 && dev_index < 8) ? int(dev_index) : 0;
-        const size_t needed_bytes = static_cast<size_t>(B) *
-                                    static_cast<size_t>(max_len) *
-                                    sizeof(__half);
-        std::lock_guard<std::mutex> g(s_scratch_mu[idx]);
-        if (s_scratch_bytes[idx] < needed_bytes) {
-            size_t new_bytes = s_scratch_bytes[idx] ? s_scratch_bytes[idx]
-                                                    : needed_bytes;
-            while (new_bytes < needed_bytes) new_bytes <<= 1;
-            const int64_t new_elems =
-                static_cast<int64_t>(new_bytes / sizeof(__half));
-            s_scratch[idx] = torch::empty(
-                {new_elems},
-                torch::TensorOptions()
-                    .dtype(torch::kFloat16)
-                    .device(q_index_fp8.device()));
-            s_scratch_bytes[idx] = new_bytes;
+        // Logits layout must match whatever Stage 1 writes; persistent
+        // rounds up to full tile-pair columns, short uses exact page*64.
+        max_len = use_persistent
+            ? max_kv_tile_pairs * (kPagesPerUMMA * kBlockKv)
+            : max_num_pages * kPageSize;
+
+        // Persistent Stage-1 logits scratch (v2 fused-topk-v1 merge).
+        // Kept outside the graph machinery: `torch::empty` is not graph-
+        // safe, but the pointer only changes when B*max_len grows past
+        // the current allocation, at which point the graph cache entry
+        // (keyed by max_len) will naturally miss and re-instantiate.
+        {
+            static std::array<torch::Tensor, 8> s_scratch;
+            static std::array<size_t, 8>        s_scratch_bytes = {};
+            static std::array<std::mutex, 8>    s_scratch_mu;
+            const int idx = (dev_index >= 0 && dev_index < 8) ? int(dev_index) : 0;
+            const size_t needed_bytes = static_cast<size_t>(B) *
+                                        static_cast<size_t>(max_len) *
+                                        sizeof(__half);
+            std::lock_guard<std::mutex> g(s_scratch_mu[idx]);
+            if (s_scratch_bytes[idx] < needed_bytes) {
+                size_t new_bytes = s_scratch_bytes[idx] ? s_scratch_bytes[idx]
+                                                        : needed_bytes;
+                while (new_bytes < needed_bytes) new_bytes <<= 1;
+                const int64_t new_elems =
+                    static_cast<int64_t>(new_bytes / sizeof(__half));
+                s_scratch[idx] = torch::empty(
+                    {new_elems},
+                    torch::TensorOptions()
+                        .dtype(torch::kFloat16)
+                        .device(q_index_fp8.device()));
+                s_scratch_bytes[idx] = new_bytes;
+            }
+            logits_ptr = reinterpret_cast<__half*>(
+                s_scratch[idx].data_ptr<at::Half>());
         }
-        logits_ptr = reinterpret_cast<__half*>(
-            s_scratch[idx].data_ptr<at::Half>());
+
+        q_ptr  = reinterpret_cast<const __nv_fp8_e4m3*>(q_index_fp8.data_ptr());
+        kv_ptr = reinterpret_cast<const uint8_t*>(k_index_cache_fp8.data_ptr());
+        w_ptr  = weights.data_ptr<float>();
+
+        if (use_persistent) {
+            constexpr int kSmTarget = 132 * 4;
+            constexpr int kMinTiles = 4;
+            constexpr int kMaxTiles = 64;
+            num_splits = (kSmTarget + B - 1) / B;
+            if (num_splits < 1) num_splits = 1;
+            if (num_splits > max_kv_tile_pairs) num_splits = max_kv_tile_pairs;
+            tiles_per_cta = (max_kv_tile_pairs + num_splits - 1) / num_splits;
+            if (tiles_per_cta < kMinTiles) tiles_per_cta = kMinTiles;
+            if (tiles_per_cta > kMaxTiles) tiles_per_cta = kMaxTiles;
+            num_splits = (max_kv_tile_pairs + tiles_per_cta - 1) / tiles_per_cta;
+
+            path = 3;
+        } else {
+            path = 1;
+        }
     }
 
-    if (use_persistent) {
-        // Pick tiles_per_cta so (a) we have enough CTAs to keep ~132 SMs
-        // busy and (b) each CTA amortises Q load over many tile-pairs.
-        constexpr int kSmTarget = 132 * 4;
-        constexpr int kMinTiles = 4;
-        constexpr int kMaxTiles = 64;
-        int num_splits = (kSmTarget + B - 1) / B;
-        if (num_splits < 1) num_splits = 1;
-        if (num_splits > max_kv_tile_pairs) num_splits = max_kv_tile_pairs;
-        int tiles_per_cta = (max_kv_tile_pairs + num_splits - 1) / num_splits;
-        if (tiles_per_cta < kMinTiles) tiles_per_cta = kMinTiles;
-        if (tiles_per_cta > kMaxTiles) tiles_per_cta = kMaxTiles;
-        num_splits = (max_kv_tile_pairs + tiles_per_cta - 1) / tiles_per_cta;
-
-        dim3 grid(num_splits, B);
-
-        // Rank 3: warp-specialised persistent kernel (256 threads/CTA) is
-        // the default on the persistent path.  Set DSA_TOPK_DISABLE_WS=1
-        // to fall back to the single-warpgroup persistent kernel (useful
-        // for A/B profiling).
-        static const bool disable_ws = [] {
-            const char* env = std::getenv("DSA_TOPK_DISABLE_WS");
-            return env && env[0] != '0' && env[0] != '\0';
-        }();
-        const bool use_ws = !disable_ws;
-
-        const auto* q_ptr  = reinterpret_cast<const __nv_fp8_e4m3*>(q_index_fp8.data_ptr());
-        const auto* kv_ptr = reinterpret_cast<const uint8_t*>(k_index_cache_fp8.data_ptr());
-        const float* w_ptr = weights.data_ptr<float>();
-        if (use_ws) {
+    // Dispatch body, parameterised on the stream (so the graph capture
+    // flow below can replay the same sequence on a dedicated stream).
+    auto dispatch = [&](cudaStream_t s) {
+        if (path == 0) {
+            dim3 grid(B);
+            dim3 block(128);
+            topk_fast_path_kernel<<<grid, block, 0, s>>>(
+                sl_ptr, bt_ptr, max_num_pages, kTopK, out_ptr);
+            return;
+        }
+        // Stage 1.
+        if (path == 3) {
+            dim3 grid(num_splits, B);
             dim3 block(256);
-            paged_mqa_logits_umma_kernel_persistent_ws<<<grid, block, 0, stream>>>(
+            paged_mqa_logits_umma_kernel_persistent_ws<<<grid, block, 0, s>>>(
+                q_ptr, kv_ptr, w_ptr, sl_ptr, bt_ptr,
+                max_num_pages, max_kv_tile_pairs, tiles_per_cta,
+                logits_ptr);
+        } else if (path == 2) {
+            dim3 grid(num_splits, B);
+            dim3 block(128);
+            paged_mqa_logits_umma_kernel_persistent<<<grid, block, 0, s>>>(
                 q_ptr, kv_ptr, w_ptr, sl_ptr, bt_ptr,
                 max_num_pages, max_kv_tile_pairs, tiles_per_cta,
                 logits_ptr);
         } else {
+            // path == 1, "short" Stage 1.
+            dim3 grid(max_num_pages, B);
             dim3 block(128);
-            paged_mqa_logits_umma_kernel_persistent<<<grid, block, 0, stream>>>(
+            paged_mqa_logits_umma_kernel_short<<<grid, block, 0, s>>>(
                 q_ptr, kv_ptr, w_ptr, sl_ptr, bt_ptr,
-                max_num_pages, max_kv_tile_pairs, tiles_per_cta,
+                max_num_pages, max_num_pages,
                 logits_ptr);
         }
-    } else {
-        dim3 grid(max_num_pages, B);
-        dim3 block(128);
-        paged_mqa_logits_umma_kernel_short<<<grid, block, 0, stream>>>(
-            reinterpret_cast<const __nv_fp8_e4m3*>(q_index_fp8.data_ptr()),
-            reinterpret_cast<const uint8_t*>(k_index_cache_fp8.data_ptr()),
-            weights.data_ptr<float>(),
-            sl_ptr, bt_ptr,
-            max_num_pages, max_num_pages,
-            logits_ptr);
-    }
-
-    {
-        dim3 grid(B);
-        dim3 block(kStage2Threads);
-        topk_page_table_transform_kernel<<<grid, block, 0, stream>>>(
+        // Stage 2.
+        dim3 grid2(B);
+        dim3 block2(kStage2Threads);
+        topk_page_table_transform_kernel<<<grid2, block2, 0, s>>>(
             logits_ptr, sl_ptr, bt_ptr,
             max_len, max_num_pages, kTopK, out_ptr);
+    };
+
+    // ----- Graph-cache dispatch --------------------------------------------
+    GraphKey k{};
+    std::memset(&k, 0, sizeof(k));   // zero padding for memcmp()
+    k.stream        = stream;
+    k.path          = path;
+    k.B             = B;
+    k.max_num_pages = max_num_pages;
+    k.max_kv_arg    = (path == 1) ? max_num_pages : max_kv_tile_pairs;
+    k.tiles_per_cta = tiles_per_cta;
+    k.num_splits    = num_splits;
+    k.max_len       = max_len;
+
+    // We can't capture on the caller-supplied stream: under flashinfer-
+    // bench's persistent isolated-runner worker, `getCurrentCUDAStream()`
+    // returns the legacy NULL default stream, on which BeginCapture
+    // returns cudaErrorIllegalState.  Use our own thread-local stream
+    // for capture; the captured graph is topology-only so replaying it
+    // on the caller's stream preserves ordering wrt. the caller's other
+    // work.
+    static thread_local cudaStream_t cap_stream = nullptr;
+    if (!cap_stream) {
+        cudaStreamCreateWithFlags(&cap_stream, cudaStreamNonBlocking);
     }
+
+    cudaError_t cerr = cudaStreamBeginCapture(
+        cap_stream, cudaStreamCaptureModeRelaxed);
+    if (cerr != cudaSuccess) {
+        // Environment refused capture (nested capture / stream in a bad
+        // state) -- fall back to direct launch so the call still works.
+        dispatch(stream);
+        const cudaError_t err2 = cudaGetLastError();
+        TORCH_CHECK(err2 == cudaSuccess,
+            "DSA topk: direct launch after capture failure: ",
+            cudaGetErrorString(err2));
+        return;
+    }
+    dispatch(cap_stream);
+    cudaGraph_t new_graph = nullptr;
+    cerr = cudaStreamEndCapture(cap_stream, &new_graph);
+    TORCH_CHECK(cerr == cudaSuccess && new_graph != nullptr,
+                "DSA topk: cudaStreamEndCapture failed: ",
+                cudaGetErrorString(cerr));
+
+    // Cache HIT: patch new pointers into the cached exec in place.
+    GraphEntry* slot = g_graph_cache.find_slot(k);
+    if (slot != nullptr) {
+#if CUDART_VERSION >= 12000
+        cudaGraphExecUpdateResultInfo info{};
+        cerr = cudaGraphExecUpdate(slot->exec, new_graph, &info);
+        const bool updated = (cerr == cudaSuccess &&
+                              info.result == cudaGraphExecUpdateSuccess);
+#else
+        cudaGraphExecUpdateResult result = cudaGraphExecUpdateError;
+        cudaGraphNode_t err_node = nullptr;
+        cerr = cudaGraphExecUpdate(slot->exec, new_graph, &err_node, &result);
+        const bool updated = (cerr == cudaSuccess &&
+                              result == cudaGraphExecUpdateSuccess);
+#endif
+        if (updated) {
+            cudaGraphDestroy(new_graph);
+            cerr = cudaGraphLaunch(slot->exec, stream);
+            TORCH_CHECK(cerr == cudaSuccess,
+                        "DSA topk: cudaGraphLaunch after update failed: ",
+                        cudaGetErrorString(cerr));
+            return;
+        }
+        // Topology mismatch (shouldn't happen given the shape key, but
+        // be defensive): drop the cached exec and re-instantiate below.
+        cudaGraphExecDestroy(slot->exec);
+        g_graph_cache.invalidate(slot);
+    }
+
+    // Cache MISS: full instantiate + launch.
+    cudaGraphExec_t exec = nullptr;
+#if CUDART_VERSION >= 12000
+    cerr = cudaGraphInstantiate(&exec, new_graph, 0);
+#else
+    cerr = cudaGraphInstantiate(&exec, new_graph, nullptr, nullptr, 0);
+#endif
+    TORCH_CHECK(cerr == cudaSuccess && exec != nullptr,
+                "DSA topk: cudaGraphInstantiate failed: ",
+                cudaGetErrorString(cerr));
+    cudaGraphDestroy(new_graph);  // exec owns its own topology copy
+
+    cerr = cudaGraphLaunch(exec, stream);
+    TORCH_CHECK(cerr == cudaSuccess,
+                "DSA topk: cudaGraphLaunch (initial) failed: ",
+                cudaGetErrorString(cerr));
+
+    g_graph_cache.insert(k, exec);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {

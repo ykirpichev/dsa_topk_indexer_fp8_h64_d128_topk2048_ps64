@@ -247,7 +247,6 @@ Current state (after R3):
 - mean 12.4 µs, p50 6.6 µs, p95 22.4 µs, min 6.3 µs, max 23.1 µs
 - 128/0/0 vs FlashInfer
 - Per bucket: mnp≤32 = 6.5 µs; 33–39 = 16.6 µs; 40–63 = 19.3 µs; ≥64 = 22.2 µs
-- `DSA_TOPK_DISABLE_WS=1` falls back to the single-warpgroup kernel (A/B toggle).
 
 ### R3 what landed
 

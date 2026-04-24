@@ -30,8 +30,22 @@ TRACE_SET_PATH = "/data"
 image = (
     modal.Image.from_registry("flashinfer/flashinfer-ci-cu132:latest")
     .apt_install("git")
-    .env({"CUDA_HOME": "/usr/local/cuda"})
+    .env({
+        "CUDA_HOME": "/usr/local/cuda",
+        # Persist PyTorch cpp_extension builds (dsa_topk_indexer.so) across runs.
+        # "TORCH_EXTENSIONS_DIR": f"{CACHE_DIR}/torch_extensions",
+        # Persist the NVIDIA driver's PTX->SASS JIT cache too.
+        # "CUDA_CACHE_PATH": f"{CACHE_DIR}/nv_compute_cache",
+        # "CUDA_CACHE_MAXSIZE": str(4 * 1024 * 1024 * 1024),  # 4 GiB
+        # flashinfer_bench internal cache (PythonBuilder source copy, logs).
+        # "FIB_CACHE_PATH": f"{CACHE_DIR}/flashinfer",
+        # B200-only; avoids building multi-arch fatbins during image build and at runtime.
+        # "TORCH_CUDA_ARCH_LIST": "10.0a",
+        # "MAX_JOBS": "16",
+    })
     .pip_install("wheel", "setuptools")
+    # cupti-python is in the evaluation environment (see EVALUATION.md).
+    .pip_install("cupti-python")
     .run_commands(
         "git clone --recursive --depth 1 https://github.com/deepseek-ai/DeepGEMM.git /tmp/DeepGEMM",
         "pip install --no-build-isolation /tmp/DeepGEMM",
@@ -45,11 +59,8 @@ image = (
 
 @app.function(image=image, gpu="B200:1", timeout=3600, volumes={TRACE_SET_PATH: trace_volume})
 def run_benchmark(solution: Solution, config: BenchmarkConfig = None,
-                  disable_ws: bool = False) -> dict:
+                  max_workloads: int = 0) -> dict:
     """Run benchmark on Modal B200 and return results."""
-    import os
-    if disable_ws:
-        os.environ["DSA_TOPK_DISABLE_WS"] = "1"
     if config is None:
         config = BenchmarkConfig(warmup_runs=3, iterations=100, num_trials=5)
 
@@ -63,6 +74,10 @@ def run_benchmark(solution: Solution, config: BenchmarkConfig = None,
 
     if not workloads:
         raise ValueError(f"No workloads found for definition '{solution.definition}'")
+
+    if max_workloads > 0:
+        workloads = workloads[:max_workloads]
+        print(f"[runner] restricting to first {len(workloads)} workload(s).", flush=True)
 
     bench_trace_set = TraceSet(
         root=trace_set.root,
@@ -119,7 +134,7 @@ def print_results(results: dict):
 
 
 @app.local_entrypoint()
-def main(disable_ws: bool = False):
+def main(max_workloads: int = 0):
     """Pack solution and run benchmark on Modal."""
     from scripts.pack_solution import pack_solution
 
@@ -129,11 +144,14 @@ def main(disable_ws: bool = False):
     print("\nLoading solution...")
     solution = Solution.model_validate_json(solution_path.read_text())
     print(f"Loaded: {solution.name} ({solution.definition})")
-    if disable_ws:
-        print("disable-ws: warp-specialised persistent kernel (Rank 3) DISABLED.")
+    if max_workloads > 0:
+        print(f"max-workloads: running only the first {max_workloads}.")
 
     print("\nRunning benchmark on Modal B200...")
-    results = run_benchmark.remote(solution, disable_ws=disable_ws)
+    results = run_benchmark.remote(
+        solution,
+        max_workloads=max_workloads,
+    )
 
     if not results:
         print("No results returned!")
