@@ -7,20 +7,44 @@ Final solution: `dsa_topk_indexer_fp8_b200_v3` (commit `31b8f71`)
 
 ## Headline Summary
 
-| Field             | Value                                                                                                                     |
-| ----------------- | ------------------------------------------------------------------------------------------------------------------------- |
-| Hardware          | NVIDIA B200 / `sm_100a` (FP8 E4M3 x FP8 E4M3 -> FP32, FP16 logits)                                                        |
-| Workloads         | 128 / 128 PASSED                                                                                                          |
-| vs naive ref      | 964x mean *(unconfirmed — see caveat)*                                                                                    |
-| vs FlashInfer/DG  | 38.4x mean (8.3x worst, 72.3x best) *(unconfirmed — see caveat)*                                                          |
-| Aggregate latency | mean 7.83 us, p50 2.40 us, p95 17.80 us *(unconfirmed — see caveat)*                                                      |
-| Source files      | `solution/python/solution.py`, `solution/python/kernel.cu`, `solution/python/tcgen05_ptx.h`, `solution/python/umma_desc.h`|
+
+| Field             | Value                                                                                                                      |
+| ----------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| Hardware          | NVIDIA B200 / `sm_100a` (FP8 E4M3 x FP8 E4M3 -> FP32, FP16 logits)                                                         |
+| Workloads         | 128 / 128 PASSED                                                                                                           |
+| vs naive ref      | 964x mean *(unconfirmed — see caveat)*                                                                                     |
+| vs FlashInfer/DG  | 38.4x mean (8.3x worst, 72.3x best) *(unconfirmed — see caveat)*                                                           |
+| Aggregate latency | mean 7.83 us, p50 2.40 us, p95 17.80 us *(unconfirmed — see caveat)*                                                       |
+| Source files      | `solution/python/solution.py`, `solution/python/kernel.cu`, `solution/python/tcgen05_ptx.h`, `solution/python/umma_desc.h` |
+
 
 > **Caveat — comparison numbers are unconfirmed.** The headline speedups (38.4x vs FlashInfer, 964x vs naive) come from `reports/submission-v10.md` / `reports/submission-v10-raw-cupti.log`. It is unclear at the time of writing whether the comparison numbers were end-to-end `cupti-python`-timed under the same harness configuration the official evaluator uses; some relative numbers may mix cupti and CUDA-event timings and will be remeasured.
 
 ## Problem and Constraints
 
 For each batch row `b`, the operator computes FP8 dot products `S[h] = sum_d Q[b,h,d] * K[page,slot,d]` over 64 heads / 128 dims with FP32 accumulation, weighted ReLU logits `logit[b,t] = scale[page,slot] * sum_h ReLU(S[h]) * weights[b,h]` for every position in `[0, seq_lens[b])`, top-K = 2048 selection, and a `block_table` transform back to physical page slots. The KV cache is FP8 with per-slot FP32 scales (132 bytes/slot, 64 slots/page), and outputs are pre-allocated (DPS).
+
+```mermaid
+flowchart LR
+    subgraph Inputs
+        Q["Q: q_index_fp8<br/>[B, H=64, D=128] FP8"]
+        K["K: k_index_cache_fp8<br/>[P, PS=64, D+4 scale]<br/>FP8 + per-slot FP32 scale"]
+        W["weights: [B, H=64] FP16"]
+        BT["block_table: [B, max_pages]"]
+        SL["seq_lens: [B]"]
+    end
+    Q --> S1
+    K --> S1
+    W --> S1
+    BT --> S1
+    SL --> S1
+    subgraph Stage1["Stage 1 — UMMA logits per page"]
+        S1["S[b,h,t] = sum_d Q * K<br/>logit = scale * sum_h ReLU(S) * w"]
+    end
+    S1 --> S2["Stage 2 — Radix top-K (K=2048)"]
+    S2 --> BTT["Block-table transform<br/>token idx -> physical page slot"]
+    BTT --> Out["topk_indices<br/>[B, K=2048] int32 (DPS)"]
+```
 
 The 128 contest workloads span batch 1-16 and `max_num_pages` 5 to 95+, meaning the smallest workloads have ~320 tokens (host launch overhead and TMEM allocation dominate) while the largest exceed 6000 tokens (HBM K-bandwidth and the TMEM-to-register readout dominate). A single kernel cannot serve both regimes well — dispatch by shape is mandatory.
 
@@ -34,7 +58,15 @@ The single largest constraint on the timeline was the evaluator. Before [flashin
 
 **Post-#354 (Apr 11 onwards).** PR #354 introduced `DsaTopkIndexerEvaluator` which compares **sorted value vectors**, vectorizes index validation (duplicates, out-of-range, block-table reachability), and provides a `build_baseline` with correct FP8 packing. This unblocked the entire custom-kernel path. Within ten days the solution was rewritten from scratch: pure PyTorch FP8 dequant + bmm indexer (Apr 11-12), then custom CUDA top-K with CUB radix sort and FP8 MMA logits via `mma.sync.m16n8k32.e4m3` PTX (Apr 19-20), then a full SM100a UMMA rewrite with `tcgen05.mma.cta_group::1`, radix-select top-K, and size-aware dispatch (`v7`, `v8`, ~16 us mean), then persistent CTAs, warp specialization, Stage-2 SMEM cache, dispatch retuning and a CUDA graph cache (`v9`-`v11`). The final 7.83 us mean / 38.4x vs FlashInfer was reached on Apr 24.
 
-In summary, the pre-#354 evaluator capped the work at ~7x for six weeks; the post-#354 evaluator enabled the full custom CUDA pipeline that delivered 38.4x in the remaining two weeks.
+```mermaid
+xychart-beta
+    title "Mean speedup vs naive reference, by submission (preliminary)"
+    x-axis ["v1", "v2", "v3", "v4", "v7", "v8", "v9", "v10/11"]
+    y-axis "Mean speedup (x)" 0 --> 1100
+    bar [5.6, 6.8, 6.6, 7.4, 12, 410, 850, 964]
+```
+
+The flat plateau at v1-v4 (5-7x) corresponds to the period when the old evaluator rejected anything beyond ATen + `torch::topk`. The sharp rise at v7-v8 follows PR #354 and the full custom-CUDA + UMMA + radix-select rewrite. The final ~13% from v9 to v11 comes from CUDA-graph host-overhead elimination on the small-workload bucket. In summary, the pre-#354 evaluator capped the work at ~7x for six weeks; the post-#354 evaluator enabled the full custom CUDA pipeline that delivered 38.4x vs FlashInfer in the remaining two weeks.
 
 ## Final Kernel Design
 
@@ -55,15 +87,41 @@ flowchart LR
     G --> O["int32 topk_indices<br/>(DPS)"]
 ```
 
+
+
 **Fast path** (`max_num_pages <= 32`). When the entire paged context fits within K=2048 every position is in the top-K, so the output is just block-table-transformed `[0, seq_len)` padded with -1, independent of Q, K, weights. 128 threads with vectorized int4 stores, ~2.3 us including graph replay overhead.
 
 **Short kernel** (`33 <= max_num_pages < 64`). One CTA per page, 128 threads. Q and K loaded into 128B-swizzled SMEM, TMEM allocated, UMMA issued with 4 K-iterations on the `(M=128, N=64, K=32)` shape, FP32 accumulator read back, ReLU-weighted logits computed, FP16 emitted. Simple grid layout, minimal setup.
 
 **Warp-specialized persistent kernel** (`max_num_pages >= 64`). 256 threads = producer warpgroup (warps 4-7, 40 regs, drives a 3-stage `cp.async` K pipeline) and math warpgroup (warps 0-3, 232 regs, issues UMMA, reads TMEM, computes ReLU/weighted sum, emits). Q is loaded once and TMEM allocated once per CTA. Per-stage `K_ready[buf]`/`K_done[buf]` mbarriers drive the handoff. A subtle bring-up bug: `cp.async.wait_group` is per-thread, so a producer-warpgroup `bar.sync` is required before the single-thread `mbarrier.arrive` on `K_ready[buf]` to ensure all threads' cp.async writes are visible. Grid is `(num_splits, B)` with `tiles_per_cta` tile-pairs per CTA.
 
+```mermaid
+sequenceDiagram
+    autonumber
+    participant H as HBM (K-cache)
+    participant P as Producer warpgroup<br/>(warps 4-7, 40 regs)
+    participant S as SMEM K[buf]
+    participant M as Math warpgroup<br/>(warps 0-3, 232 regs)
+    participant T as TMEM
+    Note over P,M: Persistent loop over (b, tile-pair) per CTA
+    P->>H: cp.async K[buf=0]
+    P->>P: bar.sync (warpgroup)
+    P->>M: mbarrier.arrive K_ready[0]
+    P->>H: cp.async K[buf=1] (overlap next stage)
+    M-->>M: wait K_ready[0]
+    M->>S: read K[0]
+    M->>T: tcgen05.mma f8f6f4 (issue)
+    M->>T: tcgen05.commit / wait_ld
+    M->>P: mbarrier.arrive K_done[0]
+    M->>M: ReLU(S) * weights, reduce, emit FP16
+    P-->>P: wait K_done[0]
+    P->>H: cp.async K[buf=0] (refill, 3-deep)
+```
+
+
 **Stage-2 radix top-K.** Two-round radix select over 16-bit ordered keys finds the pivot in O(seq_len). Since `seq_len <= 16384` for all benchmarked workloads, ordered keys are cached in a 32 KB SMEM array on round 0 and re-read on subsequent passes (4x fewer HBM reads). Elements greater than the pivot are emitted first, equal-to-pivot fills remaining slots, then the block-table transform runs.
 
-**CUDA graph cache.** `do_bench` clones inputs every iteration so pointers change but shapes (and the dispatch plan) stay fixed. For small workloads where the kernel itself is 2-10 us, ~2.5 us per `cudaLaunchKernel` dominated. The cache is a 32-slot LRU keyed by `(stream, dispatch_path, B, max_num_pages, tiles_per_cta, num_splits, max_len)`. Each call captures a fresh graph with current pointers and tries `cudaGraphExecUpdate` against the cached exec; on cache miss `cudaGraphInstantiate` creates a new exec. Falls back to direct launch if `cudaStreamBeginCapture` fails. This collapsed the fast-path bucket from 6.5 us to 2.3 us mean.
+**CUDA graph cache.** `do_bench` clones inputs every iteration so pointers change but shapes (and the dispatch plan) stay fixed. For small workloads where the kernel itself is 2-10 us, ~2.5 us per `cudaLaunchKernel` dominated. The cache is a 32-slot LRU keyed by `(stream, dispatch_path, B, max_num_pages, tiles_per_cta, num_splits, max_len)`. Each call captures a fresh graph with current pointers and tries `cudaGraphExecUpdate` against the cached exec; on cache miss `cudaGraphInstantiate` creates a new exec. Falls back to direct launch if `cudaStreamBeginCapture` fails. This collapsed the fast-path bucket from 6.5 us to 2.3 us mean (**unconfirmed, reason could be just fixing eval to use** `cupti-python`**)**.
 
 ## Negative Results and the Critical Path
 
@@ -75,6 +133,7 @@ All 128 workloads pass the post-#354 `DsaTopkIndexerEvaluator`. Final benchmarks
 
 ## Tools and Languages
 
+
 | Tool / Language                          | Role                                                                                   |
 | ---------------------------------------- | -------------------------------------------------------------------------------------- |
 | CUDA C++ (`sm_100a`)                     | All kernels: UMMA via inline PTX, cp.async pipelines, radix top-K                      |
@@ -85,6 +144,7 @@ All 128 workloads pass the post-#354 `DsaTopkIndexerEvaluator`. Final benchmarks
 | Modal                                    | Cloud B200 access for benchmarking                                                     |
 | `cupti-python`                           | GPU-side timing (matches official evaluation methodology)                              |
 | Cursor + LLM agents                      | Agent-assisted development (see disclosure below)                                      |
+
 
 ## References
 
