@@ -39,6 +39,10 @@ image = (
     .apt_install("git")
     .env({"CUDA_HOME": "/usr/local/cuda"})
     .pip_install("wheel", "setuptools")
+    # cupti-python is in the evaluation environment (see EVALUATION.md).
+    # Without it, flashinfer-bench falls back to CUDA events which adds
+    # ~3-4 us of event-sync overhead per measurement.
+    .pip_install("cupti-python")
     .run_commands(
         "git clone --recursive https://github.com/deepseek-ai/DeepGEMM.git /tmp/deep-gemm",
         "cd /tmp/deep-gemm && git checkout 59f2c07cf2 && "
@@ -55,21 +59,25 @@ image = (
 
 
 def _worker_benchmark_config(smoke: bool = False) -> BenchmarkConfig:
-    """Build BenchmarkConfig on the worker; honour flashinfer_bench defaults."""
+    """Build BenchmarkConfig on the worker.
+
+    Matches the config used in `scripts/run_modal.py` (warmup=3,
+    iter=100, trials=5) so the numbers line up when cupti-python is
+    present on both images.
+    """
     import os
-    defaults = BenchmarkConfig()
     if smoke:
-        return BenchmarkConfig(
-            warmup_runs=1, iterations=1, num_trials=1,
-            rtol=defaults.rtol, atol=defaults.atol,
-        )
-    return BenchmarkConfig(
-        warmup_runs=int(os.environ.get("FIB_WARMUP_RUNS", str(defaults.warmup_runs))),
-        iterations=int(os.environ.get("FIB_ITERATIONS", str(defaults.iterations))),
-        num_trials=int(os.environ.get("FIB_NUM_TRIALS", str(defaults.num_trials))),
-        rtol=float(os.environ.get("FIB_RTOL", str(defaults.rtol))),
-        atol=float(os.environ.get("FIB_ATOL", str(defaults.atol))),
+        return BenchmarkConfig(warmup_runs=1, iterations=1, num_trials=1)
+    kwargs = dict(
+        warmup_runs=int(os.environ.get("FIB_WARMUP_RUNS", "3")),
+        iterations=int(os.environ.get("FIB_ITERATIONS", "100")),
+        num_trials=int(os.environ.get("FIB_NUM_TRIALS", "5")),
     )
+    if "FIB_RTOL" in os.environ:
+        kwargs["rtol"] = float(os.environ["FIB_RTOL"])
+    if "FIB_ATOL" in os.environ:
+        kwargs["atol"] = float(os.environ["FIB_ATOL"])
+    return BenchmarkConfig(**kwargs)
 
 
 def _collect_results(result_trace_set, definition_name: str) -> dict:

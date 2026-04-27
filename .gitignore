@@ -1,6 +1,9 @@
 # FlashInfer Competition
 solution.json
 
+# Local PDF / report build artifacts (mermaid PNG cache, weasyprint output)
+.build_report/
+
 # CUDA build artifacts
 *.o
 *.obj
