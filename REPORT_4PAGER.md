@@ -46,6 +46,8 @@ flowchart LR
     BTT --> Out["topk_indices<br/>[B, K=2048] int32 (DPS)"]
 ```
 
+
+
 The 128 contest workloads span batch 1-16 and `max_num_pages` 5 to 95+, meaning the smallest workloads have ~320 tokens (host launch overhead and TMEM allocation dominate) while the largest exceed 6000 tokens (HBM K-bandwidth and the TMEM-to-register readout dominate). A single kernel cannot serve both regimes well — dispatch by shape is mandatory.
 
 Development was experiment-driven: each submission was benchmarked on Modal B200 with `cupti-python`, and changes were kept or reverted on measured numbers.
@@ -65,6 +67,8 @@ xychart-beta
     y-axis "Mean speedup (x)" 0 --> 1100
     bar [5.6, 6.8, 6.6, 7.4, 12, 410, 850, 964]
 ```
+
+
 
 The flat plateau at v1-v4 (5-7x) corresponds to the period when the old evaluator rejected anything beyond ATen + `torch::topk`. The sharp rise at v7-v8 follows PR #354 and the full custom-CUDA + UMMA + radix-select rewrite. The final ~13% from v9 to v11 comes from CUDA-graph host-overhead elimination on the small-workload bucket. In summary, the pre-#354 evaluator capped the work at ~7x for six weeks; the post-#354 evaluator enabled the full custom CUDA pipeline that delivered 38.4x vs FlashInfer in the remaining two weeks.
 
@@ -95,30 +99,6 @@ flowchart LR
 
 **Warp-specialized persistent kernel** (`max_num_pages >= 64`). 256 threads = producer warpgroup (warps 4-7, 40 regs, drives a 3-stage `cp.async` K pipeline) and math warpgroup (warps 0-3, 232 regs, issues UMMA, reads TMEM, computes ReLU/weighted sum, emits). Q is loaded once and TMEM allocated once per CTA. Per-stage `K_ready[buf]`/`K_done[buf]` mbarriers drive the handoff. A subtle bring-up bug: `cp.async.wait_group` is per-thread, so a producer-warpgroup `bar.sync` is required before the single-thread `mbarrier.arrive` on `K_ready[buf]` to ensure all threads' cp.async writes are visible. Grid is `(num_splits, B)` with `tiles_per_cta` tile-pairs per CTA.
 
-```mermaid
-sequenceDiagram
-    autonumber
-    participant H as HBM (K-cache)
-    participant P as Producer warpgroup<br/>(warps 4-7, 40 regs)
-    participant S as SMEM K[buf]
-    participant M as Math warpgroup<br/>(warps 0-3, 232 regs)
-    participant T as TMEM
-    Note over P,M: Persistent loop over (b, tile-pair) per CTA
-    P->>H: cp.async K[buf=0]
-    P->>P: bar.sync (warpgroup)
-    P->>M: mbarrier.arrive K_ready[0]
-    P->>H: cp.async K[buf=1] (overlap next stage)
-    M-->>M: wait K_ready[0]
-    M->>S: read K[0]
-    M->>T: tcgen05.mma f8f6f4 (issue)
-    M->>T: tcgen05.commit / wait_ld
-    M->>P: mbarrier.arrive K_done[0]
-    M->>M: ReLU(S) * weights, reduce, emit FP16
-    P-->>P: wait K_done[0]
-    P->>H: cp.async K[buf=0] (refill, 3-deep)
-```
-
-
 **Stage-2 radix top-K.** Two-round radix select over 16-bit ordered keys finds the pivot in O(seq_len). Since `seq_len <= 16384` for all benchmarked workloads, ordered keys are cached in a 32 KB SMEM array on round 0 and re-read on subsequent passes (4x fewer HBM reads). Elements greater than the pivot are emitted first, equal-to-pivot fills remaining slots, then the block-table transform runs.
 
 **CUDA graph cache.** `do_bench` clones inputs every iteration so pointers change but shapes (and the dispatch plan) stay fixed. For small workloads where the kernel itself is 2-10 us, ~2.5 us per `cudaLaunchKernel` dominated. The cache is a 32-slot LRU keyed by `(stream, dispatch_path, B, max_num_pages, tiles_per_cta, num_splits, max_len)`. Each call captures a fresh graph with current pointers and tries `cudaGraphExecUpdate` against the cached exec; on cache miss `cudaGraphInstantiate` creates a new exec. Falls back to direct launch if `cudaStreamBeginCapture` fails. This collapsed the fast-path bucket from 6.5 us to 2.3 us mean (**unconfirmed, reason could be just fixing eval to use** `cupti-python`**)**.
@@ -131,20 +111,7 @@ The most useful finding was that the per-tile critical path in the persistent ke
 
 All 128 workloads pass the post-#354 `DsaTopkIndexerEvaluator`. Final benchmarks were collected on Modal B200 with `cupti-python` matching the official evaluator's harness (warmup 3, iterations 100, 5 trials).
 
-## Tools and Languages
-
-
-| Tool / Language                          | Role                                                                                   |
-| ---------------------------------------- | -------------------------------------------------------------------------------------- |
-| CUDA C++ (`sm_100a`)                     | All kernels: UMMA via inline PTX, cp.async pipelines, radix top-K                      |
-| `torch.utils.cpp_extension.load()`       | JIT compilation with `-gencode arch=compute_100a,code=sm_100a`                         |
-| Inline PTX (`tcgen05_ptx.h`)             | TMEM alloc/dealloc, UMMA issue/commit/wait, cp.async, mbarrier, warpgroup reg reconfig |
-| CUTLASS bitfield layouts (`umma_desc.h`) | SmemDescriptor and InstrDescriptor for UMMA, vendored for self-containment             |
-| Python (solution.py)                     | Thin wrapper: JIT-compiles and calls the extension                                     |
-| Modal                                    | Cloud B200 access for benchmarking                                                     |
-| `cupti-python`                           | GPU-side timing (matches official evaluation methodology)                              |
-| Cursor + LLM agents                      | Agent-assisted development (see disclosure below)                                      |
-
+<div style="page-break-before: always;"></div>
 
 ## References
 
@@ -179,6 +146,19 @@ All 128 workloads pass the post-#354 `DsaTopkIndexerEvaluator`. Final benchmarks
 6. NVIDIA CUDA C++ Programming Guide, CUDA graphs and `cudaGraphExecUpdate` - [docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#cuda-graphs](https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#cuda-graphs).
 7. PyTorch JIT C++/CUDA extensions, `torch.utils.cpp_extension.load` - [pytorch.org/docs/stable/cpp_extension.html](https://pytorch.org/docs/stable/cpp_extension.html).
 8. FlashInfer attention library (baseline used by the contest harness) - [github.com/flashinfer-ai/flashinfer](https://github.com/flashinfer-ai/flashinfer).
+
+## Tools and Languages
+
+| Tool / Language                          | Role                                                                                   |
+| ---------------------------------------- | -------------------------------------------------------------------------------------- |
+| CUDA C++ (`sm_100a`)                     | All kernels: UMMA via inline PTX, cp.async pipelines, radix top-K                      |
+| `torch.utils.cpp_extension.load()`       | JIT compilation with `-gencode arch=compute_100a,code=sm_100a`                         |
+| Inline PTX (`tcgen05_ptx.h`)             | TMEM alloc/dealloc, UMMA issue/commit/wait, cp.async, mbarrier, warpgroup reg reconfig |
+| CUTLASS bitfield layouts (`umma_desc.h`) | SmemDescriptor and InstrDescriptor for UMMA, vendored for self-containment             |
+| Python (solution.py)                     | Thin wrapper: JIT-compiles and calls the extension                                     |
+| Modal                                    | Cloud B200 access for benchmarking                                                     |
+| `cupti-python`                           | GPU-side timing (matches official evaluation methodology)                              |
+| Cursor + LLM agents                      | Agent-assisted development (see disclosure below)                                      |
 
 ## AI / Agent-Assisted Development Disclosure
 
