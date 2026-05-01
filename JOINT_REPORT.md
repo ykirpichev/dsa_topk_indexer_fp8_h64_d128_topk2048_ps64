@@ -193,13 +193,13 @@ In summary, the joint submission combines, on both kernels, memory-traffic reduc
 
 ## References
 
-### Submitted source (Top-K Indexer)
+### Submitted source (Top-K Indexer) — pinned to `submission-v11` (commit `31b8f71`) of [`ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64`](https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64)
 
-1. Final kernel implementation - [solution/python/kernel.cu](solution/python/kernel.cu).
-2. Python entry point and JIT compile flags - [solution/python/solution.py](solution/python/solution.py).
-3. Inline PTX wrappers for SM100a - [solution/python/tcgen05_ptx.h](solution/python/tcgen05_ptx.h).
-4. UMMA descriptor layouts (vendored from CUTLASS) - [solution/python/umma_desc.h](solution/python/umma_desc.h).
-5. Submission manifest - [config.toml](config.toml).
+1. Final kernel implementation - [solution/python/kernel.cu](https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64/blob/submission-v11/solution/python/kernel.cu).
+2. Python entry point and JIT compile flags - [solution/python/solution.py](https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64/blob/submission-v11/solution/python/solution.py).
+3. Inline PTX wrappers for SM100a - [solution/python/tcgen05_ptx.h](https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64/blob/submission-v11/solution/python/tcgen05_ptx.h).
+4. UMMA descriptor layouts (vendored from CUTLASS) - [solution/python/umma_desc.h](https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64/blob/submission-v11/solution/python/umma_desc.h).
+5. Submission manifest - [config.toml](https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64/blob/submission-v11/config.toml).
 
 ### Submitted source (Sparse Attention) — pinned to `submission-final-v2` (commit `de475b9`) of [`ykirpichev/dsa_sparse_attention_h16_ckv512_kpe64_topk2048_ps64`](https://github.com/ykirpichev/dsa_sparse_attention_h16_ckv512_kpe64_topk2048_ps64)
 
@@ -209,15 +209,16 @@ In summary, the joint submission combines, on both kernels, memory-traffic reduc
 
 ### Contest documentation
 
-1. Top-K indexer track docs - [README.md](README.md), [FAQ.md](FAQ.md), [EVALUATION.md](EVALUATION.md).
+1. Top-K indexer track docs - [README.md](https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64/blob/submission-v11/README.md), [FAQ.md](https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64/blob/submission-v11/FAQ.md), [EVALUATION.md](https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64/blob/submission-v11/EVALUATION.md).
 2. Sparse attention track docs - [README.md](https://github.com/ykirpichev/dsa_sparse_attention_h16_ckv512_kpe64_topk2048_ps64/blob/submission-final-v2/README.md), [FAQ.md](https://github.com/ykirpichev/dsa_sparse_attention_h16_ckv512_kpe64_topk2048_ps64/blob/submission-final-v2/FAQ.md), [EVALUATION.md](https://github.com/ykirpichev/dsa_sparse_attention_h16_ckv512_kpe64_topk2048_ps64/blob/submission-final-v2/EVALUATION.md), [SUBMISSION.md](https://github.com/ykirpichev/dsa_sparse_attention_h16_ckv512_kpe64_topk2048_ps64/blob/submission-final-v2/SUBMISSION.md).
 
 ### Performance and correctness artifacts
 
-1. Top-K indexer final cupti-timed comparison - [reports/submission-v10.md](reports/submission-v10.md), raw log [reports/submission-v10-raw-cupti.log](reports/submission-v10-raw-cupti.log).
-2. Top-K indexer optimization history and ablations - [IMPROVEMENTS.md](IMPROVEMENTS.md), [experiments/FUTURE_IDEAS.md](experiments/FUTURE_IDEAS.md).
-3. Sparse attention milestone tags - [`submission-v1`](https://github.com/ykirpichev/dsa_sparse_attention_h16_ckv512_kpe64_topk2048_ps64/releases/tag/submission-v1), [`submission-final`](https://github.com/ykirpichev/dsa_sparse_attention_h16_ckv512_kpe64_topk2048_ps64/releases/tag/submission-final), [`submission-final-v2`](https://github.com/ykirpichev/dsa_sparse_attention_h16_ckv512_kpe64_topk2048_ps64/releases/tag/submission-final-v2).
-4. Sparse attention artifacts (cupti-timed comparison report, raw Modal log, graph-cache A/B logs, ablations) live under `artifacts/` in a follow-up branch tied to `submission-final-v2`.
+1. Top-K indexer final cupti-timed comparison report - [reports/submission-v10.md](https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64/blob/writeup/reports/submission-v10.md), raw log [reports/submission-v10-raw-cupti.log](https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64/blob/writeup/reports/submission-v10-raw-cupti.log).
+2. Top-K indexer optimization history and ablations - [IMPROVEMENTS.md](https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64/blob/writeup/IMPROVEMENTS.md), [experiments/FUTURE_IDEAS.md](https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64/blob/writeup/experiments/FUTURE_IDEAS.md).
+3. Top-K indexer milestone tags - [`submission-v1`](https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64/releases/tag/submission-v1) ... [`submission-v10`](https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64/releases/tag/submission-v10), [`submission-v11`](https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64/releases/tag/submission-v11) (full chronological history: [git log](https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64/commits/submission-v11)).
+4. Sparse attention milestone tags - [`submission-v1`](https://github.com/ykirpichev/dsa_sparse_attention_h16_ckv512_kpe64_topk2048_ps64/releases/tag/submission-v1), [`submission-final`](https://github.com/ykirpichev/dsa_sparse_attention_h16_ckv512_kpe64_topk2048_ps64/releases/tag/submission-final), [`submission-final-v2`](https://github.com/ykirpichev/dsa_sparse_attention_h16_ckv512_kpe64_topk2048_ps64/releases/tag/submission-final-v2).
+5. Sparse attention artifacts (cupti-timed comparison report, raw Modal log, graph-cache A/B logs, ablations) live under `artifacts/` in a follow-up branch tied to `submission-final-v2`.
 
 ### External references
 
