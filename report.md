@@ -1,8 +1,8 @@
 # Joint Optimization of a Top-K Indexer and Sparse Attention Kernel for DeepSeek Sparse Attention on NVIDIA Blackwell
 
-**George Karpenkov &nbsp;&nbsp; Yury Kirpichev &nbsp;&nbsp; Mikhail Usvyatsev**
+**George Karpenkov · Yury Kirpichev · Mikhail Usvyatsev**
 
-*Team Wombat — MLSys 2026 FlashInfer AI Kernel Generation Contest, DSA Track (Agent-Assisted Approach), 3rd Place*
+*Team Wombat — MLSys 2026 FlashInfer AI Kernel Generation Contest · DSA Track (Agent-Assisted) · 3rd place*
 
 ---
 
@@ -54,15 +54,13 @@ The single largest constraint on the timeline was the evaluator. Before [flashin
 
 **Post-#354 (Apr 11 onward).** PR #354 introduced `DsaTopkIndexerEvaluator` which compares **sorted value vectors**, vectorizes index validation (duplicates, out-of-range, block-table reachability), and provides a `build_baseline` with correct FP8 packing. Within ten days the solution was rewritten from scratch: pure PyTorch FP8 dequant + bmm indexer (Apr 11–12); custom CUDA top-K with CUB radix sort and FP8 MMA logits via `mma.sync.m16n8k32.e4m3` PTX (Apr 19–20); a full SM100a UMMA rewrite with `tcgen05.mma.cta_group::1`, radix-select top-K, and size-aware dispatch (v7, v8, ~16 µs mean); persistent CTAs, warp specialization, Stage-2 SMEM cache, dispatch retuning and a CUDA graph cache (v9–v11). The final 7.83 µs mean / 38.4× vs. FlashInfer was reached on Apr 24.
 
-![Figure 1. Indexer speedup progression vs. naive reference by submission milestone. The flat plateau at v1–v4 reflects the pre-PR #354 evaluator cap; the cliff at v7–v8 follows the full UMMA + radix-select rewrite.](images/diagrams/diag2.png)
-
-*Figure 1. The flat plateau at v1–v4 corresponds to the period when the old evaluator capped progress; the sharp rise at v7–v8 follows PR #354 and the UMMA + radix-select rewrite; the final 13% from v9 to v11 comes from CUDA-graph overhead elimination.*
+![**Figure 1.** Indexer mean speedup vs. the naive PyTorch reference, by submission milestone. The flat plateau at v1–v4 reflects the pre-PR&nbsp;#354 evaluator cap (≈7×); the cliff at v7–v8 follows the full UMMA&nbsp;+&nbsp;radix-select rewrite; the final ≈13% from v9 to v11 comes from CUDA-graph overhead elimination on the small-workload bucket.](images/diagrams/diag2.png)
 
 ### 4.2 Final Indexer Design
 
 A host dispatcher selects between three Stage-1 variants plus a fast-path bypass; Stage-2 is a radix top-K; a hand-rolled CUDA graph cache wraps the whole launch sequence.
 
-![Figure 2. Top-K Indexer dispatch architecture.](images/diagrams/diag3.png)
+![**Figure 2.** Top-K Indexer dispatch architecture: a host predicate selects between a fast path, a 1-page-per-CTA short kernel, and a warp-specialized persistent kernel; all three feed a Stage-2 radix top-K, a block-table transform, and a CUDA-graph-cached launch sequence.](images/diagrams/diag3.png)
 
 **Fast path** (`max_num_pages ≤ 32`). When the entire paged context fits within K = 2048, every position is in the top-K, so the output is just a block-table-transformed `[0, seq_len)` padded with −1, independent of Q, K, and weights. Implementation: 128 threads with vectorized `int4` stores, ~2.3 µs including graph replay overhead.
 
@@ -92,7 +90,7 @@ Every micro-optimization adding work to the post-`wait_ld` emit path regressed t
 
 Development proceeded through eight phases. Three principles survived to the final solution:
 
-![Figure 3. Sparse Attention optimization phases. Green boxes were kept in the final solution; red boxes were tried and reverted.](images/diagrams/diag4.png)
+![**Figure 3.** Sparse Attention optimization phases (P0–P7) in chronological order, snake layout. Green boxes were kept in the final solution; red boxes were measured, found unhelpful, and reverted.](images/diagrams/diag4.png)
 
 1. **Reduce repeated HBM traffic.** `v5_fused` collapsed logit computation, softmax, and value accumulation into a single-pass online-softmax K loop that consumes each sparse KV tile exactly once, eliminating a full `TOPK`-length intermediate logit array.
 2. **BF16 only at the output boundary.** Intermediate logits and split-K partials in BF16 caused intermittent `abs_err` spikes. The final split-K path uses FP32 partial buffers and converts to BF16 only on the final write.
@@ -100,7 +98,7 @@ Development proceeded through eight phases. Three principles survived to the fin
 
 ### 5.2 Final Attention Design
 
-![Figure 4. Sparse Attention dispatch architecture.](images/diagrams/diag5.png)
+![**Figure 4.** Sparse Attention dispatch architecture: an `H == 16` predicate gates a GPU density pre-scan; high-density shapes use a CTA-per-token WMMA path, low-density shapes fall back to the legacy grid; an underfill check then routes between a single-pass kernel and a split-K kernel with reducer; all paths terminate in a CUDA-graph-cached launch sequence.](images/diagrams/diag5.png)
 
 **Legacy kernel.** One CTA per `(token, head)`. Sparse indices are pre-scanned with vectorized `int4` loads; invalid entries are canonicalized to −1 and zero-filled in shared memory rather than fetched. The K loop is fused (load tile → logits → online softmax update → value accumulate), keeping memory traffic close to one use per tile.
 
@@ -118,9 +116,9 @@ This is the **opposite finding** to the indexer: the indexer's Stage-1 has a squ
 
 ## 6. Shared Infrastructure: CUDA Graph Cache
 
-Both kernels use the same hand-rolled in-extension graph cache. The contest `do_bench` harness clones inputs every iteration so pointers change but shapes (and the dispatch plan) stay fixed. For small workloads where the kernel itself is single-digit microseconds, ~2.5 µs per `cudaLaunchKernel` dominated. The cache is keyed by `(stream, dispatch_path, shape, scale_bits, split_factor, ...)` — no tensor pointers. Each call captures a fresh graph with current pointers and tries `cudaGraphExecUpdate` against the cached exec; on topology mismatch the entry is re-instantiated. Falls back to direct launch if `cudaStreamBeginCapture` fails. In the indexer this collapsed the fast-path bucket from 6.5 µs to 2.3 µs mean.
+Both kernels use the same hand-rolled in-extension graph cache. The contest `do_bench` harness clones inputs every iteration, so pointers change but shapes (and the dispatch plan) stay fixed. For small workloads where the kernel itself is single-digit microseconds, ≈2.5 µs per `cudaLaunchKernel` dominates total latency. The cache is keyed by `(stream, dispatch_path, shape, scale_bits, split_factor, …)` — explicitly *not* by tensor pointers. Each call captures a fresh graph with current pointers and tries `cudaGraphExecUpdate` against the cached executable; on topology mismatch the entry is re-instantiated. The wrapper falls back to a direct kernel launch if `cudaStreamBeginCapture` fails. In the indexer, this transformation collapsed the fast-path bucket from 6.5 µs to 2.3 µs mean.
 
-The cache state machine: on kernel entry, capture a new graph via `cudaStreamBeginCapture`/`cudaStreamEndCapture`; look up the cache by shape key; on hit, call `cudaGraphExecUpdate` to redirect the existing exec's node pointers to the new graph; on success, call `cudaGraphLaunch`; on topology mismatch or miss, call `cudaGraphInstantiate` to create a new exec and cache it.
+![**Figure 5.** CUDA-graph cache state machine. On every call we capture the current launch sequence into a graph, look up the cached executable by shape key, and either redirect node pointers in-place via `cudaGraphExecUpdate` (hit) or instantiate a fresh executable (miss / topology mismatch); the executable is then replayed via `cudaGraphLaunch`.](images/diagrams/diag6.png)
 
 ## 7. Evaluation
 
@@ -148,12 +146,12 @@ Development benchmarks were collected on Modal B200 with `cupti-python` (warmup 
 
 ### 7.3 Per-Workload Latency
 
-Official per-workload submission latency (milliseconds), keyed by public workload UUID.
+Official per-workload submission latency (milliseconds), measured on the contest harness.
 
-**DSA Attention (23 workloads)**
+**DSA Attention (23 workloads).**
 
-| UUID | Latency (ms) | UUID | Latency (ms) | UUID | Latency (ms) |
-|:----:|:------------:|:----:|:------------:|:----:|:------------:|
+| UUID | ms | UUID | ms | UUID | ms |
+|:-----|:----:|:-----|:----:|:-----|:----:|
 | `0c23b10c` | 0.003 | `9f3f891b` | 0.019 | `232ed014` | 0.051 |
 | `fc85411e` | 0.004 | `05f6de65` | 0.023 | `7a389715` | 0.051 |
 | `9d4a5f21` | 0.004 | `4c46a94b` | 0.036 | `2207f0fd` | 0.051 |
@@ -163,7 +161,21 @@ Official per-workload submission latency (milliseconds), keyed by public workloa
 | `e6b849f2` | 0.008 | `02d6ae9c` | 0.051 | `ae4219a9` | 0.051 |
 | `68d6817d` | 0.009 | `564007ac` | 0.052 | | |
 
-**DSA Indexer latency distribution (128 workloads): 69 workloads at 0.002 ms, 14 at 0.011 ms, 10 at 0.012 ms, 8 at 0.013 ms, 5 at 0.014 ms, 5 at 0.016 ms, 10 at 0.017 ms, 6 at 0.018 ms, 1 at 0.017–0.018 ms.** Full per-UUID table is available in the supplemental artifacts at [reports/submission-v10.md](https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64/blob/writeup/reports/submission-v10.md).
+**DSA Indexer (128 workloads).** Latency distribution:
+
+| Latency bucket | Workloads |
+|:---|:---:|
+| 0.002 ms | 69 |
+| 0.011 ms | 14 |
+| 0.012 ms | 10 |
+| 0.013 ms | 8 |
+| 0.014 ms | 5 |
+| 0.016 ms | 5 |
+| 0.017 ms | 10 |
+| 0.018 ms | 6 |
+| 0.017–0.018 ms (other) | 1 |
+
+The full per-UUID indexer table is available in the supplemental artifacts at [`reports/submission-v10.md`](https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64/blob/writeup/reports/submission-v10.md).
 
 ## 8. Discussion
 
@@ -197,44 +209,44 @@ Both submissions were agent-assisted (Cursor + Claude/GPT-family LLMs); directio
 
 ## References
 
-[1] T. Dao, D. Fu, S. Ermon, A. Rudra, C. Ré. "FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness." *NeurIPS*, 2022. arXiv:2205.14135.
+<p>[1] T. Dao, D. Fu, S. Ermon, A. Rudra, C. Ré. &ldquo;FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness.&rdquo; <em>NeurIPS</em>, 2022. arXiv:2205.14135.</p>
 
-[2] T. Dao. "FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning." *ICLR*, 2024. arXiv:2307.08691.
+<p>[2] T. Dao. &ldquo;FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning.&rdquo; <em>ICLR</em>, 2024. arXiv:2307.08691.</p>
 
-[3] T. Dao, D. Haziza, F. Massa, G. Sizov. "Flash-Decoding for long-context inference." *CRFM Blog*, Stanford, Oct 2023.
+<p>[3] T. Dao, D. Haziza, F. Massa, G. Sizov. &ldquo;Flash-Decoding for long-context inference.&rdquo; <em>CRFM Blog</em>, Stanford, Oct. 2023.</p>
 
-[4] T. Dao et al. "FlashAttention-4." arXiv:2603.05451, Mar 2026.
+<p>[4] T. Dao et al. &ldquo;FlashAttention-4.&rdquo; arXiv:2603.05451, Mar. 2026.</p>
 
-[5] NVIDIA. "CUTLASS: CUDA Templates for Linear Algebra Subroutines." 2024. `tcgen05.mma.kind::f8f6f4`, cta_group=2, SmemDescriptor/InstrDescriptor layouts.
+<p>[5] NVIDIA. &ldquo;CUTLASS: CUDA Templates for Linear Algebra Subroutines.&rdquo; 2024. <code>tcgen05.mma.kind::f8f6f4</code>, <code>cta_group=2</code>, <code>SmemDescriptor</code>/<code>InstrDescriptor</code> layouts.</p>
 
-[6] Colfax Research. "Writing GEMM Kernels Using Tensor Memory For Blackwell GPUs." 2025.
+<p>[6] Colfax Research. &ldquo;Writing GEMM Kernels Using Tensor Memory For Blackwell GPUs.&rdquo; 2025.</p>
 
-[7] DeepGEMM contributors. `sm100_fp8_paged_mqa_logits.cuh` — reference production kernel. 2026.
+<p>[7] DeepGEMM contributors. <code>sm100_fp8_paged_mqa_logits.cuh</code> — reference production kernel. 2026.</p>
 
-[8] NVIDIA. *CUDA C++ Programming Guide*. CUDA Graphs / `cudaGraphExecUpdate`; `nvcuda::wmma`. 2025.
+<p>[8] NVIDIA. <em>CUDA C++ Programming Guide.</em> CUDA Graphs / <code>cudaGraphExecUpdate</code>; <code>nvcuda::wmma</code>. 2025.</p>
 
-[9] Z. Ye, L. Chen, R. Lai, W. Lin, Y. She, S. Sun, B. Zhang, H. Shi. "FlashInfer: Efficient and Customizable Attention Engine for LLM Inference Serving." *MLSys*, 2025.
+<p>[9] Z. Ye, L. Chen, R. Lai, W. Lin, Y. She, S. Sun, B. Zhang, H. Shi. &ldquo;FlashInfer: Efficient and Customizable Attention Engine for LLM Inference Serving.&rdquo; <em>MLSys</em>, 2025.</p>
 
-[10] NVIDIA. *PTX ISA Reference*, `tcgen05.mma`, `tcgen05.alloc`, `cp.async`, mbarrier. 2025.
+<p>[10] NVIDIA. <em>PTX ISA Reference</em>, <code>tcgen05.mma</code>, <code>tcgen05.alloc</code>, <code>cp.async</code>, mbarrier. 2025.</p>
 
-[11] DeepSeek-AI. "DeepSeek-V2: A Strong, Economical, and Efficient Mixture-of-Experts Language Model." arXiv:2405.04434, 2024.
+<p>[11] DeepSeek-AI. &ldquo;DeepSeek-V2: A Strong, Economical, and Efficient Mixture-of-Experts Language Model.&rdquo; arXiv:2405.04434, 2024.</p>
 
-[12] PyTorch contributors. `torch.utils.cpp_extension.load` — JIT C++/CUDA extension compilation. 2025.
+<p>[12] PyTorch contributors. <code>torch.utils.cpp_extension.load</code> — JIT C++/CUDA extension compilation. 2025.</p>
 
-[13] W. Merrill et al. / NVIDIA. CUB: device-wide and block-wide radix sort and selection. 2025.
+<p>[13] W. Merrill et al. / NVIDIA. CUB: device-wide and block-wide radix sort and selection. 2025.</p>
 
-[14] S. Rajbhandari, J. Rasley, O. Ruwase, Y. He. "ZeRO: Memory Optimizations Toward Training Trillion Parameter Models." *SC*, 2020.
+<p>[14] S. Rajbhandari, J. Rasley, O. Ruwase, Y. He. &ldquo;ZeRO: Memory Optimizations Toward Training Trillion Parameter Models.&rdquo; <em>SC</em>, 2020.</p>
 
-[15] A. Katharopoulos, A. Vyas, N. Pappas, F. Fleuret. "Transformers are RNNs: Fast Autoregressive Transformers with Linear Attention." *ICML*, 2020.
+<p>[15] A. Katharopoulos, A. Vyas, N. Pappas, F. Fleuret. &ldquo;Transformers are RNNs: Fast Autoregressive Transformers with Linear Attention.&rdquo; <em>ICML</em>, 2020.</p>
 
-[16] FlashInfer contributors. MLSys 2026 FlashInfer AI Kernel Generation Contest entry definitions. 2026. [github.com/flashinfer-ai/mlsys26-contest](https://github.com/flashinfer-ai/mlsys26-contest).
+<p>[16] FlashInfer contributors. MLSys 2026 FlashInfer AI Kernel Generation Contest entry definitions. 2026. <a href="https://github.com/flashinfer-ai/mlsys26-contest">github.com/flashinfer-ai/mlsys26-contest</a>.</p>
 
-[17] flashinfer-bench PR #354: `DsaTopkIndexerEvaluator` for correct tie-breaking comparison. [github.com/flashinfer-ai/flashinfer-bench/pull/354](https://github.com/flashinfer-ai/flashinfer-bench/pull/354).
+<p>[17] flashinfer-bench PR #354: <code>DsaTopkIndexerEvaluator</code> for correct tie-breaking comparison. <a href="https://github.com/flashinfer-ai/flashinfer-bench/pull/354">github.com/flashinfer-ai/flashinfer-bench/pull/354</a>.</p>
 
-[18] Y. Kirpichev. DSA Top-K Indexer — submitted source (tag `submission-v11`, commit `31b8f71`). [github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64](https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64).
+<p>[18] Y. Kirpichev. DSA Top-K Indexer — submitted source (tag <code>submission-v11</code>, commit <code>31b8f71</code>). <a href="https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64">github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64</a>.</p>
 
-[19] Y. Kirpichev. DSA Sparse Attention — submitted source (tag `submission-final-v2`, commit `de475b9`). [github.com/ykirpichev/dsa_sparse_attention_h16_ckv512_kpe64_topk2048_ps64](https://github.com/ykirpichev/dsa_sparse_attention_h16_ckv512_kpe64_topk2048_ps64).
+<p>[19] Y. Kirpichev. DSA Sparse Attention — submitted source (tag <code>submission-final-v2</code>, commit <code>de475b9</code>). <a href="https://github.com/ykirpichev/dsa_sparse_attention_h16_ckv512_kpe64_topk2048_ps64">github.com/ykirpichev/dsa_sparse_attention_h16_ckv512_kpe64_topk2048_ps64</a>.</p>
 
-[20] Y. Kirpichev. Post-deadline routing study: density cache on/off vs. sync-free shape dispatch. [artifacts/density_cache_vs_shape_dispatch/REPORT.md](https://github.com/ykirpichev/dsa_sparse_attention_h16_ckv512_kpe64_topk2048_ps64/blob/reports/submission-final-v2-draft/artifacts/density_cache_vs_shape_dispatch/REPORT.md).
+<p>[20] Y. Kirpichev. Post-deadline routing study: density cache on/off vs. sync-free shape dispatch. <a href="https://github.com/ykirpichev/dsa_sparse_attention_h16_ckv512_kpe64_topk2048_ps64/blob/reports/submission-final-v2-draft/artifacts/density_cache_vs_shape_dispatch/REPORT.md">artifacts/density_cache_vs_shape_dispatch/REPORT.md</a>.</p>
 
-[21] Y. Kirpichev. DSA track joint process write-up. [final_writeup.md](https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64/blob/writeup/final_writeup.md).
+<p>[21] Y. Kirpichev. DSA track joint process write-up. <a href="https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64/blob/writeup/final_writeup.md">final_writeup.md</a>.</p>
