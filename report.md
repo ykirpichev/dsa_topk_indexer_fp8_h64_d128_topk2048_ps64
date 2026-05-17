@@ -1,6 +1,6 @@
 # Joint Optimization of a Top-K Indexer and Sparse Attention Kernel for DeepSeek Sparse Attention on NVIDIA Blackwell
 
-**Yury Kirpichev**
+**George Karpenkov · Yury Kirpichev · Mikhail Usvyatsev**
 
 *MLSys 2026 FlashInfer AI Kernel Generation Contest · DSA Track (Agent-Assisted) · 3rd place*
 
