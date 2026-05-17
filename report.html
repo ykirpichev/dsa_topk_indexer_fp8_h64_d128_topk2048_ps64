@@ -187,7 +187,7 @@ code {
 
 <div class="title-block">
   <h1>Joint Optimization of a Top-K Indexer and Sparse Attention Kernel for DeepSeek Sparse Attention on NVIDIA Blackwell</h1>
-  <p class="authors">Top-K Indexer problem statement.** For each batch row b, the operator computes FP8 dot products `S[h] = Σ_d Q[b,h,d] · K[page,slot,d]` over H=64 heads and D=128 dimensions with FP32 accumulation, weighted ReLU logits `logit[b,t] = scale[page,slot] · Σ_h ReLU(S[h]) · weights[b,h]` for every position in `[0, seq_lens[b])`, top-K = 2048 selection, and a `block_table` transform back to physical page slots. The KV cache is FP8 with per-slot FP32 scales (132 bytes/slot, 64 slots/page); outputs are pre-allocated (DPS).</p>
+  <p class="authors">Yury Kirpichev</p>
   <p class="venue">MLSys 2026 FlashInfer AI Kernel Generation Contest · DSA Track (Agent-Assisted) · 3rd place</p>
 </div>
 

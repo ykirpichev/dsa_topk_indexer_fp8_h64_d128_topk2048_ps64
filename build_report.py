@@ -398,8 +398,9 @@ def build_html(md_path: Path) -> str:
     title_line = next((l for l in lines if l.startswith("# ")), "")
     title = title_line.lstrip("# ").strip()
 
-    # Authors line (bold)
-    authors_line = next((l for l in lines if l.startswith("**") and "·" in l), "")
+    # Authors line: first **...** line after the title
+    title_idx = next((i for i, l in enumerate(lines) if l.startswith("# ")), 0)
+    authors_line = next((l for l in lines[title_idx:] if l.startswith("**") and l.endswith("**")), "")
     authors = authors_line.strip("*").strip()
 
     # Venue line (italic)
