@@ -2,7 +2,7 @@
 
 **George Karpenkov · Yury Kirpichev · Mikhail Usvyatsev**
 
-*Team Wombat — MLSys 2026 FlashInfer AI Kernel Generation Contest · DSA Track (Agent-Assisted) · 3rd place*
+*MLSys 2026 FlashInfer AI Kernel Generation Contest · DSA Track (Agent-Assisted) · 3rd place*
 
 ---
 
