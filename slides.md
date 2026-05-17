@@ -118,7 +118,7 @@ style: |
   }
   section.thanks h2 { font-size: 2.2em; color: #0f172a; margin-bottom: 8px; }
   section.thanks .contact { font-size: 0.85em; color: #64748b; margin-bottom: 32px; }
-  section.thanks .orgs { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 24px; width: 100%; margin-bottom: 28px; }
+  section.thanks .orgs { display: grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap: 18px; width: 100%; margin-bottom: 28px; }
   section.thanks .org { background: #fff; border: 1px solid #e2e8f0; border-radius: 12px; padding: 16px; display: flex; flex-direction: column; align-items: center; gap: 10px; }
   section.thanks .org img { height: 36px; object-fit: contain; }
   section.thanks .org .label { font-size: 0.72em; color: #64748b; line-height: 1.4; }
@@ -342,15 +342,21 @@ github.com/ykirpichev/dsa_sparse_attention_h16_ckv512_kpe64_topk2048_ps64
 <div class="orgs">
 
 <div class="org">
+<img src="images/mlsys-logo.svg" alt="MLSys" />
+<div class="role">Conference Host</div>
+<div class="label">MLSys 2026<br>Bellevue, WA · May 18–22</div>
+</div>
+
+<div class="org">
 <img src="images/nvidia-logo.svg" alt="NVIDIA" />
 <div class="role">Contest Organizer</div>
-<div class="label">FlashInfer AI Kernel Generation Contest<br>Competition Chair: Vartika Singh</div>
+<div class="label">FlashInfer AI Kernel Generation Contest</div>
 </div>
 
 <div class="org">
 <img src="images/flashinfer-logo.png" alt="FlashInfer" />
 <div class="role">Benchmark & Baseline</div>
-<div class="label">FlashInfer team &amp; flashinfer-bench<br>Zihao Ye, Lequn Chen, Ruihang Lai et al.</div>
+<div class="label">FlashInfer team &amp; flashinfer-bench</div>
 </div>
 
 <div class="org">
@@ -362,5 +368,5 @@ github.com/ykirpichev/dsa_sparse_attention_h16_ckv512_kpe64_topk2048_ps64
 </div>
 
 <div class="links">
-MLSys 2026 · Santa Clara · mlsys.org &nbsp;·&nbsp; mlsys26.flashinfer.ai
+mlsys.org &nbsp;·&nbsp; mlsys26.flashinfer.ai
 </div>
