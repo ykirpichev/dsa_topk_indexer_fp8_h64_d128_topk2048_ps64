@@ -364,16 +364,16 @@ code {
 
 /* ── References — inside body-columns, so inherits 2-column flow ─────── */
 .references-inner {
-    font-size: 6.5pt;
-    line-height: 1.2;
+    font-size: 7.5pt;
+    line-height: 1.42;
 }
 .references-inner h2 {
     font-size: 9pt;
-    margin: 5pt 0 2pt 0;
+    margin: 6pt 0 4pt 0;
     break-after: avoid;
 }
 .references-inner p {
-    margin-bottom: 1.5pt;
+    margin-bottom: 13pt;
     break-inside: avoid;
 }
 
