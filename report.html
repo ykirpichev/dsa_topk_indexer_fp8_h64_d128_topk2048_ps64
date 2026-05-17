@@ -187,7 +187,7 @@ code {
 
 <div class="title-block">
   <h1>Joint Optimization of a Top-K Indexer and Sparse Attention Kernel for DeepSeek Sparse Attention on NVIDIA Blackwell</h1>
-  <p class="authors">George Karpenkov · Yury Kirpichev · Mikhail Usvyatsev</p>
+  <p class="authors">Top-K Indexer problem statement.** For each batch row b, the operator computes FP8 dot products `S[h] = Σ_d Q[b,h,d] · K[page,slot,d]` over H=64 heads and D=128 dimensions with FP32 accumulation, weighted ReLU logits `logit[b,t] = scale[page,slot] · Σ_h ReLU(S[h]) · weights[b,h]` for every position in `[0, seq_lens[b])`, top-K = 2048 selection, and a `block_table` transform back to physical page slots. The KV cache is FP8 with per-slot FP32 scales (132 bytes/slot, 64 slots/page); outputs are pre-allocated (DPS).</p>
   <p class="venue">MLSys 2026 FlashInfer AI Kernel Generation Contest · DSA Track (Agent-Assisted) · 3rd place</p>
 </div>
 
@@ -331,6 +331,9 @@ code {
 <p><strong>FlashAttention family</strong> [1, 2] established IO-aware attention with online softmax. Our fused K-loop in the attention kernel applies the same principle. <strong>Flash-Decoding</strong> [3] introduced split-K parallelism for multi-head decoding; our split-K path for sparse attention is a direct application. <strong>FlashAttention-4</strong> [4] documents asymmetric scaling, 2-CTA MMA, and TMEM intermediates on Blackwell, providing context for our UMMA and TMEM decisions. The <strong>DeepGEMM</strong> <code>sm100_fp8_paged_mqa_logits.cuh</code> reference kernel [7] uses warp specialization and TMA pipelines for a related FP8 scoring problem; our persistent kernel shares structural similarities. The <strong>CUB</strong> [12] radix sort and selection primitives provided a baseline for our custom radix-select Stage-2. <strong>CUTLASS</strong> [5] Blackwell documentation and <code>umma_desc.h</code> bitfield layouts were vendored for self-containment. The <strong>FlashInfer</strong> library [9] is the contest baseline. </p>
 <h2>10. Conclusion</h2>
 <p>We presented joint optimizations of a paged FP8 Top-K Indexer and Sparse Attention kernel for DSA decoding on NVIDIA B200, achieving 38.4× and 14.18× speedups versus the FlashInfer + DeepGEMM reference baseline and a 28.96× track-level geometric-mean speedup in the MLSys 2026 contest. The dominant performance levers — shape-aware dispatch, fused loops, and CUDA graph caching — emerged independently in both kernels from experiment-driven optimization against the same harness. Negative results were as informative as positive ones: TMEM readout, not MMA compute, is the critical path in the FP8 indexer; WMMA, not UMMA, is the correct tensor-core interface for the sparse attention value accumulation. Both findings contradict a naive "use the newest hardware feature" heuristic and reinforce the importance of direct measurement over architectural intuition. </p>
+<hr>
+<h2>Acknowledgements</h2>
+<p>The author thanks George Karpenkov and Mikhail Usvyatsev, teammates in the MLSys 2026 FlashInfer Kernel Generation Contest, for discussions and support throughout the contest. </p>
 <hr>
 </div>
 

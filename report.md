@@ -1,6 +1,6 @@
 # Joint Optimization of a Top-K Indexer and Sparse Attention Kernel for DeepSeek Sparse Attention on NVIDIA Blackwell
 
-**George Karpenkov · Yury Kirpichev · Mikhail Usvyatsev**
+**Yury Kirpichev**
 
 *MLSys 2026 FlashInfer AI Kernel Generation Contest · DSA Track (Agent-Assisted) · 3rd place*
 
@@ -200,6 +200,12 @@ The pre-#354 evaluator capped indexer progress at ~7× for six weeks. The post-#
 ## 10. Conclusion
 
 We presented joint optimizations of a paged FP8 Top-K Indexer and Sparse Attention kernel for DSA decoding on NVIDIA B200, achieving 38.4× and 14.18× speedups versus the FlashInfer + DeepGEMM reference baseline and a 28.96× track-level geometric-mean speedup in the MLSys 2026 contest. The dominant performance levers — shape-aware dispatch, fused loops, and CUDA graph caching — emerged independently in both kernels from experiment-driven optimization against the same harness. Negative results were as informative as positive ones: TMEM readout, not MMA compute, is the critical path in the FP8 indexer; WMMA, not UMMA, is the correct tensor-core interface for the sparse attention value accumulation. Both findings contradict a naive "use the newest hardware feature" heuristic and reinforce the importance of direct measurement over architectural intuition.
+
+---
+
+## Acknowledgements
+
+The author thanks George Karpenkov and Mikhail Usvyatsev, teammates in the MLSys 2026 FlashInfer Kernel Generation Contest, for discussions and support throughout the contest.
 
 ---
 
