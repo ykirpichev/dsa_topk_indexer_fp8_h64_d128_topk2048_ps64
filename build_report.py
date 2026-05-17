@@ -209,14 +209,14 @@ CSS = """
 /* ── Page setup ─────────────────────────────────────────────────────── */
 @page {
     size: letter;
-    margin: 12mm 13mm 12mm 13mm;
+    margin: 14mm 14mm 14mm 14mm;
 }
 
 /* ── Base typography ─────────────────────────────────────────────────── */
 body {
     font-family: "Linux Libertine O", "Palatino Linotype", Georgia, serif;
     font-size: 9pt;
-    line-height: 1.29;
+    line-height: 1.38;
     color: #111;
     margin: 0; padding: 0;
 }
@@ -362,34 +362,24 @@ code {
     padding: 0 2pt;
 }
 
-/* ── References — inside body-columns, so inherits 2-column flow ─────── */
-.references-inner {
+/* ── References ─────────────────────────────────────────────────────── */
+.references {
+    column-count: 2;
+    column-gap: 14pt;
     font-size: 7.5pt;
-    line-height: 1.42;
 }
-.references-inner h2 {
-    font-size: 9pt;
-    margin: 6pt 0 4pt 0;
-    break-after: avoid;
-}
-.references-inner p {
-    margin-bottom: 13pt;
+.references p {
+    margin-bottom: 3pt;
     break-inside: avoid;
 }
 
-/* ── Disclosure — styled as a callout but stays in column flow ───────── */
-.body-columns .disclosure-heading {
-    font-size: 8.5pt;
-    font-weight: bold;
-    margin: 5pt 0 2pt 0;
-    break-after: avoid;
-    color: #333;
-}
-.body-columns p.disclosure-body {
-    font-size: 7.5pt;
-    padding-left: 6pt;
-    border-left: 1.5pt solid #bbb;
-    color: #444;
+/* ── Disclosure block ────────────────────────────────────────────────── */
+.disclosure {
+    font-size: 8pt;
+    margin: 6pt 0;
+    padding: 4pt 6pt;
+    border-left: 2pt solid #aaa;
+    break-inside: avoid;
 }
 """
 
@@ -449,10 +439,9 @@ def build_html(md_path: Path) -> str:
     except StopIteration:
         ref_start = len(lines)
 
-    # Body: from after the second "---" all the way to references
-    # (includes the Disclosure section so it flows in the 2-column layout)
+    # Body: from after the second "---" to before the disclosure (or references)
     body_start = abs_end + 1
-    body_end   = ref_start
+    body_end   = disc_start if disc_start > 0 else ref_start
 
     body_md = "\n".join(lines[body_start:body_end]).strip()
 
@@ -461,31 +450,25 @@ def build_html(md_path: Path) -> str:
 
     body_html = md_to_html(body_md)
 
+    # Disclosure
+    if disc_start > 0:
+        disc_md = "\n".join(lines[disc_start : disc_end]).strip()
+        disc_html = md_to_html(disc_md)
+    else:
+        disc_html = ""
+
     # References
     ref_md = "\n".join(lines[ref_start:]).strip()
     ref_html = md_to_html(ref_md)
 
-    # ── Post-process: style the disclosure heading and paragraphs ──────────
-    # The disclosure is now inside body-columns; give it lighter styling.
+    # ── Post-process: make wide tables span columns ─────────────────────
+    # Tables in the per-workload section (UUID tables) should span both cols
     body_html = re.sub(
-        r'<h2>(AI\s*/\s*Agent-Assisted[^<]*)</h2>',
-        r'<h2 class="disclosure-heading">\1</h2>',
+        r'(<table>)(.*?)(</table>)',
+        lambda m: m.group(0),  # leave as-is; Chrome handles break nicely
         body_html,
+        flags=re.DOTALL,
     )
-    # Mark paragraphs that follow the disclosure heading
-    def mark_disclosure_paras(html: str) -> str:
-        marker = '<h2 class="disclosure-heading">'
-        if marker not in html:
-            return html
-        before, _, after = html.partition(marker)
-        # Find the next h2 after the disclosure heading
-        parts = re.split(r'(?=<h2(?!\s+class="disclosure))', after, maxsplit=1)
-        disc_section = parts[0]
-        rest = parts[1] if len(parts) > 1 else ""
-        disc_section = re.sub(r'<p>', '<p class="disclosure-body">', disc_section)
-        return before + marker + disc_section + rest
-
-    body_html = mark_disclosure_paras(body_html)
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -516,9 +499,12 @@ def build_html(md_path: Path) -> str:
 
 <div class="body-columns">
 {body_html}
-<div class="references-inner">
-{ref_html}
 </div>
+
+{"<div class='disclosure'>" + disc_html + "</div>" if disc_html else ""}
+
+<div class="references">
+{ref_html}
 </div>
 
 </body>

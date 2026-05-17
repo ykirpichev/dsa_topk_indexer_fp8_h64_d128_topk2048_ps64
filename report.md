@@ -48,7 +48,7 @@ Development was **agent-assisted**: Cursor with Claude- and GPT-family LLMs was 
 
 ### 4.1 Evaluator Constraint (Pre vs. Post PR #354)
 
-The single largest constraint on the timeline was the evaluator. Before [flashinfer-bench PR #354](https://github.com/flashinfer-ai/flashinfer-bench/pull/354) (merged Apr 10, 2026) there was no dedicated `DsaTopkIndexerEvaluator`. The default evaluator compared **raw output index vectors** element-wise. When multiple positions tie on logit value, any custom top-K — radix select, CUB sort, atomic emit — produced a valid top-K set that the evaluator rejected as `INCORRECT_NUMERICAL` because the index ordering did not match the reference's tie-breaking. In practice the only top-K path that reliably passed was `torch::topk`.
+The single largest constraint on the timeline was the evaluator. Before flashinfer-bench PR #354 [14] (merged Apr 10, 2026) there was no dedicated `DsaTopkIndexerEvaluator`. The default evaluator compared **raw output index vectors** element-wise. When multiple positions tie on logit value, any custom top-K — radix select, CUB sort, atomic emit — produced a valid top-K set that the evaluator rejected as `INCORRECT_NUMERICAL` because the index ordering did not match the reference's tie-breaking. In practice the only top-K path that reliably passed was `torch::topk`.
 
 **Pre-#354 (v1–v4, Mar 29 – Apr 6), ceiling ~7×.** The early kernel was constrained to ATen ops: a fused FP8 page-gather + dequant CUDA kernel, then `torch::bmm` for Q·K, ATen `relu` + weighted sum, and `torch::topk`. More aggressive ideas (fused Q·K dot products, per-row scoring, BF16 reduction, chunked GEMM with running top-K) were tried and reverted because they broke index-level agreement.
 
@@ -64,7 +64,7 @@ A host dispatcher selects between three Stage-1 variants plus a fast-path bypass
 
 **Fast path** (`max_num_pages ≤ 32`). When the entire paged context fits within K = 2048, every position is in the top-K, so the output is just a block-table-transformed `[0, seq_len)` padded with −1, independent of Q, K, and weights. Implementation: 128 threads with vectorized `int4` stores, ~2.3 µs including graph replay overhead.
 
-**Short kernel** (`33 ≤ max_num_pages < 64`). One CTA per page, 128 threads. Q and K are loaded into 128B-swizzled SMEM, TMEM is allocated, UMMA is issued with 4 K-iterations on the `(M=128, N=64, K=32)` shape, FP32 accumulators are read back, ReLU-weighted logits are computed, and FP16 is emitted.
+**Short kernel** (`33 ≤ max_num_pages < 64`). One CTA per page, 128 threads. Q and K are loaded into 128B-swizzled SMEM, TMEM is allocated, UMMA is issued with 4 K-iterations on the `(M=128, N=64, K=32)` shape, FP32 accumulators are read back, ReLU-weighted logits are computed, and FP32 logits are emitted.
 
 **Warp-specialized persistent kernel** (`max_num_pages ≥ 64`). 256 threads = producer warpgroup (warps 4–7, 40 registers, 3-stage `cp.async` K pipeline) and math warpgroup (warps 0–3, 232 registers, issues UMMA, reads TMEM, computes ReLU/weighted sum, emits). Q is loaded once and TMEM is allocated once per CTA. Per-stage `K_ready[buf]`/`K_done[buf]` mbarriers drive the handoff. A subtle bring-up issue: `cp.async.wait_group` is per-thread, so a producer-warpgroup `bar.sync` is required before the single-thread `mbarrier.arrive` on `K_ready[buf]` to ensure all threads' `cp.async` writes are visible.
 
@@ -72,7 +72,7 @@ A host dispatcher selects between three Stage-1 variants plus a fast-path bypass
 
 ### 4.3 Negative Results and the Critical Path
 
-The most useful single finding was that the per-tile critical path in the persistent kernel is **dominated by the TMEM-to-register transfer** (`tcgen05_ld_32x32b_x64_b32` + `tcgen05_wait_ld`), not by MMA compute, producer-prefetch latency, or the FMA accumulation chain.
+The most useful single finding was that the per-tile critical path in the persistent kernel is **dominated by the TMEM-to-register transfer** (`tcgen05_ld_32x32b_x64_b32` + `tcgen05_wait_ld` [10]), not by MMA compute, producer-prefetch latency, or the FMA accumulation chain.
 
 Levers measured and rejected:
 
@@ -116,7 +116,7 @@ This is the **opposite finding** to the indexer: the indexer's Stage-1 has a squ
 
 ## 6. Shared Infrastructure: CUDA Graph Cache
 
-Both kernels use the same hand-rolled in-extension graph cache. The contest `do_bench` harness clones inputs every iteration, so pointers change but shapes (and the dispatch plan) stay fixed. For small workloads where the kernel itself is single-digit microseconds, ≈2.5 µs per `cudaLaunchKernel` dominates total latency. The cache is keyed by `(stream, dispatch_path, shape, scale_bits, split_factor, …)` — explicitly *not* by tensor pointers. Each call captures a fresh graph with current pointers and tries `cudaGraphExecUpdate` against the cached executable; on topology mismatch the entry is re-instantiated. The wrapper falls back to a direct kernel launch if `cudaStreamBeginCapture` fails. In the indexer, this transformation collapsed the fast-path bucket from 6.5 µs to 2.3 µs mean.
+Both kernels use the same hand-rolled in-extension graph cache. The contest `do_bench` harness clones inputs every iteration, so pointers change but shapes (and the dispatch plan) stay fixed. For small workloads where the kernel itself is single-digit microseconds, ≈2.5 µs per `cudaLaunchKernel` dominates total latency. The cache is keyed by `(stream, dispatch_path, shape, scale_bits, split_factor, …)` — explicitly *not* by tensor pointers. Each call captures a fresh graph with current pointers and tries `cudaGraphExecUpdate` [8] against the cached executable; on topology mismatch the entry is re-instantiated. The wrapper falls back to a direct kernel launch if `cudaStreamBeginCapture` fails. In the indexer, this transformation collapsed the fast-path bucket from 6.5 µs to 2.3 µs mean.
 
 ![**Figure 5.** CUDA-graph cache state machine. On every call we capture the current launch sequence into a graph, look up the cached executable by shape key, and either redirect node pointers in-place via `cudaGraphExecUpdate` (hit) or instantiate a fresh executable (miss / topology mismatch); the executable is then replayed via `cudaGraphLaunch`.](images/diagrams/diag6.png)
 
@@ -185,7 +185,7 @@ Both kernels independently converged on the same three structural choices: shape
 
 ### 8.2 Blackwell Feature Selectivity
 
-The two kernels differ sharply in which Blackwell hardware features are beneficial. The indexer's Stage-1 computation has a square-ish `(M=128, N=64, K=32)` shape that maps cleanly to UMMA (`tcgen05.mma`) and tensor memory. The attention's value accumulation is a skinny GEMM where UMMA overhead exceeds benefit; WMMA via the legacy `nvcuda::wmma` interface suffices. This asymmetry — UMMA beneficial in one kernel, counterproductive in the other — illustrates that hardware feature applicability on Blackwell is shape-sensitive and must be evaluated empirically.
+The two kernels differ sharply in which Blackwell hardware features are beneficial. The indexer's Stage-1 computation has a square-ish `(M=128, N=64, K=32)` shape that maps cleanly to UMMA (`tcgen05.mma`) and tensor memory [6]. The attention's value accumulation is a skinny GEMM where UMMA overhead exceeds benefit; WMMA via the legacy `nvcuda::wmma` interface suffices. This asymmetry — UMMA beneficial in one kernel, counterproductive in the other — illustrates that hardware feature applicability on Blackwell is shape-sensitive and must be evaluated empirically.
 
 ### 8.3 Evaluator Infrastructure as a Timeline Constraint
 
@@ -203,7 +203,7 @@ We presented joint optimizations of a paged FP8 Top-K Indexer and Sparse Attenti
 
 ## AI / Agent-Assisted Development Disclosure
 
-Both submissions were agent-assisted (Cursor + Claude/GPT-family LLMs); direction and acceptance criteria were human, and all changes were accepted only when measured B200 numbers improved. The agent was used as a pair-programming and refactoring tool for code generation, inline PTX wrapper authoring, and experiment scaffolding. All design decisions (kernel architecture, dispatch thresholds, pipeline depth, optimization accept/reject) were made by the human authors based on benchmark measurements. The agent never had access to contest workload data or evaluation results beyond what was visible in the development logs.
+Both submissions were agent-assisted (Cursor + Claude/GPT-family LLMs); direction and acceptance criteria rested with the human authors, and all changes were accepted only when measured B200 numbers improved. The agent was used as a pair-programming and refactoring tool for code generation, inline PTX wrapper authoring, and experiment scaffolding. All design decisions (kernel architecture, dispatch thresholds, pipeline depth, optimization accept/reject) were made by the human authors based on benchmark measurements. The agent never had access to contest workload data or evaluation results beyond what was visible in the development logs.
 
 ---
 
