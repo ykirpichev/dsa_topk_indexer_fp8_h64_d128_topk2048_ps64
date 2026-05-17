@@ -62,7 +62,7 @@ The single largest constraint on the timeline was the evaluator. Before flashinf
 
 A host dispatcher selects between three Stage-1 variants plus a fast-path bypass; Stage-2 is a radix top-K; a hand-rolled CUDA graph cache wraps the whole launch sequence.
 
-![**Figure 3.** Top-K Indexer dispatch architecture: a host predicate selects between a fast path, a 1-page-per-CTA short kernel, and a warp-specialized persistent kernel; all three feed a Stage-2 radix top-K, a block-table transform, and a CUDA-graph-cached launch sequence.](images/diagrams/diag3.png)
+![**Figure 3.** Top-K Indexer dispatch architecture: a host predicate selects between a fast path, a 1-page-per-CTA short kernel, and a warp-specialized persistent kernel; the short and warp-spec kernels feed a Stage-2 radix top-K and block-table transform, while the fast path bypasses both and feeds directly into the CUDA-graph-cached launch sequence.](images/diagrams/diag3.png)
 
 **Fast path** (`max_num_pages ≤ 32`). When the entire paged context fits within K = 2048, every position is in the top-K, so the output is just a block-table-transformed `[0, seq_len)` padded with −1, independent of Q, K, and weights. Implementation: 128 threads with vectorized `int4` stores, ~2.3 µs including graph replay overhead.
 
