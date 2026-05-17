@@ -18,7 +18,7 @@ We present a joint optimization of the two operators that constitute the compute
 
 DeepSeek Sparse Attention (DSA) [11] is a decoding-time mechanism that decouples token selection from value aggregation: a lightweight indexer scores every cached key against the current query and selects the top K most relevant tokens, and a sparse attention kernel then performs full MLA-style attention restricted to those tokens. This factoring exposes two tightly coupled but architecturally distinct problems on modern accelerators. The indexer is a memory-bound, FP8-dominated paged scoring and selection problem in which raw arithmetic throughput is rarely the bottleneck. The sparse attention kernel is a small-batch, online-softmax problem whose performance is governed by occupancy, sparse-index density, and launch overhead at decoding-time batch sizes.
 
-The MLSys 2026 FlashInfer Kernel Generation Contest [16] formalized both operators as separate tracks on NVIDIA B200 (`sm_100a`) with destination-passing-style (DPS) outputs, contest-supplied paged KV layouts, and a baseline composed of `flashinfer_wrapper` and `flashinfer_deepgemm_wrapper`. The contest evaluator measures end-to-end kernel-side latency on a held-out set of representative shapes — 128 indexer, 23 attention — and ranks submissions by geometric-mean speedup against the reference baseline.
+The MLSys 2026 FlashInfer Kernel Generation Contest [13] formalized both operators as separate tracks on NVIDIA B200 (`sm_100a`) with destination-passing-style (DPS) outputs, contest-supplied paged KV layouts, and a baseline composed of `flashinfer_wrapper` and `flashinfer_deepgemm_wrapper`. The contest evaluator measures end-to-end kernel-side latency on a held-out set of representative shapes — 128 indexer, 23 attention — and ranks submissions by geometric-mean speedup against the reference baseline.
 
 We submitted optimized solutions for both tracks. On the official harness our submissions pass every public workload and achieve a 28.96× track-level geometric-mean speedup, finishing **3rd in the DSA track of the agent-assisted division**. Beyond the headline numbers, this report documents the design process that led there: a small set of structural decisions that survived the entire optimization timeline, and a much larger set of micro-optimizations that we measured, characterized, and rejected. We treat negative results as first-class artifacts and report them explicitly.
 
@@ -193,7 +193,7 @@ The pre-#354 evaluator capped indexer progress at ~7× for six weeks. The post-#
 
 ## 9. Related Work
 
-**FlashAttention family** [1, 2] established IO-aware attention with online softmax. Our fused K-loop in the attention kernel applies the same principle. **Flash-Decoding** [3] introduced split-K parallelism for multi-head decoding; our split-K path for sparse attention is a direct application. **FlashAttention-4** [4] documents asymmetric scaling, 2-CTA MMA, and TMEM intermediates on Blackwell, providing context for our UMMA and TMEM decisions. The **DeepGEMM** `sm100_fp8_paged_mqa_logits.cuh` reference kernel uses warp specialization and TMA pipelines for a related FP8 scoring problem; our persistent kernel shares structural similarities. The **CUB** radix sort and selection primitives provided a baseline for our custom radix-select Stage-2. **CUTLASS** Blackwell documentation and `umma_desc.h` bitfield layouts were vendored for self-containment. The **FlashInfer** library [9] is the contest baseline.
+**FlashAttention family** [1, 2] established IO-aware attention with online softmax. Our fused K-loop in the attention kernel applies the same principle. **Flash-Decoding** [3] introduced split-K parallelism for multi-head decoding; our split-K path for sparse attention is a direct application. **FlashAttention-4** [4] documents asymmetric scaling, 2-CTA MMA, and TMEM intermediates on Blackwell, providing context for our UMMA and TMEM decisions. The **DeepGEMM** `sm100_fp8_paged_mqa_logits.cuh` reference kernel [7] uses warp specialization and TMA pipelines for a related FP8 scoring problem; our persistent kernel shares structural similarities. The **CUB** [12] radix sort and selection primitives provided a baseline for our custom radix-select Stage-2. **CUTLASS** [5] Blackwell documentation and `umma_desc.h` bitfield layouts were vendored for self-containment. The **FlashInfer** library [9] is the contest baseline.
 
 ## 10. Conclusion
 
@@ -231,22 +231,12 @@ Both submissions were agent-assisted (Cursor + Claude/GPT-family LLMs); directio
 
 <p>[11] DeepSeek-AI. &ldquo;DeepSeek-V2: A Strong, Economical, and Efficient Mixture-of-Experts Language Model.&rdquo; arXiv:2405.04434, 2024.</p>
 
-<p>[12] PyTorch contributors. <code>torch.utils.cpp_extension.load</code> — JIT C++/CUDA extension compilation. 2025.</p>
+<p>[12] W. Merrill et al. / NVIDIA. CUB: device-wide and block-wide radix sort and selection. 2025.</p>
 
-<p>[13] W. Merrill et al. / NVIDIA. CUB: device-wide and block-wide radix sort and selection. 2025.</p>
+<p>[13] FlashInfer contributors. MLSys 2026 FlashInfer AI Kernel Generation Contest entry definitions. 2026. <a href="https://github.com/flashinfer-ai/mlsys26-contest">github.com/flashinfer-ai/mlsys26-contest</a>.</p>
 
-<p>[14] S. Rajbhandari, J. Rasley, O. Ruwase, Y. He. &ldquo;ZeRO: Memory Optimizations Toward Training Trillion Parameter Models.&rdquo; <em>SC</em>, 2020.</p>
+<p>[14] flashinfer-bench PR #354: <code>DsaTopkIndexerEvaluator</code> for correct tie-breaking comparison. <a href="https://github.com/flashinfer-ai/flashinfer-bench/pull/354">github.com/flashinfer-ai/flashinfer-bench/pull/354</a>.</p>
 
-<p>[15] A. Katharopoulos, A. Vyas, N. Pappas, F. Fleuret. &ldquo;Transformers are RNNs: Fast Autoregressive Transformers with Linear Attention.&rdquo; <em>ICML</em>, 2020.</p>
+<p>[15] Y. Kirpichev. DSA Top-K Indexer — submitted source (tag <code>submission-v11</code>, commit <code>31b8f71</code>). <a href="https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64">github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64</a>.</p>
 
-<p>[16] FlashInfer contributors. MLSys 2026 FlashInfer AI Kernel Generation Contest entry definitions. 2026. <a href="https://github.com/flashinfer-ai/mlsys26-contest">github.com/flashinfer-ai/mlsys26-contest</a>.</p>
-
-<p>[17] flashinfer-bench PR #354: <code>DsaTopkIndexerEvaluator</code> for correct tie-breaking comparison. <a href="https://github.com/flashinfer-ai/flashinfer-bench/pull/354">github.com/flashinfer-ai/flashinfer-bench/pull/354</a>.</p>
-
-<p>[18] Y. Kirpichev. DSA Top-K Indexer — submitted source (tag <code>submission-v11</code>, commit <code>31b8f71</code>). <a href="https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64">github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64</a>.</p>
-
-<p>[19] Y. Kirpichev. DSA Sparse Attention — submitted source (tag <code>submission-final-v2</code>, commit <code>de475b9</code>). <a href="https://github.com/ykirpichev/dsa_sparse_attention_h16_ckv512_kpe64_topk2048_ps64">github.com/ykirpichev/dsa_sparse_attention_h16_ckv512_kpe64_topk2048_ps64</a>.</p>
-
-<p>[20] Y. Kirpichev. Post-deadline routing study: density cache on/off vs. sync-free shape dispatch. <a href="https://github.com/ykirpichev/dsa_sparse_attention_h16_ckv512_kpe64_topk2048_ps64/blob/reports/submission-final-v2-draft/artifacts/density_cache_vs_shape_dispatch/REPORT.md">artifacts/density_cache_vs_shape_dispatch/REPORT.md</a>.</p>
-
-<p>[21] Y. Kirpichev. DSA track joint process write-up. <a href="https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64/blob/writeup/final_writeup.md">final_writeup.md</a>.</p>
+<p>[16] Y. Kirpichev. DSA Sparse Attention — submitted source (tag <code>submission-final-v2</code>, commit <code>de475b9</code>). <a href="https://github.com/ykirpichev/dsa_sparse_attention_h16_ckv512_kpe64_topk2048_ps64">github.com/ykirpichev/dsa_sparse_attention_h16_ckv512_kpe64_topk2048_ps64</a>.</p>
