@@ -26,6 +26,8 @@ We submitted optimized solutions for both tracks. On the official harness our su
 
 The two operators form one half of a DSA decoding step on B200. The **Top-K Indexer** scores every paged KV position against the current query and emits the K = 2048 most relevant token indices; the **Sparse Attention** kernel then reads only those 2048 positions out of a compressed MLA KV cache and produces BF16 output and FP32 LSE in destination-passing style. The only data dependency between the two operators is the integer index array output by the indexer.
 
+![**Figure 1.** DSA decoding pipeline dataflow. Inputs to the Top-K Indexer (FP8 query, paged KV cache with per-slot scales, attention weights, block table, sequence lengths) flow through UMMA-based logit scoring and radix top-K selection to produce topk_indices of shape B×2048. The Sparse Attention kernel consumes those indices together with BF16 query tensors and compressed KV caches to produce BF16 output and FP32 LSE in destination-passing style.](images/diagrams/diag1.png)
+
 The 128 indexer workloads and 23 attention workloads each span small to mid-range shapes typical of decoding-time inference, where launch overhead, occupancy, memory scheduling, and sparse-index density are at least as important as raw arithmetic throughput. A single-kernel design cannot serve both small and large regimes well — both submissions ended up as *size- and density-aware host dispatchers* over a small set of specialized kernels, with a CUDA Graph cache wrapping the launch sequence.
 
 **Top-K Indexer problem statement.** For each batch row b, the operator computes FP8 dot products `S[h] = Σ_d Q[b,h,d] · K[page,slot,d]` over H=64 heads and D=128 dimensions with FP32 accumulation, weighted ReLU logits `logit[b,t] = scale[page,slot] · Σ_h ReLU(S[h]) · weights[b,h]` for every position in `[0, seq_lens[b])`, top-K = 2048 selection, and a `block_table` transform back to physical page slots. The KV cache is FP8 with per-slot FP32 scales (132 bytes/slot, 64 slots/page); outputs are pre-allocated (DPS).
@@ -54,13 +56,13 @@ The single largest constraint on the timeline was the evaluator. Before flashinf
 
 **Post-#354 (Apr 11 onward).** PR #354 introduced `DsaTopkIndexerEvaluator` which compares **sorted value vectors**, vectorizes index validation (duplicates, out-of-range, block-table reachability), and provides a `build_baseline` with correct FP8 packing. Within ten days the solution was rewritten from scratch: pure PyTorch FP8 dequant + bmm indexer (Apr 11–12); custom CUDA top-K with CUB radix sort and FP8 MMA logits via `mma.sync.m16n8k32.e4m3` PTX (Apr 19–20); a full SM100a UMMA rewrite with `tcgen05.mma.cta_group::1`, radix-select top-K, and size-aware dispatch (v7, v8, ~16 µs mean); persistent CTAs, warp specialization, Stage-2 SMEM cache, dispatch retuning and a CUDA graph cache (v9–v11). The final 7.83 µs mean / 38.4× vs. FlashInfer was reached on Apr 24.
 
-![**Figure 1.** Indexer mean speedup vs. the naive PyTorch reference, by submission milestone. The flat plateau at v1–v4 reflects the pre-PR&nbsp;#354 evaluator cap (≈7×); the cliff at v7–v8 follows the full UMMA&nbsp;+&nbsp;radix-select rewrite; the final ≈13% from v9 to v11 comes from CUDA-graph overhead elimination on the small-workload bucket.](images/diagrams/diag2.png)
+![**Figure 2.** Indexer mean speedup vs. the naive PyTorch reference, by submission milestone. The flat plateau at v1–v4 reflects the pre-PR&nbsp;#354 evaluator cap (≈7×); the cliff at v7–v8 follows the full UMMA&nbsp;+&nbsp;radix-select rewrite; the final ≈13% from v9 to v11 comes from CUDA-graph overhead elimination on the small-workload bucket.](images/diagrams/diag2.png)
 
 ### 4.2 Final Indexer Design
 
 A host dispatcher selects between three Stage-1 variants plus a fast-path bypass; Stage-2 is a radix top-K; a hand-rolled CUDA graph cache wraps the whole launch sequence.
 
-![**Figure 2.** Top-K Indexer dispatch architecture: a host predicate selects between a fast path, a 1-page-per-CTA short kernel, and a warp-specialized persistent kernel; all three feed a Stage-2 radix top-K, a block-table transform, and a CUDA-graph-cached launch sequence.](images/diagrams/diag3.png)
+![**Figure 3.** Top-K Indexer dispatch architecture: a host predicate selects between a fast path, a 1-page-per-CTA short kernel, and a warp-specialized persistent kernel; all three feed a Stage-2 radix top-K, a block-table transform, and a CUDA-graph-cached launch sequence.](images/diagrams/diag3.png)
 
 **Fast path** (`max_num_pages ≤ 32`). When the entire paged context fits within K = 2048, every position is in the top-K, so the output is just a block-table-transformed `[0, seq_len)` padded with −1, independent of Q, K, and weights. Implementation: 128 threads with vectorized `int4` stores, ~2.3 µs including graph replay overhead.
 
@@ -90,7 +92,7 @@ Every micro-optimization adding work to the post-`wait_ld` emit path regressed t
 
 Development proceeded through eight phases. Three principles survived to the final solution:
 
-![**Figure 3.** Sparse Attention optimization phases (P0–P7) in chronological order, snake layout. Green boxes were kept in the final solution; red boxes were measured, found unhelpful, and reverted.](images/diagrams/diag4.png)
+![**Figure 4.** Sparse Attention optimization phases (P0–P7) in chronological order, snake layout. Green boxes were kept in the final solution; red boxes were measured, found unhelpful, and reverted.](images/diagrams/diag4.png)
 
 1. **Reduce repeated HBM traffic.** `v5_fused` collapsed logit computation, softmax, and value accumulation into a single-pass online-softmax K loop that consumes each sparse KV tile exactly once, eliminating a full `TOPK`-length intermediate logit array.
 2. **BF16 only at the output boundary.** Intermediate logits and split-K partials in BF16 caused intermittent `abs_err` spikes. The final split-K path uses FP32 partial buffers and converts to BF16 only on the final write.
@@ -98,7 +100,7 @@ Development proceeded through eight phases. Three principles survived to the fin
 
 ### 5.2 Final Attention Design
 
-![**Figure 4.** Sparse Attention dispatch architecture: an `H == 16` predicate gates a GPU density pre-scan; high-density shapes use a CTA-per-token WMMA path, low-density shapes fall back to the legacy grid; an underfill check then routes between a single-pass kernel and a split-K kernel with reducer; all paths terminate in a CUDA-graph-cached launch sequence.](images/diagrams/diag5.png)
+![**Figure 5.** Sparse Attention dispatch architecture: an `H == 16` predicate gates a GPU density pre-scan; high-density shapes use a CTA-per-token WMMA path, low-density shapes fall back to the legacy grid; an underfill check then routes between a single-pass kernel and a split-K kernel with reducer; all paths terminate in a CUDA-graph-cached launch sequence.](images/diagrams/diag5.png)
 
 **Legacy kernel.** One CTA per `(token, head)`. Sparse indices are pre-scanned with vectorized `int4` loads; invalid entries are canonicalized to −1 and zero-filled in shared memory rather than fetched. The K loop is fused (load tile → logits → online softmax update → value accumulate), keeping memory traffic close to one use per tile.
 
@@ -118,7 +120,7 @@ This is the **opposite finding** to the indexer: the indexer's Stage-1 has a squ
 
 Both kernels use the same hand-rolled in-extension graph cache. The contest `do_bench` harness clones inputs every iteration, so pointers change but shapes (and the dispatch plan) stay fixed. For small workloads where the kernel itself is single-digit microseconds, ≈2.5 µs per `cudaLaunchKernel` dominates total latency. The cache is keyed by `(stream, dispatch_path, shape, scale_bits, split_factor, …)` — explicitly *not* by tensor pointers. Each call captures a fresh graph with current pointers and tries `cudaGraphExecUpdate` [8] against the cached executable; on topology mismatch the entry is re-instantiated. The wrapper falls back to a direct kernel launch if `cudaStreamBeginCapture` fails. In the indexer, this transformation collapsed the fast-path bucket from 6.5 µs to 2.3 µs mean.
 
-![**Figure 5.** CUDA-graph cache state machine. On every call we capture the current launch sequence into a graph, look up the cached executable by shape key, and either redirect node pointers in-place via `cudaGraphExecUpdate` (hit) or instantiate a fresh executable (miss / topology mismatch); the executable is then replayed via `cudaGraphLaunch`.](images/diagrams/diag6.png)
+![**Figure 6.** CUDA-graph cache state machine. On every call we capture the current launch sequence into a graph, look up the cached executable by shape key, and either redirect node pointers in-place via `cudaGraphExecUpdate` (hit) or instantiate a fresh executable (miss / topology mismatch); the executable is then replayed via `cudaGraphLaunch`.](images/diagrams/diag6.png)
 
 ## 7. Evaluation
 
