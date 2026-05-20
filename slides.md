@@ -44,6 +44,9 @@ style: |
   section.story .phase ul li { font-size: 0.72em; color: #475569; padding: 1px 0 1px 12px; position: relative; line-height: 1.3; }
   section.story .phase ul li::before { content: "▸"; position: absolute; left: 0; color: #94a3b8; }
   section.story .phase.hot ul li::before { color: #2563eb88; }
+  section.story .phase ul li ul { margin: 2px 0 0 0; padding: 0; }
+  section.story .phase ul li ul li { font-size: 0.95em; color: #64748b; padding-left: 12px; }
+  section.story .phase ul li ul li::before { content: "·"; color: #cbd5e1; }
   section.story .phase .result { margin-top: 6px; font-size: 0.82em; font-weight: 700; }
   section.story .phase .result.bad { color: #dc2626; }
   section.story .phase .result.good { color: #2563eb; }
@@ -66,7 +69,7 @@ style: |
 
   /* ── 3. Playbook ── */
   section.recipe h2 { font-size: 1.45em; color: #0f172a; border-bottom: 2px solid #2563eb33; padding-bottom: 8px; margin-bottom: 22px; }
-  section.recipe .recipe-grid { display: grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap: 12px; }
+  section.recipe .recipe-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
   section.recipe .card {
     background: #f8fafc; border-radius: 10px; padding: 14px 16px;
     border-top: 2px solid #2563eb44;
@@ -109,6 +112,13 @@ style: |
   section.tldr .point .text { font-size: 1.0em; color: #0f172a; font-weight: 600; }
   section.tldr .point .sub { font-size: 0.78em; color: #64748b; margin-top: 3px; }
   section.tldr .kicker { font-size: 1.0em; color: #059669; font-weight: 700; text-align: center; margin-bottom: 14px; }
+  section.tldr .next-time { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 14px; }
+  section.tldr .next-time .card {
+    background: #fffbeb; border: 1px solid #fcd34d66; border-radius: 8px;
+    padding: 10px 14px; text-align: center;
+  }
+  section.tldr .next-time .card .label { font-size: 0.65em; color: #d97706; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 3px; }
+  section.tldr .next-time .card .text { font-size: 0.75em; color: #78350f; }
   section.tldr .footer { font-size: 0.72em; color: #94a3b8; text-align: center; }
 
   /* ── 6. Thank you ── */
@@ -141,31 +151,36 @@ Yury Kirpichev, on behalf of Team Wombat &nbsp;·&nbsp; MLSys 2026 · FlashInfer
 
 <!-- _class: story -->
 
-## Two contests in one
+## Two phases
 
 <div class="grid">
 
 <div class="phase">
 <h3>Phase 1 · Cursor cloud agents</h3>
-<div class="tag">Immature evaluator — 6 weeks stuck</div>
+<div class="tag">Mar – early Apr · old evaluator</div>
 <ul>
-  <li>Cursor $20/mo → $60 → $200</li>
-  <li>Agents on cloud, async, many branches</li>
-  <li>Evaluator compared raw index vectors — any custom top-K = INCORRECT</li>
-  <li>Only <code>torch::topk</code> passed; agents mostly pushed back</li>
-  <li>Strong human supervision kept progress alive</li>
+  <li>Focused only on DSA Indexer kernel</li>
+  <li>Cursor $20/mo → $60 (Apr 4)</li>
+  <li>Claude $20/mo</li>
+  <li>Cursor cloud agents, async supervision mode, many branches</li>
+  <li>Operations must be numerically stable to pass evaluation</li>
 </ul>
-<div class="result bad">Ceiling: ~7× for 6 weeks</div>
+<div class="result bad">Ceiling: ~7× speedup</div>
 </div>
 
 <div class="phase hot">
 <h3>Phase 2 · tight sync loop · 2 weeks</h3>
-<div class="tag">PR #354 dropped — new evaluator, full rewrite</div>
+<div class="tag">Apr 21 – May · tight sync loop</div>
 <ul>
-  <li>Evaluator fixed: sorted-value comparison, block-table reachability</li>
-  <li>Full custom CUDA pipeline unlocked — agents generated diffs, human accepted/rejected</li>
-  <li>Synchronous, tight supervision, rapid iteration</li>
-  <li>UMMA + radix select + warp specialization + CUDA graphs</li>
+  <li>Cursor bumped to $200/mo</li>
+  <li>Claude $20/mo</li>
+  <li>Started using Opus 4.7 (was available at 50% price)</li>
+  <li>Interim results email: top 3 at ~11× DSA</li>
+  <li>Updated evaluator → full custom CUDA pipeline:
+    <ul>
+      <li>UMMA kernels, warp specialization, radix select, inline PTX…</li>
+    </ul>
+  </li>
 </ul>
 <div class="result good">38.4× indexer &nbsp;·&nbsp; 14.18× attention &nbsp;·&nbsp; 28.96× track</div>
 </div>
@@ -173,7 +188,6 @@ Yury Kirpichev, on behalf of Team Wombat &nbsp;·&nbsp; MLSys 2026 · FlashInfer
 </div>
 
 <div class="chart-kicker">
-<strong>Opus 4.7 launched + leaderboard released → agents cooking 24/7</strong>
 </div>
 
 <div class="charts">
@@ -182,61 +196,9 @@ Yury Kirpichev, on behalf of Team Wombat &nbsp;·&nbsp; MLSys 2026 · FlashInfer
 <figcaption>Indexer speedup — ~7× plateau, then cliff after PR #354</figcaption>
 </figure>
 <figure>
-<img src="images/cursor_billing.png" alt="Cursor cumulative spend by model" />
-<figcaption>Cursor spend — flat until late April, then Opus spike</figcaption>
+<img src="images/cursor_usage.png" alt="Cursor cumulative spend by model" />
+<figcaption>Switched to Opus 4.7 + interim results email (top 3, ~11× DSA) → spending spike</figcaption>
 </figure>
-</div>
-
----
-
-<!-- _class: recipe -->
-
-## The playbook
-
-<div class="recipe-grid">
-
-<div class="card">
-<span class="num">1</span>
-<h3>Fast feedback loop</h3>
-<p>Smoke tests for correctness, perf tests only when implementation is ready. Never run the full suite during exploration.</p>
-</div>
-
-<div class="card">
-<span class="num">2</span>
-<h3>Incremental hypothesis</h3>
-<p>One change at a time, measured on real B200 hardware. Reject immediately if numbers don't improve.</p>
-</div>
-
-<div class="card">
-<span class="num">3</span>
-<h3>Parallel agents on branches</h3>
-<p>Cursor cloud agents exploring different hypotheses concurrently. Phase 1: async review. Phase 2: serial tight loop.</p>
-</div>
-
-<div class="card">
-<span class="num">4</span>
-<h3>Auto-track +/−</h3>
-<p>Every experiment logged. Negative results treated as first-class — ~50 micro-opts tried and reverted, all documented.</p>
-</div>
-
-<div class="card">
-<span class="num">5</span>
-<h3>Human as judge</h3>
-<p>Accept/reject based on benchmark numbers only — never on agent confidence.</p>
-</div>
-
-<div class="card">
-<span class="num">6</span>
-<h3>Revert aggressively</h3>
-<p>If it doesn't measure better, it goes. No "promising but needs more work." Keeps the baseline clean for the next hypothesis.</p>
-</div>
-
-<div class="card">
-<span class="num">7</span>
-<h3>Refactoring = own branch</h3>
-<p>Never mix a structural rewrite with a micro-opt. Run them separately against a clean baseline — otherwise you can't tell what helped.</p>
-</div>
-
 </div>
 
 ---
@@ -288,6 +250,52 @@ Yury Kirpichev, on behalf of Team Wombat &nbsp;·&nbsp; MLSys 2026 · FlashInfer
 
 ---
 
+<!-- _class: recipe -->
+
+## The playbook
+
+<div class="recipe-grid">
+
+<div class="card">
+<span class="num">1</span>
+<h3>Fast feedback loop</h3>
+<p>Smoke tests for correctness, perf tests only when implementation is ready. Never run the full suite during exploration.</p>
+</div>
+
+<div class="card">
+<span class="num">2</span>
+<h3>Incremental hypothesis</h3>
+<p>One change at a time, measured on real B200 hardware. Reject immediately if numbers don't improve.</p>
+</div>
+
+<div class="card">
+<span class="num">3</span>
+<h3>Explore in parallel</h3>
+<p>Cursor cloud agents exploring different hypotheses concurrently. Phase 1: async review. Phase 2: serial tight loop.</p>
+</div>
+
+<div class="card">
+<span class="num">4</span>
+<h3>Auto-track +/−</h3>
+<p>Every experiment logged. Negative results treated as first-class — ~50 micro-opts tried and reverted, all documented.</p>
+</div>
+
+<div class="card">
+<span class="num">5</span>
+<h3>Numbers decide</h3>
+<p>Accept/reject based on measured numbers only — agent confidence is not evidence.</p>
+</div>
+
+<div class="card">
+<span class="num">6</span>
+<h3>Revert aggressively</h3>
+<p>If it doesn't measure better, it goes. No "promising but needs more work." Keeps the baseline clean for the next hypothesis.</p>
+</div>
+
+</div>
+
+---
+
 <!-- _class: tldr -->
 
 ## TL;DR
@@ -296,34 +304,41 @@ Yury Kirpichev, on behalf of Team Wombat &nbsp;·&nbsp; MLSys 2026 · FlashInfer
 
 <div class="point">
 <div class="num">1</div>
-<div class="text">Baseline matters</div>
-<div class="sub">Broken evaluator capped us at 7× for 6 weeks. Fixed evaluator → 38.4× in 2 weeks.</div>
+<div class="text">Baseline</div>
+<div class="sub">Start from the strongest available baseline. Every optimization is only as meaningful as what you measure it against.</div>
 </div>
 
 <div class="point">
 <div class="num">2</div>
-<div class="text">Environment matters</div>
-<div class="sub">Fast feedback loop + smoke tests + B200 access on Modal = agents can iterate at human speed or faster.</div>
+<div class="text">Environment</div>
+<div class="sub">Smoke tests + B200 access + fast iterations = agents outpace manual development.</div>
 </div>
 
 <div class="point">
 <div class="num">3</div>
-<div class="text">Compute matters</div>
-<div class="sub">~$500 API + Modal B200 compute, $200/mo Cursor. Unlocked warp specialization, TMEM, inline PTX, radix sort — all agent-generated.</div>
+<div class="text">Compute</div>
+<div class="sub">Modal B200 compute, $200/mo Cursor. Unlocked warp specialization, TMEM, inline PTX, radix sort — all agent-generated.</div>
 </div>
 
 <div class="point">
 <div class="num">4</div>
-<div class="text">Agents amplify you &gt;10×</div>
-<div class="sub">Not a kernel engineer by trade. Without modern tools — 3rd place at MLSys would not be possible.</div>
+<div class="text">Agents</div>
+<div class="sub">Amplify you &gt;10× — and that's conservative. With the right setup, agents redefine what's possible.</div>
 </div>
 
 </div>
 
-<div class="kicker">Agents can write production CUDA kernels today. You just have to measure.</div>
+<div class="kicker">Agents are ready. Is your workflow?</div>
 
-<div style="font-size:0.72em; color:#555; text-align:center; margin-bottom:10px;">
-  What I'd do differently: fix cupti on day one · use Cursor cloud agents + new harnesses (OpenClaw, etc.) more aggressively · learn to use Claude more efficiently
+<div class="next-time">
+<div class="card">
+<div class="label">Next time</div>
+<div class="text">Fix measurement tooling on day one — bad benchmarks reject good ideas</div>
+</div>
+<div class="card">
+<div class="label">Next time</div>
+<div class="text">Use Cursor cloud agents and Claude more aggressively — still learning the right workflow</div>
+</div>
 </div>
 
 <div class="footer">
