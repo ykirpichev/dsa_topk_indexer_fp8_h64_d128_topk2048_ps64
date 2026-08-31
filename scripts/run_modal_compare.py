@@ -58,20 +58,22 @@ image = (
 )
 
 
-def _worker_benchmark_config(smoke: bool = False) -> BenchmarkConfig:
+def _worker_benchmark_config(smoke: bool = False, warmup: int = 0,
+                             iterations: int = 0, trials: int = 0) -> BenchmarkConfig:
     """Build BenchmarkConfig on the worker.
 
-    Matches the config used in `scripts/run_modal.py` (warmup=3,
-    iter=100, trials=5) so the numbers line up when cupti-python is
-    present on both images.
+    Defaults match `scripts/run_modal.py` (warmup=3, iter=100, trials=5) so
+    the numbers line up when cupti-python is present on both images. The
+    explicit warmup/iterations/trials arguments override those defaults for
+    quick checks, where absolute precision matters less than turnaround.
     """
     import os
     if smoke:
         return BenchmarkConfig(warmup_runs=1, iterations=1, num_trials=1)
     kwargs = dict(
-        warmup_runs=int(os.environ.get("FIB_WARMUP_RUNS", "3")),
-        iterations=int(os.environ.get("FIB_ITERATIONS", "100")),
-        num_trials=int(os.environ.get("FIB_NUM_TRIALS", "5")),
+        warmup_runs=warmup or int(os.environ.get("FIB_WARMUP_RUNS", "3")),
+        iterations=iterations or int(os.environ.get("FIB_ITERATIONS", "100")),
+        num_trials=trials or int(os.environ.get("FIB_NUM_TRIALS", "5")),
     )
     if "FIB_RTOL" in os.environ:
         kwargs["rtol"] = float(os.environ["FIB_RTOL"])
@@ -114,9 +116,12 @@ def _collect_results(result_trace_set, definition_name: str) -> dict:
 @app.function(image=image, gpu="B200:1", timeout=3600,
               volumes={TRACE_SET_PATH: trace_volume})
 def run_benchmark(solution: Solution, smoke: bool = False,
-                  n_workloads: int = 0, compare_fi: bool = False) -> dict:
+                  n_workloads: int = 0, compare_fi: bool = False,
+                  per_plan: int = 0, warmup: int = 0, iterations: int = 0,
+                  trials: int = 0) -> dict:
     """Run ours (+ optionally every other registered solution) on B200."""
-    config = _worker_benchmark_config(smoke=smoke)
+    config = _worker_benchmark_config(smoke=smoke, warmup=warmup,
+                                      iterations=iterations, trials=trials)
 
     trace_set = TraceSet.from_path(TRACE_SET_PATH)
 
@@ -133,6 +138,35 @@ def run_benchmark(solution: Solution, smoke: bool = False,
 
     if smoke:
         workloads = workloads[:1]
+    elif per_plan > 0:
+        # Sample evenly across the three dispatch plans (thresholds from
+        # solution/python/dsa_config.cuh), so a quick run still exercises
+        # every kernel instead of whatever the trace order happens to put
+        # first.
+        def _axes(entry) -> dict:
+            # Entries may be Workloads or Traces wrapping a workload.
+            axes = getattr(entry, "axes", None)
+            if axes is None:
+                axes = getattr(getattr(entry, "workload", None), "axes", None)
+            return axes or {}
+
+        buckets: dict = {"fast path": [], "short": [], "persistent ws": []}
+        for w in workloads:
+            pages = _axes(w).get("max_num_pages")
+            if pages is None:
+                continue
+            if pages <= 32:
+                buckets["fast path"].append(w)
+            elif pages < 64:
+                buckets["short"].append(w)
+            else:
+                buckets["persistent ws"].append(w)
+        picked = []
+        for name, group in buckets.items():
+            take = group[:per_plan]
+            print(f"[per-plan] {name}: {len(take)} of {len(group)} workloads")
+            picked.extend(take)
+        workloads = picked
     elif n_workloads > 0:
         workloads = workloads[:n_workloads]
 
@@ -270,12 +304,26 @@ def _print_report(payload: dict):
 
 
 @app.local_entrypoint()
-def main(smoke: bool = False, n_workloads: int = 0, compare_fi: bool = True):
+def main(smoke: bool = False, n_workloads: int = 0, compare_fi: bool = True,
+         quick: bool = False, per_plan: int = 0, warmup: int = 0,
+         iterations: int = 0, trials: int = 0):
     """Pack the solution from solution/ and run on Modal B200.
 
-    Defaults to --compare-fi=True. Pass --compare-fi False to run ours only.
+    Defaults to --compare-fi=True. Pass --no-compare-fi to run ours only.
+
+    `--quick` is the refactor-validation preset: 4 workloads per dispatch
+    plan at warmup=2/iterations=25/trials=2. It finishes in a couple of
+    minutes and is enough to catch a functional break or a gross slowdown,
+    but not to resolve sub-percent latency differences — use the full run
+    for that.
     """
     from scripts.pack_solution import pack_solution
+
+    if quick:
+        per_plan = per_plan or 4
+        warmup = warmup or 2
+        iterations = iterations or 25
+        trials = trials or 2
 
     print("Packing solution from source files...")
     solution_path = pack_solution()
@@ -287,6 +335,10 @@ def main(smoke: bool = False, n_workloads: int = 0, compare_fi: bool = True):
         print("compare-fi: will include every other solution in the trace set.")
     if smoke:
         print("Smoke mode: 1 workload, warmup=1, iterations=1, trials=1.")
+    elif per_plan > 0:
+        print(f"Per-plan mode: {per_plan} workloads per dispatch plan, "
+              f"warmup={warmup or 3}, iterations={iterations or 100}, "
+              f"trials={trials or 5}.")
     elif n_workloads > 0:
         print(f"Subset mode: {n_workloads} workloads.")
     else:
@@ -294,7 +346,8 @@ def main(smoke: bool = False, n_workloads: int = 0, compare_fi: bool = True):
 
     payload = run_benchmark.remote(
         solution, smoke=smoke, n_workloads=n_workloads,
-        compare_fi=compare_fi,
+        compare_fi=compare_fi, per_plan=per_plan, warmup=warmup,
+        iterations=iterations, trials=trials,
     )
     if not payload:
         print("No results returned!")

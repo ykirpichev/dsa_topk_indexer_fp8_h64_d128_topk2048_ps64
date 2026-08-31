@@ -15,7 +15,7 @@ Final solution: `dsa_topk_indexer_fp8_b200_v3` (commit `31b8f71`)
 | vs naive ref      | 964x mean *(unconfirmed — see caveat)*                                                                                     |
 | vs FlashInfer/DG  | 38.4x mean (8.3x worst, 72.3x best) *(unconfirmed — see caveat)*                                                           |
 | Aggregate latency | mean 7.83 us, p50 2.40 us, p95 17.80 us *(unconfirmed — see caveat)*                                                       |
-| Source files      | `solution/python/solution.py`, `solution/python/kernel.cu`, `solution/python/tcgen05_ptx.h`, `solution/python/umma_desc.h` |
+| Source files      | `solution/python/` (`solution.py`, `kernel.cu`, stage/dispatch `.cuh` headers, `tcgen05_ptx.h`, `umma_desc.h`) |
 
 
 > **Caveat — comparison numbers are unconfirmed.** The headline speedups (38.4x vs FlashInfer, 964x vs naive) come from `reports/submission-v10.md` / `reports/submission-v10-raw-cupti.log`. It is unclear at the time of writing whether the comparison numbers were end-to-end `cupti-python`-timed under the same harness configuration the official evaluator uses; some relative numbers may mix cupti and CUDA-event timings and will be remeasured.
@@ -117,7 +117,7 @@ All 128 workloads pass the post-#354 `DsaTopkIndexerEvaluator`. Final benchmarks
 
 ### Submitted source
 
-1. Final kernel implementation - [solution/python/kernel.cu](solution/python/kernel.cu).
+1. Modular kernel sources - [solution/python/](solution/python/) (`kernel.cu` + stage/dispatch `.cuh` headers; see [docs/KERNEL_ARCHITECTURE.md](docs/KERNEL_ARCHITECTURE.md)).
 2. Python entry point and JIT compile flags - [solution/python/solution.py](solution/python/solution.py).
 3. Inline PTX wrappers for SM100a - [solution/python/tcgen05_ptx.h](solution/python/tcgen05_ptx.h).
 4. UMMA descriptor layouts (vendored from CUTLASS) - [solution/python/umma_desc.h](solution/python/umma_desc.h).
