@@ -8,7 +8,6 @@ Reads configuration from config.toml and packs the appropriate source files
 import sys
 from pathlib import Path
 
-# Add project root to path for imports
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
@@ -41,18 +40,18 @@ def pack_solution(output_path: Path = None) -> Path:
     language = build_config["language"]
     entry_point = build_config["entry_point"]
 
-    # Determine source directory based on language
     if language == "triton":
         source_dir = PROJECT_ROOT / "solution" / "triton"
     elif language == "cuda":
         source_dir = PROJECT_ROOT / "solution" / "cuda"
+    elif language == "python":
+        source_dir = PROJECT_ROOT / "solution" / "python"
     else:
         raise ValueError(f"Unsupported language: {language}")
 
     if not source_dir.exists():
         raise FileNotFoundError(f"Source directory not found: {source_dir}")
 
-    # Create build spec
     dps = build_config.get("destination_passing_style", True)
     spec = BuildSpec(
         language=language,
@@ -61,7 +60,6 @@ def pack_solution(output_path: Path = None) -> Path:
         destination_passing_style=dps,
     )
 
-    # Pack the solution
     solution = pack_solution_from_files(
         path=str(source_dir),
         spec=spec,
@@ -70,7 +68,6 @@ def pack_solution(output_path: Path = None) -> Path:
         author=solution_config["author"],
     )
 
-    # Write to output file
     if output_path is None:
         output_path = PROJECT_ROOT / "solution.json"
 

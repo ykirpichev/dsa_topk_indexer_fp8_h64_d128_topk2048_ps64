@@ -1,6 +1,12 @@
 # FlashInfer Competition
 solution.json
 
+# Local PDF / report build artifacts (mermaid PNG cache, weasyprint output)
+.build_report/
+
+# Local refactor scratch: benchmark logs, SASS dumps, pre-refactor backups
+artifacts/
+
 # CUDA build artifacts
 *.o
 *.obj

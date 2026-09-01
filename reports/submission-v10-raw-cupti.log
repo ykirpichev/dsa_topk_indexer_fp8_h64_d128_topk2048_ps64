@@ -1,0 +1,582 @@
+✓ Initialized. View run at 
+https://modal.com/apps/ykirpichev/main/ap-f3rHucAeZ5Apr3BacPAxXI
+
+
+✓ Created objects.
+├── 🔨 Created mount 
+│   /home/ykirpichev/sources/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64/scripts
+│   /run_modal_compare.py
+└── 🔨 Created function run_benchmark.
+Packing solution from source files...
+Solution packed: 
+/home/ykirpichev/sources/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64/solution.js
+on
+  Name: dsa_topk_indexer_fp8_b200_v3
+  Definition: dsa_topk_indexer_fp8_h64_d128_topk2048_ps64
+  Author: Wombat
+  Language: python
+
+Loading solution...
+Loaded: dsa_topk_indexer_fp8_b200_v3 
+(dsa_topk_indexer_fp8_h64_d128_topk2048_ps64)
+compare-fi: will include every other solution in the trace set.
+Full mode: all workloads in the trace set.
+
+==========
+== CUDA ==
+==========
+
+CUDA Version 13.2.0
+
+Container image Copyright (c) 2016-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+This container image and its contents are governed by the NVIDIA Deep Learning Container License.
+By pulling and using the container, you accept the terms and conditions of this license:
+https://developer.nvidia.com/ngc/nvidia-deep-learning-container-license
+
+A copy of this license is made available in this container at /NGC-DL-CONTAINER-LICENSE for your convenience.
+
+[compare-fi] trace set has 2 solution(s):
+  - dsa_topk_indexer_fp8_b200_v1 (lang=?)
+  - flashinfer_deepgemm_wrapper_2ba145 (lang=?)
+
+dsa_topk_indexer_fp8_h64_d128_topk2048_ps64 — solution 
+`dsa_topk_indexer_fp8_b200_v3`:
+  30cecff1...: PASSED | 2.3 us | 488.02x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=1, max_num_pages=1, num_pages=11923]
+  cd594d26...: PASSED | 2.3 us | 452.64x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=1, max_num_pages=2, num_pages=11923]
+  44ddaa65...: PASSED | 2.3 us | 454.04x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=1, max_num_pages=3, num_pages=11923]
+  b2098949...: PASSED | 2.3 us | 560.16x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=2, max_num_pages=2, num_pages=11923]
+  4667f9ad...: PASSED | 2.3 us | 545.95x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=2, max_num_pages=1, num_pages=11923]
+  8f2fde6c...: PASSED | 2.2 us | 591.69x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=2, max_num_pages=6, num_pages=11923]
+  02fa7f90...: PASSED | 2.3 us | 572.91x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=2, max_num_pages=5, num_pages=11923]
+  545f8a85...: PASSED | 2.3 us | 570.00x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=2, max_num_pages=3, num_pages=11923]
+  e49574dd...: PASSED | 2.3 us | 549.31x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=2, max_num_pages=7, num_pages=11923]
+  0ebafac4...: PASSED | 2.2 us | 585.71x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=2, max_num_pages=4, num_pages=11923]
+  82a8a885...: PASSED | 2.3 us | 563.08x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=2, max_num_pages=8, num_pages=11923]
+  4279d75e...: PASSED | 2.2 us | 779.64x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=4, max_num_pages=17, num_pages=11923]
+  83cb81c5...: PASSED | 2.3 us | 661.03x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=3, max_num_pages=2, num_pages=11923]
+  d8a73470...: PASSED | 11.0 us | 162.23x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=4, max_num_pages=34, num_pages=11923]
+  16feeab1...: PASSED | 11.0 us | 159.89x vs naive ref | abs_err=3.01e-02, 
+rel_err=4.33e-04  [batch_size=4, max_num_pages=43, num_pages=11923]
+  9754a4e7...: PASSED | 2.4 us | 727.38x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=4, max_num_pages=16, num_pages=11923]
+  05775386...: PASSED | 2.2 us | 801.95x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=4, max_num_pages=18, num_pages=11923]
+  46f236c0...: PASSED | 2.3 us | 744.95x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=4, max_num_pages=1, num_pages=11923]
+  d54c1568...: PASSED | 2.2 us | 788.22x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=4, max_num_pages=2, num_pages=11923]
+  17ced9b8...: PASSED | 2.4 us | 724.84x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=4, max_num_pages=30, num_pages=11923]
+  cd3434ac...: PASSED | 10.9 us | 161.46x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=4, max_num_pages=35, num_pages=11923]
+  101a39ac...: PASSED | 2.4 us | 733.26x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=4, max_num_pages=31, num_pages=11923]
+  55be3dc3...: PASSED | 2.3 us | 756.36x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=4, max_num_pages=3, num_pages=11923]
+  ef12ac76...: PASSED | 11.2 us | 155.38x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=4, max_num_pages=44, num_pages=11923]
+  4c7705ad...: PASSED | 11.1 us | 157.56x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=4, max_num_pages=36, num_pages=11923]
+  ef0d0deb...: PASSED | 2.3 us | 768.03x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=4, max_num_pages=32, num_pages=11923]
+  28a9fa48...: PASSED | 2.2 us | 780.98x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=4, max_num_pages=19, num_pages=11923]
+  899c2d2f...: PASSED | 2.4 us | 709.41x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=4, max_num_pages=4, num_pages=11923]
+  03fc111f...: PASSED | 11.3 us | 154.96x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=4, max_num_pages=45, num_pages=11923]
+  b017f77a...: PASSED | 10.9 us | 247.58x vs naive ref | abs_err=1.07e-01, 
+rel_err=6.08e-04  [batch_size=8, max_num_pages=34, num_pages=11923]
+  82bd3e70...: PASSED | 2.2 us | 1210.30x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=8, max_num_pages=16, num_pages=11923]
+  f897f64e...: PASSED | 2.4 us | 1136.63x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=8, max_num_pages=17, num_pages=11923]
+  df80c00b...: PASSED | 2.2 us | 1084.96x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=7, max_num_pages=18, num_pages=11923]
+  99920dc5...: PASSED | 11.2 us | 218.77x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=7, max_num_pages=34, num_pages=11923]
+  9410ad1e...: PASSED | 2.3 us | 990.85x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=6, max_num_pages=1, num_pages=11923]
+  3e91afa0...: PASSED | 11.2 us | 237.66x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=8, max_num_pages=43, num_pages=11923]
+  9a2bb7f8...: PASSED | 2.3 us | 955.46x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=6, max_num_pages=26, num_pages=11923]
+  2774963f...: PASSED | 12.0 us | 222.67x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=8, max_num_pages=38, num_pages=11923]
+  e64a4ebc...: PASSED | 2.3 us | 1161.86x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=8, max_num_pages=1, num_pages=11923]
+  a4cdaee6...: PASSED | 2.3 us | 1133.55x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=8, max_num_pages=30, num_pages=11923]
+  6caf09cf...: PASSED | 2.4 us | 1106.62x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=8, max_num_pages=18, num_pages=11923]
+  7752dda1...: PASSED | 2.4 us | 1093.19x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=8, max_num_pages=26, num_pages=11923]
+  67216408...: PASSED | 2.4 us | 1132.93x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=8, max_num_pages=32, num_pages=11923]
+  8638fe06...: PASSED | 11.3 us | 235.22x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=8, max_num_pages=35, num_pages=11923]
+  d04ea89f...: PASSED | 2.2 us | 1215.65x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=8, max_num_pages=27, num_pages=11923]
+  13dad24c...: PASSED | 2.4 us | 1074.92x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=8, max_num_pages=2, num_pages=11923]
+  1152c61f...: PASSED | 2.4 us | 1082.87x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=8, max_num_pages=31, num_pages=11923]
+  77279062...: PASSED | 11.5 us | 229.95x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=8, max_num_pages=44, num_pages=11923]
+  9c313fc4...: PASSED | 2.3 us | 1134.47x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=8, max_num_pages=19, num_pages=11923]
+  8f3fe9ff...: PASSED | 11.3 us | 233.34x vs naive ref | abs_err=9.20e-03, 
+rel_err=2.07e-04  [batch_size=8, max_num_pages=36, num_pages=11923]
+  06ec358c...: PASSED | 2.3 us | 1128.30x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=8, max_num_pages=28, num_pages=11923]
+  8f1a5846...: PASSED | 2.3 us | 1112.79x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=8, max_num_pages=3, num_pages=11923]
+  3240d5fa...: PASSED | 2.2 us | 1196.25x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=8, max_num_pages=8, num_pages=11923]
+  c729310b...: PASSED | 2.4 us | 1087.62x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=8, max_num_pages=9, num_pages=11923]
+  81a953ea...: PASSED | 11.4 us | 231.97x vs naive ref | abs_err=8.44e-03, 
+rel_err=3.78e-04  [batch_size=8, max_num_pages=45, num_pages=11923]
+  09bb020f...: PASSED | 2.4 us | 924.46x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=6, max_num_pages=28, num_pages=11923]
+  e515e20a...: PASSED | 2.4 us | 999.99x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=7, max_num_pages=32, num_pages=11923]
+  10b4eebe...: PASSED | 2.3 us | 946.39x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=6, max_num_pages=32, num_pages=11923]
+  1ece7fb3...: PASSED | 2.5 us | 1757.70x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=15, max_num_pages=18, num_pages=11923]
+  9810dadf...: PASSED | 11.5 us | 391.41x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=16, max_num_pages=34, num_pages=11923]
+  9a95a10e...: PASSED | 11.3 us | 377.64x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=15, max_num_pages=34, num_pages=11923]
+  696dbfa4...: PASSED | 12.4 us | 366.10x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=16, max_num_pages=43, num_pages=11923]
+  ee603b53...: PASSED | 12.3 us | 350.14x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=15, max_num_pages=43, num_pages=11923]
+  70d53807...: PASSED | 17.8 us | 205.93x vs naive ref | abs_err=5.36e-04, 
+rel_err=3.62e-05  [batch_size=12, max_num_pages=82, num_pages=11923]
+  19e7663d...: PASSED | 12.5 us | 360.22x vs naive ref | abs_err=4.16e-02, 
+rel_err=5.46e-04  [batch_size=16, max_num_pages=38, num_pages=11923]
+  ed3e595b...: PASSED | 13.1 us | 343.86x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=16, max_num_pages=33, num_pages=11923]
+  e4ecb462...: PASSED | 17.8 us | 240.84x vs naive ref | abs_err=1.88e-02, 
+rel_err=3.51e-04  [batch_size=15, max_num_pages=82, num_pages=11923]
+  f1fc35d4...: PASSED | 12.1 us | 355.82x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=15, max_num_pages=38, num_pages=11923]
+  67c09e9c...: PASSED | 2.3 us | 1908.40x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=15, max_num_pages=30, num_pages=11923]
+  786b5173...: PASSED | 17.7 us | 244.44x vs naive ref | abs_err=7.35e-03, 
+rel_err=1.74e-04  [batch_size=15, max_num_pages=89, num_pages=11923]
+  08a752fc...: PASSED | 11.5 us | 367.97x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=15, max_num_pages=35, num_pages=11923]
+  cdc0ff86...: PASSED | 17.5 us | 246.06x vs naive ref | abs_err=3.43e-02, 
+rel_err=3.29e-04  [batch_size=15, max_num_pages=90, num_pages=11923]
+  f457feb2...: PASSED | 12.1 us | 351.04x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=15, max_num_pages=39, num_pages=11923]
+  e977c163...: PASSED | 2.4 us | 1773.81x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=15, max_num_pages=31, num_pages=11923]
+  6bdb38e6...: PASSED | 16.9 us | 248.17x vs naive ref | abs_err=1.89e-02, 
+rel_err=4.15e-04  [batch_size=15, max_num_pages=83, num_pages=11923]
+  e26d02ef...: PASSED | 12.4 us | 339.65x vs naive ref | abs_err=4.89e-02, 
+rel_err=5.81e-04  [batch_size=15, max_num_pages=44, num_pages=11923]
+  97a6d5c2...: PASSED | 2.4 us | 1759.35x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=15, max_num_pages=19, num_pages=11923]
+  175849a8...: PASSED | 11.7 us | 360.29x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=15, max_num_pages=36, num_pages=11923]
+  3eab2c37...: PASSED | 17.7 us | 239.43x vs naive ref | abs_err=1.74e-02, 
+rel_err=3.34e-04  [batch_size=15, max_num_pages=91, num_pages=11923]
+  60605091...: PASSED | 11.9 us | 353.97x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=15, max_num_pages=40, num_pages=11923]
+  bb22d09a...: PASSED | 2.3 us | 1785.01x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=15, max_num_pages=32, num_pages=11923]
+  fb1ceff0...: PASSED | 16.8 us | 248.22x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=15, max_num_pages=84, num_pages=11923]
+  b83c4150...: PASSED | 12.7 us | 334.47x vs naive ref | abs_err=3.23e-03, 
+rel_err=5.21e-05  [batch_size=15, max_num_pages=45, num_pages=11923]
+  752c2ee5...: PASSED | 2.2 us | 1803.59x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=15, max_num_pages=1, num_pages=11923]
+  e1a185dc...: PASSED | 16.9 us | 235.48x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=14, max_num_pages=84, num_pages=11923]
+  7f03b670...: PASSED | 2.3 us | 1692.04x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=14, max_num_pages=32, num_pages=11923]
+  d0c00dd5...: PASSED | 2.2 us | 1716.68x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=14, max_num_pages=1, num_pages=11923]
+  f7f61b05...: PASSED | 17.9 us | 224.60x vs naive ref | abs_err=3.11e-02, 
+rel_err=3.42e-04  [batch_size=14, max_num_pages=91, num_pages=11923]
+  7f1cd9c2...: PASSED | 12.3 us | 327.62x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=14, max_num_pages=40, num_pages=11923]
+  f59fd3e2...: PASSED | 12.7 us | 316.50x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=14, max_num_pages=35, num_pages=11923]
+  5f7e6f22...: PASSED | 2.2 us | 1491.56x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=11, max_num_pages=32, num_pages=11923]
+  bda73497...: PASSED | 2.4 us | 3311.25x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=31, max_num_pages=26, num_pages=11923]
+  37098ea3...: PASSED | 2.3 us | 3265.80x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=29, max_num_pages=18, num_pages=11923]
+  a03d722b...: PASSED | 14.1 us | 550.64x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=30, max_num_pages=34, num_pages=11923]
+  34195ade...: PASSED | 17.7 us | 399.64x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=27, max_num_pages=82, num_pages=11923]
+  03910df4...: PASSED | 2.4 us | 3132.07x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=29, max_num_pages=30, num_pages=11923]
+  a876010b...: PASSED | 18.1 us | 415.00x vs naive ref | abs_err=3.69e-03, 
+rel_err=2.60e-04  [batch_size=29, max_num_pages=89, num_pages=11923]
+  7f20565a...: PASSED | 2.4 us | 3258.06x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=30, max_num_pages=30, num_pages=11923]
+  a52c09bc...: PASSED | 16.2 us | 491.86x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=31, max_num_pages=43, num_pages=11923]
+  bb0f8277...: PASSED | 17.9 us | 430.93x vs naive ref | abs_err=1.06e-02, 
+rel_err=1.29e-04  [batch_size=30, max_num_pages=89, num_pages=11923]
+  6b4b9d2b...: PASSED | 17.8 us | 432.74x vs naive ref | abs_err=4.53e-03, 
+rel_err=7.97e-05  [batch_size=30, max_num_pages=82, num_pages=11923]
+  a30b4f8d...: PASSED | 2.4 us | 3234.75x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=30, max_num_pages=18, num_pages=11923]
+  8bdd4f88...: PASSED | 15.5 us | 503.66x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=30, max_num_pages=43, num_pages=11923]
+  30a90fa5...: PASSED | 14.0 us | 549.65x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=30, max_num_pages=33, num_pages=11923]
+  de54c4e6...: PASSED | 14.5 us | 530.54x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=30, max_num_pages=35, num_pages=11923]
+  22207643...: PASSED | 17.7 us | 435.67x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=30, max_num_pages=90, num_pages=11923]
+  6832006b...: PASSED | 2.4 us | 3172.75x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=30, max_num_pages=28, num_pages=11923]
+  9f252ffa...: PASSED | 2.4 us | 3166.94x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=30, max_num_pages=31, num_pages=11923]
+  4a0e0529...: PASSED | 2.4 us | 3137.09x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=30, max_num_pages=29, num_pages=11923]
+  f362edf4...: PASSED | 17.5 us | 431.03x vs naive ref | abs_err=3.05e-02, 
+rel_err=3.78e-04  [batch_size=30, max_num_pages=83, num_pages=11923]
+  e0488cb7...: PASSED | 2.4 us | 3180.36x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=30, max_num_pages=19, num_pages=11923]
+  ee6946e7...: PASSED | 15.9 us | 478.65x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=30, max_num_pages=44, num_pages=11923]
+  2f3b7321...: PASSED | 14.6 us | 523.36x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=30, max_num_pages=36, num_pages=11923]
+  5db1b172...: PASSED | 17.8 us | 430.57x vs naive ref | abs_err=6.05e-03, 
+rel_err=1.70e-04  [batch_size=30, max_num_pages=91, num_pages=11923]
+  8ba75447...: PASSED | 2.4 us | 3141.80x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=30, max_num_pages=32, num_pages=11923]
+  e667d2ac...: PASSED | 2.4 us | 3094.90x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=29, max_num_pages=32, num_pages=11923]
+  6b10b6da...: PASSED | 17.9 us | 410.43x vs naive ref | abs_err=2.94e-03, 
+rel_err=1.00e-04  [batch_size=29, max_num_pages=91, num_pages=11923]
+  1571c14a...: PASSED | 2.4 us | 3035.88x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=29, max_num_pages=19, num_pages=11923]
+  0c4f5578...: PASSED | 17.2 us | 425.66x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=29, max_num_pages=83, num_pages=11923]
+  fc14d852...: PASSED | 15.6 us | 493.51x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=29, max_num_pages=44, num_pages=11923]
+  e63194e7...: PASSED | 14.4 us | 512.44x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=29, max_num_pages=36, num_pages=11923]
+  27afdcea...: PASSED | 17.3 us | 421.47x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=29, max_num_pages=84, num_pages=11923]
+  abc9d12c...: PASSED | 2.1 us | 3199.00x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=29, max_num_pages=1, num_pages=11923]
+  27c3374f...: PASSED | 15.7 us | 472.38x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=29, max_num_pages=45, num_pages=11923]
+  6e4e9b37...: PASSED | 2.4 us | 2830.42x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=26, max_num_pages=30, num_pages=11923]
+  4a616af2...: PASSED | 2.4 us | 2989.25x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=27, max_num_pages=32, num_pages=11923]
+  8635db8f...: PASSED | 17.8 us | 394.59x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=27, max_num_pages=91, num_pages=11923]
+  dba1e960...: PASSED | 2.4 us | 2770.73x vs naive ref | abs_err=0.00e+00, 
+rel_err=0.00e+00  [batch_size=25, max_num_pages=30, num_pages=11923]
+
+Per-workload side-by-side (us):
+  #  uuid8       axes                                 ours_us   
+dsa_topk_indexer_us   flashinfer_deepg_us   FI/ours
+--------------------------------------------------------------------------------
+-----------------------------------
+  1  abc9d12c-2  batch_size=29, max_num_pages=1, num_pages=11923       2.1      
+6.5                 151.9     3.05x
+  2  d04ea89f-d  batch_size=8, max_num_pages=27, num_pages=11923       2.2      
+6.7                 143.0     3.08x
+  3  d0c00dd5-8  batch_size=14, max_num_pages=1, num_pages=11923       2.2      
+6.4                 146.6     2.93x
+  4  752c2ee5-9  batch_size=15, max_num_pages=1, num_pages=11923       2.2      
+6.5                 148.0     2.95x
+  5  d54c1568-8  batch_size=4, max_num_pages=2, num_pages=11923       2.2       
+6.3                 140.9     2.86x
+  6  0ebafac4-a  batch_size=2, max_num_pages=4, num_pages=11923       2.2       
+6.3                 139.6     2.87x
+  7  05775386-5  batch_size=4, max_num_pages=18, num_pages=11923       2.2      
+6.4                 141.5     2.91x
+  8  8f2fde6c-5  batch_size=2, max_num_pages=6, num_pages=11923       2.2       
+6.4                 140.6     2.89x
+  9  df80c00b-9  batch_size=7, max_num_pages=18, num_pages=11923       2.2      
+6.5                 141.4     2.92x
+ 10  4279d75e-b  batch_size=4, max_num_pages=17, num_pages=11923       2.2      
+6.4                 140.2     2.86x
+ 11  82bd3e70-4  batch_size=8, max_num_pages=16, num_pages=11923       2.2      
+6.5                 142.8     2.91x
+ 12  3240d5fa-9  batch_size=8, max_num_pages=8, num_pages=11923       2.2       
+6.3                 145.5     2.84x
+ 13  28a9fa48-9  batch_size=4, max_num_pages=19, num_pages=11923       2.2      
+6.4                 141.7     2.88x
+ 14  5f7e6f22-1  batch_size=11, max_num_pages=32, num_pages=11923       2.2     
+8.1                 147.7     3.63x
+ 15  9410ad1e-e  batch_size=6, max_num_pages=1, num_pages=11923       2.3       
+6.4                 142.7     2.85x
+ 16  67c09e9c-3  batch_size=15, max_num_pages=30, num_pages=11923       2.3     
+8.3                 143.2     3.67x
+ 17  545f8a85-3  batch_size=2, max_num_pages=3, num_pages=11923       2.3       
+6.3                 139.6     2.80x
+ 18  30cecff1-7  batch_size=1, max_num_pages=1, num_pages=11923       2.3       
+6.5                 137.0     2.90x
+ 19  02fa7f90-8  batch_size=2, max_num_pages=5, num_pages=11923       2.3       
+6.3                 140.7     2.77x
+ 20  ef0d0deb-a  batch_size=4, max_num_pages=32, num_pages=11923       2.3      
+6.4                 140.1     2.81x
+ 21  e64a4ebc-1  batch_size=8, max_num_pages=1, num_pages=11923       2.3       
+6.4                 140.9     2.82x
+ 22  83cb81c5-7  batch_size=3, max_num_pages=2, num_pages=11923       2.3       
+6.3                 140.4     2.78x
+ 23  82a8a885-a  batch_size=2, max_num_pages=8, num_pages=11923       2.3       
+6.2                 139.9     2.73x
+ 24  37098ea3-9  batch_size=29, max_num_pages=18, num_pages=11923       2.3     
+9.0                 146.4     3.95x
+ 25  b2098949-a  batch_size=2, max_num_pages=2, num_pages=11923       2.3       
+6.2                 140.6     2.71x
+ 26  55be3dc3-b  batch_size=4, max_num_pages=3, num_pages=11923       2.3       
+6.2                 140.6     2.69x
+ 27  44ddaa65-5  batch_size=1, max_num_pages=3, num_pages=11923       2.3       
+6.3                 138.8     2.75x
+ 28  10b4eebe-e  batch_size=6, max_num_pages=32, num_pages=11923       2.3      
+6.8                 144.7     2.96x
+ 29  9c313fc4-4  batch_size=8, max_num_pages=19, num_pages=11923       2.3      
+6.4                 143.7     2.75x
+ 30  9a2bb7f8-b  batch_size=6, max_num_pages=26, num_pages=11923       2.3      
+6.4                 144.2     2.79x
+ 31  cd594d26-4  batch_size=1, max_num_pages=2, num_pages=11923       2.3       
+6.4                 138.5     2.77x
+ 32  8f1a5846-5  batch_size=8, max_num_pages=3, num_pages=11923       2.3       
+6.2                 142.0     2.65x
+ 33  06ec358c-6  batch_size=8, max_num_pages=28, num_pages=11923       2.3      
+6.7                 144.0     2.85x
+ 34  e49574dd-5  batch_size=2, max_num_pages=7, num_pages=11923       2.3       
+6.2                 140.1     2.66x
+ 35  bb22d09a-7  batch_size=15, max_num_pages=32, num_pages=11923       2.3     
+8.6                 146.8     3.67x
+ 36  7f03b670-8  batch_size=14, max_num_pages=32, num_pages=11923       2.3     
+8.4                 147.1     3.57x
+ 37  46f236c0-3  batch_size=4, max_num_pages=1, num_pages=11923       2.3       
+6.4                 141.8     2.71x
+ 38  a4cdaee6-2  batch_size=8, max_num_pages=30, num_pages=11923       2.3      
+7.0                 142.4     2.96x
+ 39  4667f9ad-9  batch_size=2, max_num_pages=1, num_pages=11923       2.3       
+6.3                 140.6     2.70x
+ 40  4a616af2-b  batch_size=27, max_num_pages=32, num_pages=11923       2.4     
+11.8                 151.3     5.02x
+ 41  f897f64e-6  batch_size=8, max_num_pages=17, num_pages=11923       2.4      
+6.4                 142.8     2.71x
+ 42  7f20565a-5  batch_size=30, max_num_pages=30, num_pages=11923       2.4     
+11.8                 146.5     4.99x
+ 43  e977c163-0  batch_size=15, max_num_pages=31, num_pages=11923       2.4     
+8.3                 144.3     3.53x
+ 44  9f252ffa-e  batch_size=30, max_num_pages=31, num_pages=11923       2.4     
+11.6                 146.8     4.88x
+ 45  09bb020f-6  batch_size=6, max_num_pages=28, num_pages=11923       2.4      
+6.5                 142.0     2.73x
+ 46  a30b4f8d-d  batch_size=30, max_num_pages=18, num_pages=11923       2.4     
+9.2                 145.5     3.89x
+ 47  101a39ac-6  batch_size=4, max_num_pages=31, num_pages=11923       2.4      
+6.4                 140.9     2.69x
+ 48  67216408-b  batch_size=8, max_num_pages=32, num_pages=11923       2.4      
+7.2                 141.2     3.01x
+ 49  03910df4-7  batch_size=29, max_num_pages=30, num_pages=11923       2.4     
+11.3                 147.4     4.75x
+ 50  97a6d5c2-e  batch_size=15, max_num_pages=19, num_pages=11923       2.4     
+7.6                 146.1     3.17x
+ 51  e0488cb7-b  batch_size=30, max_num_pages=19, num_pages=11923       2.4     
+9.6                 149.3     4.03x
+ 52  dba1e960-4  batch_size=25, max_num_pages=30, num_pages=11923       2.4     
+11.1                 154.3     4.62x
+ 53  e667d2ac-c  batch_size=29, max_num_pages=32, num_pages=11923       2.4     
+11.8                 149.1     4.91x
+ 54  6e4e9b37-0  batch_size=26, max_num_pages=30, num_pages=11923       2.4     
+11.4                 153.3     4.76x
+ 55  bda73497-5  batch_size=31, max_num_pages=26, num_pages=11923       2.4     
+11.1                 148.3     4.60x
+ 56  6832006b-2  batch_size=30, max_num_pages=28, num_pages=11923       2.4     
+11.4                 145.7     4.75x
+ 57  4a0e0529-5  batch_size=30, max_num_pages=29, num_pages=11923       2.4     
+11.6                 147.0     4.82x
+ 58  13dad24c-6  batch_size=8, max_num_pages=2, num_pages=11923       2.4       
+6.2                 143.6     2.59x
+ 59  9754a4e7-3  batch_size=4, max_num_pages=16, num_pages=11923       2.4      
+6.3                 141.2     2.62x
+ 60  c729310b-1  batch_size=8, max_num_pages=9, num_pages=11923       2.4       
+6.2                 141.3     2.58x
+ 61  1571c14a-1  batch_size=29, max_num_pages=19, num_pages=11923       2.4     
+9.5                 149.6     3.94x
+ 62  6caf09cf-7  batch_size=8, max_num_pages=18, num_pages=11923       2.4      
+6.3                 142.4     2.61x
+ 63  1152c61f-0  batch_size=8, max_num_pages=31, num_pages=11923       2.4      
+7.0                 144.8     2.87x
+ 64  e515e20a-6  batch_size=7, max_num_pages=32, num_pages=11923       2.4      
+6.9                 141.7     2.84x
+ 65  8ba75447-a  batch_size=30, max_num_pages=32, num_pages=11923       2.4     
+11.9                 148.3     4.90x
+ 66  17ced9b8-3  batch_size=4, max_num_pages=30, num_pages=11923       2.4      
+6.4                 141.2     2.63x
+ 67  899c2d2f-5  batch_size=4, max_num_pages=4, num_pages=11923       2.4       
+6.2                 140.1     2.56x
+ 68  7752dda1-9  batch_size=8, max_num_pages=26, num_pages=11923       2.4      
+6.7                 143.6     2.73x
+ 69  1ece7fb3-b  batch_size=15, max_num_pages=18, num_pages=11923       2.5     
+7.1                 143.1     2.88x
+ 70  cd3434ac-b  batch_size=4, max_num_pages=35, num_pages=11923      10.9      
+11.6                 144.0     1.06x
+ 71  b017f77a-7  batch_size=8, max_num_pages=34, num_pages=11923      10.9      
+12.3                 147.2     1.12x
+ 72  d8a73470-c  batch_size=4, max_num_pages=34, num_pages=11923      11.0      
+11.8                 145.9     1.08x
+ 73  16feeab1-5  batch_size=4, max_num_pages=43, num_pages=11923      11.0      
+11.9                 146.0     1.08x
+ 74  4c7705ad-0  batch_size=4, max_num_pages=36, num_pages=11923      11.1      
+12.1                 144.5     1.09x
+ 75  99920dc5-e  batch_size=7, max_num_pages=34, num_pages=11923      11.2      
+12.1                 147.4     1.08x
+ 76  ef12ac76-8  batch_size=4, max_num_pages=44, num_pages=11923      11.2      
+11.9                 144.9     1.06x
+ 77  3e91afa0-0  batch_size=8, max_num_pages=43, num_pages=11923      11.2      
+13.2                 150.1     1.17x
+ 78  8638fe06-e  batch_size=8, max_num_pages=35, num_pages=11923      11.3      
+12.4                 145.9     1.10x
+ 79  03fc111f-0  batch_size=4, max_num_pages=45, num_pages=11923      11.3      
+11.8                 145.6     1.05x
+ 80  9a95a10e-b  batch_size=15, max_num_pages=34, num_pages=11923      11.3     
+14.2                 149.1     1.26x
+ 81  8f3fe9ff-c  batch_size=8, max_num_pages=36, num_pages=11923      11.3      
+12.8                 145.1     1.13x
+ 82  81a953ea-f  batch_size=8, max_num_pages=45, num_pages=11923      11.4      
+13.3                 145.4     1.17x
+ 83  77279062-1  batch_size=8, max_num_pages=44, num_pages=11923      11.5      
+13.3                 146.8     1.16x
+ 84  9810dadf-1  batch_size=16, max_num_pages=34, num_pages=11923      11.5     
+14.2                 147.4     1.24x
+ 85  08a752fc-5  batch_size=15, max_num_pages=35, num_pages=11923      11.5     
+14.2                 148.9     1.23x
+ 86  175849a8-a  batch_size=15, max_num_pages=36, num_pages=11923      11.7     
+14.1                 150.1     1.21x
+ 87  60605091-4  batch_size=15, max_num_pages=40, num_pages=11923      11.9     
+14.9                 149.7     1.25x
+ 88  2774963f-0  batch_size=8, max_num_pages=38, num_pages=11923      12.0      
+12.9                 147.7     1.07x
+ 89  f1fc35d4-3  batch_size=15, max_num_pages=38, num_pages=11923      12.1     
+14.8                 147.7     1.23x
+ 90  f457feb2-6  batch_size=15, max_num_pages=39, num_pages=11923      12.1     
+14.7                 147.8     1.21x
+ 91  ee603b53-f  batch_size=15, max_num_pages=43, num_pages=11923      12.3     
+15.0                 156.1     1.22x
+ 92  7f1cd9c2-1  batch_size=14, max_num_pages=40, num_pages=11923      12.3     
+14.7                 149.0     1.19x
+ 93  e26d02ef-5  batch_size=15, max_num_pages=44, num_pages=11923      12.4     
+15.3                 150.2     1.23x
+ 94  696dbfa4-e  batch_size=16, max_num_pages=43, num_pages=11923      12.4     
+15.2                 147.7     1.22x
+ 95  19e7663d-2  batch_size=16, max_num_pages=38, num_pages=11923      12.5     
+15.1                 149.8     1.21x
+ 96  b83c4150-d  batch_size=15, max_num_pages=45, num_pages=11923      12.7     
+15.5                 151.5     1.22x
+ 97  f59fd3e2-a  batch_size=14, max_num_pages=35, num_pages=11923      12.7     
+13.8                 151.8     1.09x
+ 98  ed3e595b-e  batch_size=16, max_num_pages=33, num_pages=11923      13.1     
+14.0                 149.2     1.06x
+ 99  30a90fa5-3  batch_size=30, max_num_pages=33, num_pages=11923      14.0     
+17.6                 149.7     1.25x
+100  a03d722b-1  batch_size=30, max_num_pages=34, num_pages=11923      14.1     
+17.6                 149.3     1.25x
+101  e63194e7-b  batch_size=29, max_num_pages=36, num_pages=11923      14.4     
+17.8                 156.7     1.24x
+102  de54c4e6-7  batch_size=30, max_num_pages=35, num_pages=11923      14.5     
+17.8                 150.8     1.23x
+103  2f3b7321-e  batch_size=30, max_num_pages=36, num_pages=11923      14.6     
+18.0                 151.6     1.23x
+104  8bdd4f88-c  batch_size=30, max_num_pages=43, num_pages=11923      15.5     
+19.6                 148.7     1.27x
+105  fc14d852-7  batch_size=29, max_num_pages=44, num_pages=11923      15.6     
+20.0                 153.0     1.28x
+106  27c3374f-c  batch_size=29, max_num_pages=45, num_pages=11923      15.7     
+20.2                 155.7     1.28x
+107  ee6946e7-b  batch_size=30, max_num_pages=44, num_pages=11923      15.9     
+19.8                 151.8     1.24x
+108  a52c09bc-2  batch_size=31, max_num_pages=43, num_pages=11923      16.2     
+19.9                 150.6     1.23x
+109  fb1ceff0-a  batch_size=15, max_num_pages=84, num_pages=11923      16.8     
+19.7                 152.3     1.17x
+110  e1a185dc-a  batch_size=14, max_num_pages=84, num_pages=11923      16.9     
+19.7                 151.4     1.17x
+111  6bdb38e6-2  batch_size=15, max_num_pages=83, num_pages=11923      16.9     
+20.3                 150.7     1.20x
+112  0c4f5578-a  batch_size=29, max_num_pages=83, num_pages=11923      17.2     
+27.2                 154.2     1.58x
+113  27afdcea-6  batch_size=29, max_num_pages=84, num_pages=11923      17.3     
+27.4                 154.8     1.58x
+114  cdc0ff86-2  batch_size=15, max_num_pages=90, num_pages=11923      17.5     
+20.7                 150.0     1.19x
+115  f362edf4-7  batch_size=30, max_num_pages=83, num_pages=11923      17.5     
+27.4                 154.3     1.56x
+116  786b5173-e  batch_size=15, max_num_pages=89, num_pages=11923      17.7     
+20.7                 148.0     1.17x
+117  34195ade-a  batch_size=27, max_num_pages=82, num_pages=11923      17.7     
+25.9                 152.9     1.47x
+118  3eab2c37-d  batch_size=15, max_num_pages=91, num_pages=11923      17.7     
+21.2                 152.2     1.20x
+119  22207643-e  batch_size=30, max_num_pages=90, num_pages=11923      17.7     
+28.5                 151.3     1.61x
+120  70d53807-f  batch_size=12, max_num_pages=82, num_pages=11923      17.8     
+18.2                 148.5     1.02x
+121  8635db8f-5  batch_size=27, max_num_pages=91, num_pages=11923      17.8     
+28.2                 157.7     1.59x
+122  e4ecb462-e  batch_size=15, max_num_pages=82, num_pages=11923      17.8     
+19.8                 149.6     1.11x
+123  5db1b172-e  batch_size=30, max_num_pages=91, num_pages=11923      17.8     
+29.2                 154.7     1.64x
+124  6b4b9d2b-1  batch_size=30, max_num_pages=82, num_pages=11923      17.8     
+26.9                 151.0     1.51x
+125  bb0f8277-4  batch_size=30, max_num_pages=89, num_pages=11923      17.9     
+28.5                 153.0     1.59x
+126  f7f61b05-f  batch_size=14, max_num_pages=91, num_pages=11923      17.9     
+20.3                 150.9     1.13x
+127  6b10b6da-7  batch_size=29, max_num_pages=91, num_pages=11923      17.9     
+28.8                 153.4     1.61x
+128  a876010b-d  batch_size=29, max_num_pages=89, num_pages=11923      18.1     
+28.1                 153.5     1.55x
+
+Aggregate latency (us):
+  solution                                         mean      p50      p95      
+min      max
+  dsa_topk_indexer_fp8_b200_v3                      7.8      2.4     17.8      
+2.1     18.1
+  dsa_topk_indexer_fp8_b200_v1                     12.4     11.6     27.4      
+6.2     29.2
+  flashinfer_deepgemm_wrapper_2ba145              146.7    146.8    154.3    
+137.0    157.7
+
+Head-to-head vs `dsa_topk_indexer_fp8_b200_v1` (>5% margin = win):
+  ours wins:  127
+  FI wins:    0
+  ties:       1
+
+Stopping app - local entrypoint completed.
+Runner terminated.
+✓ App completed. View run at 
+https://modal.com/apps/ykirpichev/main/ap-f3rHucAeZ5Apr3BacPAxXI
