@@ -20,6 +20,13 @@
 #include "stage1_short.cuh"
 #include "stage2_topk.cuh"
 
+#define DSA_CUDA_CHECK(expr)                                                  \
+    do {                                                                      \
+        const cudaError_t _dsa_err = (expr);                                  \
+        TORCH_CHECK(_dsa_err == cudaSuccess,                                  \
+                    "DSA topk: ", #expr, ": ", cudaGetErrorString(_dsa_err)); \
+    } while (0)
+
 void dsa_topk_indexer_cuda(
     torch::Tensor q_index_fp8,
     torch::Tensor k_index_cache_fp8,
@@ -198,52 +205,44 @@ void dsa_topk_indexer_cuda(
         // Environment refused capture (nested capture / stream in a bad
         // state) -- fall back to direct launch so the call still works.
         dispatch(stream);
-        const cudaError_t err2 = cudaGetLastError();
-        TORCH_CHECK(err2 == cudaSuccess,
-            "DSA topk: direct launch after capture failure: ",
-            cudaGetErrorString(err2));
+        DSA_CUDA_CHECK(cudaGetLastError());
         return;
     }
     dispatch(cap_stream);
-    cudaGraph_t new_graph = nullptr;
-    cerr = cudaStreamEndCapture(cap_stream, &new_graph);
-    TORCH_CHECK(cerr == cudaSuccess && new_graph != nullptr,
-                "DSA topk: cudaStreamEndCapture failed: ",
-                cudaGetErrorString(cerr));
+
+    UniqueCudaGraph graph;
+    {
+        cudaGraph_t raw = nullptr;
+        DSA_CUDA_CHECK(cudaStreamEndCapture(cap_stream, &raw));
+        TORCH_CHECK(raw != nullptr, "DSA topk: EndCapture returned null graph");
+        graph.reset(raw);
+    }
 
     // Cache HIT: patch new pointers into the cached exec in place.
     GraphEntry* slot = g_graph_cache.find_slot(k);
     if (slot != nullptr) {
         cudaGraphExecUpdateResultInfo info{};
-        cerr = cudaGraphExecUpdate(slot->exec, new_graph, &info);
-        const bool updated = (cerr == cudaSuccess &&
-                              info.result == cudaGraphExecUpdateSuccess);
-        if (updated) {
-            cudaGraphDestroy(new_graph);
-            cerr = cudaGraphLaunch(slot->exec, stream);
-            TORCH_CHECK(cerr == cudaSuccess,
-                        "DSA topk: cudaGraphLaunch after update failed: ",
-                        cudaGetErrorString(cerr));
+        cerr = cudaGraphExecUpdate(slot->exec, graph.get(), &info);
+        if (cerr == cudaSuccess && info.result == cudaGraphExecUpdateSuccess) {
+            graph.reset();  // template no longer needed
+            DSA_CUDA_CHECK(cudaGraphLaunch(slot->exec, stream));
             return;
         }
         // Topology mismatch (shouldn't happen given the shape key, but
         // be defensive): drop the cached exec and re-instantiate below.
-        cudaGraphExecDestroy(slot->exec);
         g_graph_cache.invalidate(slot);
     }
 
     // Cache MISS: full instantiate + launch.
-    cudaGraphExec_t exec = nullptr;
-    cerr = cudaGraphInstantiate(&exec, new_graph, 0);
-    TORCH_CHECK(cerr == cudaSuccess && exec != nullptr,
-                "DSA topk: cudaGraphInstantiate failed: ",
-                cudaGetErrorString(cerr));
-    cudaGraphDestroy(new_graph);  // exec owns its own topology copy
+    UniqueCudaGraphExec exec;
+    {
+        cudaGraphExec_t raw = nullptr;
+        DSA_CUDA_CHECK(cudaGraphInstantiate(&raw, graph.get(), 0));
+        TORCH_CHECK(raw != nullptr, "DSA topk: Instantiate returned null exec");
+        exec.reset(raw);
+    }
+    graph.reset();  // exec owns its own topology copy
 
-    cerr = cudaGraphLaunch(exec, stream);
-    TORCH_CHECK(cerr == cudaSuccess,
-                "DSA topk: cudaGraphLaunch (initial) failed: ",
-                cudaGetErrorString(cerr));
-
-    g_graph_cache.insert(k, exec);
+    DSA_CUDA_CHECK(cudaGraphLaunch(exec.get(), stream));
+    g_graph_cache.insert(k, exec.release());
 }

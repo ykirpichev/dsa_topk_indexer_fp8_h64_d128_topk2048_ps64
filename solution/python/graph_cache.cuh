@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstring>
 #include <mutex>
+#include <utility>
 
 #include "dsa_config.cuh"
 
@@ -43,6 +44,42 @@ struct GraphKey {
 };
 static_assert(sizeof(GraphKey) % 8 == 0, "GraphKey must be 8-byte aligned for memcmp");
 
+// Move-only owner for opaque CUDA graph handles. Destroy is ignored for null.
+template <class Handle, cudaError_t (*Destroy)(Handle)>
+class UniqueCudaHandle {
+public:
+    UniqueCudaHandle() = default;
+    explicit UniqueCudaHandle(Handle h) noexcept : h_(h) {}
+    ~UniqueCudaHandle() { reset(); }
+
+    UniqueCudaHandle(UniqueCudaHandle&& o) noexcept : h_(o.release()) {}
+    UniqueCudaHandle& operator=(UniqueCudaHandle&& o) noexcept {
+        if (this != &o) {
+            reset();
+            h_ = o.release();
+        }
+        return *this;
+    }
+
+    UniqueCudaHandle(const UniqueCudaHandle&)            = delete;
+    UniqueCudaHandle& operator=(const UniqueCudaHandle&) = delete;
+
+    Handle get() const noexcept { return h_; }
+    Handle release() noexcept { return std::exchange(h_, Handle{}); }
+    explicit operator bool() const noexcept { return h_ != Handle{}; }
+
+    void reset(Handle h = Handle{}) noexcept {
+        if (h_) Destroy(h_);
+        h_ = h;
+    }
+
+private:
+    Handle h_{};
+};
+
+using UniqueCudaGraph     = UniqueCudaHandle<cudaGraph_t, cudaGraphDestroy>;
+using UniqueCudaGraphExec = UniqueCudaHandle<cudaGraphExec_t, cudaGraphExecDestroy>;
+
 struct GraphEntry {
     GraphKey        key{};
     cudaGraphExec_t exec  = nullptr;
@@ -54,9 +91,7 @@ public:
     static constexpr int N = 32;
 
     ~GraphCache() {
-        for (auto& e : e_) {
-            if (e.exec) cudaGraphExecDestroy(e.exec);
-        }
+        for (auto& e : e_) clear_locked(e);
     }
 
     GraphEntry* find_slot(const GraphKey& k) {
@@ -67,23 +102,32 @@ public:
         return nullptr;
     }
 
+    // Takes ownership of `x` (caller should release() from UniqueCudaGraphExec).
     void insert(const GraphKey& k, cudaGraphExec_t x) {
         std::lock_guard<std::mutex> lk(mu_);
         auto& slot = e_[head_];
-        if (slot.valid && slot.exec) cudaGraphExecDestroy(slot.exec);
+        clear_locked(slot);
         slot.key   = k;
         slot.exec  = x;
         slot.valid = true;
         head_ = (head_ + 1) % N;
     }
 
+    // Destroys any cached exec and marks the slot unused.
     void invalidate(GraphEntry* slot) {
         std::lock_guard<std::mutex> lk(mu_);
-        slot->valid = false;
-        slot->exec  = nullptr;
+        clear_locked(*slot);
     }
 
 private:
+    static void clear_locked(GraphEntry& e) {
+        if (e.exec) {
+            cudaGraphExecDestroy(e.exec);
+            e.exec = nullptr;
+        }
+        e.valid = false;
+    }
+
     GraphEntry e_[N];
     int        head_ = 0;
     std::mutex mu_;
