@@ -10,22 +10,15 @@
 #include <torch/extension.h>
 
 #include <array>
-#include <cstring>
 #include <mutex>
 
+#include "cuda_utils.cuh"
 #include "dsa_config.cuh"
 #include "fast_path.cuh"
 #include "graph_cache.cuh"
 #include "stage1_persistent_ws.cuh"
 #include "stage1_short.cuh"
 #include "stage2_topk.cuh"
-
-#define DSA_CUDA_CHECK(expr)                                                  \
-    do {                                                                      \
-        const cudaError_t _dsa_err = (expr);                                  \
-        TORCH_CHECK(_dsa_err == cudaSuccess,                                  \
-                    "DSA topk: ", #expr, ": ", cudaGetErrorString(_dsa_err)); \
-    } while (0)
 
 void dsa_topk_indexer_cuda(
     torch::Tensor q_index_fp8,
@@ -60,21 +53,18 @@ void dsa_topk_indexer_cuda(
     const int* bt_ptr  = block_table.data_ptr<int32_t>();
     int*       out_ptr = topk_indices.data_ptr<int32_t>();
 
-    const bool is_fast_path = (max_num_pages <= kFastPathMaxPages);
+    const Plan plan = select_plan(max_num_pages);
 
-    // Plan parameters, all of which go into the GraphKey since they determine
-    // the captured launch topology.
-    Plan                 plan              = Plan::FastPath;
     int                  max_kv_tile_pairs = 0;
     int                  tiles_per_cta     = 0;
     int                  num_splits        = 0;
-    int                  max_len           = 0;
+    const int            max_len           = stage2_max_len(plan, max_num_pages);
     __half*              logits_ptr        = nullptr;
     const __nv_fp8_e4m3* q_ptr             = nullptr;
     const uint8_t*       kv_ptr            = nullptr;
     const float*         w_ptr             = nullptr;
 
-    if (!is_fast_path) {
+    if (plan != Plan::FastPath) {
         // Validation only the UMMA paths need, paid only when we take them.
         TORCH_CHECK(q_index_fp8.is_cuda() && q_index_fp8.is_contiguous(),
                     "q_index_fp8 must be contiguous CUDA");
@@ -84,20 +74,10 @@ void dsa_topk_indexer_cuda(
                         weights.scalar_type() == torch::kFloat32,
                     "weights must be float32 contiguous CUDA");
 
-        const bool use_persistent = (max_num_pages >= kPersistentPageThreshold);
-
-        max_kv_tile_pairs = (max_num_pages + kPagesPerUMMA - 1) / kPagesPerUMMA;
-
-        // Must match what Stage 1 writes: persistent rounds up to full
-        // tile-pair columns, short uses exactly pages * 64.
-        max_len = use_persistent
-            ? max_kv_tile_pairs * (kPagesPerUMMA * kBlockKv)
-            : max_num_pages * kPageSize;
-
         // Stage-1 logits scratch, one geometrically grown buffer per device.
         // `torch::empty` is not graph-safe, so this stays outside capture; the
         // pointer only moves when B*max_len outgrows the allocation, and the
-        // cache entry (keyed by max_len) misses at that point anyway.
+        // cache entry (keyed by shape) misses at that point anyway.
         {
             static std::array<torch::Tensor, 8> s_scratch;
             static std::array<size_t, 8>        s_scratch_bytes = {};
@@ -128,17 +108,11 @@ void dsa_topk_indexer_cuda(
         kv_ptr = reinterpret_cast<const uint8_t*>(k_index_cache_fp8.data_ptr());
         w_ptr  = weights.data_ptr<float>();
 
-        if (use_persistent) {
-            num_splits = (kPersistentSmTarget + B - 1) / B;   // >= 1 for B >= 1
-            if (num_splits > max_kv_tile_pairs) num_splits = max_kv_tile_pairs;
-            tiles_per_cta = (max_kv_tile_pairs + num_splits - 1) / num_splits;
-            if (tiles_per_cta < kPersistentMinTiles) tiles_per_cta = kPersistentMinTiles;
-            if (tiles_per_cta > kPersistentMaxTiles) tiles_per_cta = kPersistentMaxTiles;
-            num_splits = (max_kv_tile_pairs + tiles_per_cta - 1) / tiles_per_cta;
-
-            plan = Plan::PersistentWs;
-        } else {
-            plan = Plan::Short;
+        if (plan == Plan::PersistentWs) {
+            const PersistentGrid grid = compute_persistent_grid(B, max_num_pages);
+            max_kv_tile_pairs = grid.max_kv_tile_pairs;
+            tiles_per_cta     = grid.tiles_per_cta;
+            num_splits        = grid.num_splits;
         }
     }
 
@@ -177,72 +151,9 @@ void dsa_topk_indexer_cuda(
             max_len, max_num_pages, kTopK, out_ptr);
     };
 
-    // ----- Graph-cache dispatch --------------------------------------------
-    GraphKey k{};
-    std::memset(&k, 0, sizeof(k));   // zero padding for memcmp()
-    k.stream        = stream;
-    k.plan          = plan;
-    k.B             = B;
-    k.max_num_pages = max_num_pages;
-    k.max_kv_arg    = (plan == Plan::Short) ? max_num_pages : max_kv_tile_pairs;
-    k.tiles_per_cta = tiles_per_cta;
-    k.num_splits    = num_splits;
-    k.max_len       = max_len;
-
-    // Capture cannot use the caller's stream: under flashinfer-bench's
-    // isolated-runner worker `getCurrentCUDAStream()` returns the legacy NULL
-    // stream, where BeginCapture fails with cudaErrorIllegalState. The
-    // captured graph is topology-only, so replaying it on the caller's stream
-    // still preserves ordering against the caller's other work.
-    static thread_local cudaStream_t cap_stream = nullptr;
-    if (!cap_stream) {
-        cudaStreamCreateWithFlags(&cap_stream, cudaStreamNonBlocking);
-    }
-
-    cudaError_t cerr = cudaStreamBeginCapture(
-        cap_stream, cudaStreamCaptureModeRelaxed);
-    if (cerr != cudaSuccess) {
-        // Environment refused capture (nested capture / stream in a bad
-        // state) -- fall back to direct launch so the call still works.
-        dispatch(stream);
-        DSA_CUDA_CHECK(cudaGetLastError());
-        return;
-    }
-    dispatch(cap_stream);
-
-    UniqueCudaGraph graph;
-    {
-        cudaGraph_t raw = nullptr;
-        DSA_CUDA_CHECK(cudaStreamEndCapture(cap_stream, &raw));
-        TORCH_CHECK(raw != nullptr, "DSA topk: EndCapture returned null graph");
-        graph.reset(raw);
-    }
-
-    // Cache HIT: patch new pointers into the cached exec in place.
-    GraphEntry* slot = g_graph_cache.find_slot(k);
-    if (slot != nullptr) {
-        cudaGraphExecUpdateResultInfo info{};
-        cerr = cudaGraphExecUpdate(slot->exec, graph.get(), &info);
-        if (cerr == cudaSuccess && info.result == cudaGraphExecUpdateSuccess) {
-            graph.reset();  // template no longer needed
-            DSA_CUDA_CHECK(cudaGraphLaunch(slot->exec, stream));
-            return;
-        }
-        // Topology mismatch (shouldn't happen given the shape key, but
-        // be defensive): drop the cached exec and re-instantiate below.
-        g_graph_cache.invalidate(slot);
-    }
-
-    // Cache MISS: full instantiate + launch.
-    UniqueCudaGraphExec exec;
-    {
-        cudaGraphExec_t raw = nullptr;
-        DSA_CUDA_CHECK(cudaGraphInstantiate(&raw, graph.get(), 0));
-        TORCH_CHECK(raw != nullptr, "DSA topk: Instantiate returned null exec");
-        exec.reset(raw);
-    }
-    graph.reset();  // exec owns its own topology copy
-
-    DSA_CUDA_CHECK(cudaGraphLaunch(exec.get(), stream));
-    g_graph_cache.insert(k, exec.release());
+    g_graph_cache.replay(
+        GraphKey::make(stream, B, max_num_pages),
+        capture_stream(),
+        stream,
+        dispatch);
 }

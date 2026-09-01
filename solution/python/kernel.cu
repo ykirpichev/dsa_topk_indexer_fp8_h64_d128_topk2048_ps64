@@ -21,6 +21,7 @@
  *   stage1_short.cuh            Stage 1, mid-size contexts
  *   stage1_persistent_ws.cuh    Stage 1, large contexts (warp-specialised)
  *   stage2_topk.cuh             radix top-K + block-table transform
+ *   cuda_utils.cuh              CUDA RAII handles + error checks
  *   graph_cache.cuh             shape-keyed CUDA graph capture/replay
  *   dispatch.cuh                host entry, plan selection, launches
  */
