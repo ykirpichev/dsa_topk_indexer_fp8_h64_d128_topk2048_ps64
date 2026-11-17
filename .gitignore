@@ -7,6 +7,11 @@ solution.json
 # Local refactor scratch: benchmark logs, SASS dumps, pre-refactor backups
 artifacts/
 
+# Local scratch / generated outputs (do not commit)
+tmp/
+output/
+.DS_Store
+
 # CUDA build artifacts
 *.o
 *.obj
