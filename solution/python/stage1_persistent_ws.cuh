@@ -65,14 +65,14 @@ void paged_mqa_logits_umma_kernel_persistent_ws(
 
     const __half kHalfNegInf = __ushort_as_half(static_cast<unsigned short>(0xFC00));
 
-    // Both this and the range check in describe_tile below are unreachable --
-    // the host sets num_splits = ceil(max_kv_tile_pairs / tiles_per_cta) -- but
-    // they change how the compiler schedules the pipeline. Removing the
-    // describe_tile one alone costs 11.6% on B200; this one measured within
-    // noise but is kept for the same reason.
+    // Unreachable given the host grid (num_splits covers every tile-pair),
+    // but it changes how the compiler schedules the pipeline. Kept; see the
+    // matching check in describe_tile.
     if (tile_pair_begin >= max_kv_tile_pairs) return;
 
 
+    // Q and weights are loaded once. K is triple-buffered: the producer fills
+    // stage (i+1) % 3 while math consumes stage i % 3.
     __shared__ __align__(1024) __nv_fp8_e4m3 smem_q[kNumHeads * kHeadDim];
     __shared__ __align__(1024) __nv_fp8_e4m3 smem_k[kKVStages][kUMMA_M * kHeadDim];
     __shared__ float    smem_kscale[kKVStages][kUMMA_M];
@@ -91,6 +91,9 @@ void paged_mqa_logits_umma_kernel_persistent_ws(
 
     auto describe_tile = [&](int tp) -> TileDesc {
         TileDesc d{};
+        // Unreachable given the host grid, but removing it remeasured +9.7%
+        // on the persistent bucket (19.42 us vs 17.70 us, warmup=2/iter=25/
+        // trials=2, both builds with the shared UMMA helpers). Kept.
         if (tp < tile_pair_begin || tp >= tile_pair_end) return d;
         const int kv_base = tp * kUMMA_M;
         if (kv_base >= seq_len) return d;
@@ -107,23 +110,14 @@ void paged_mqa_logits_umma_kernel_persistent_ws(
         return d;
     };
 
-    if (warp_id == 0) {
-        const uint32_t tmem_ptr_smem = dsa_ptx::smem_ptr_to_uint(&smem_tmem_ptr);
-        dsa_ptx::tcgen05_alloc_1sm(tmem_ptr_smem, kTmemCols);
-        dsa_ptx::tcgen05_relinquish_alloc_permit_1sm();
-        if (lane == 0) {
+    alloc_tmem_init_mbars(&smem_tmem_ptr, kTmemCols, warp_id, lane, [&] {
 #pragma unroll
-            for (int s = 0; s < kKVStages; ++s) {
-                dsa_ptx::mbarrier_init(
-                    dsa_ptx::smem_ptr_to_uint(&smem_k_ready[s]), 1);
-                dsa_ptx::mbarrier_init(
-                    dsa_ptx::smem_ptr_to_uint(&smem_k_done[s]), 1);
-            }
-            dsa_ptx::mbarrier_init(
-                dsa_ptx::smem_ptr_to_uint(&smem_umma_done), 1);
+        for (int s = 0; s < kKVStages; ++s) {
+            dsa_ptx::mbarrier_init(dsa_ptx::smem_ptr_to_uint(&smem_k_ready[s]), 1);
+            dsa_ptx::mbarrier_init(dsa_ptx::smem_ptr_to_uint(&smem_k_done[s]), 1);
         }
-        dsa_ptx::fence_barrier_init();
-    }
+        dsa_ptx::mbarrier_init(dsa_ptx::smem_ptr_to_uint(&smem_umma_done), 1);
+    });
 
     if (is_math) {
         const uint4* src = reinterpret_cast<const uint4*>(
@@ -145,6 +139,8 @@ void paged_mqa_logits_umma_kernel_persistent_ws(
         // ======================= PRODUCER WARPGROUP =======================
         dsa_ptx::warpgroup_reg_dealloc<40>();
 
+        // Two pages per tile (128 K rows). The second page is zero-filled
+        // when it would run past seq_len; its scale is 0 so those logits die.
         auto prefetch_tile_producer = [&](int buf, int tp) {
             const TileDesc d = describe_tile(tp);
             if (d.any_valid) {
@@ -237,6 +233,9 @@ void paged_mqa_logits_umma_kernel_persistent_ws(
             const int buf     = i % kKVStages;
             const int kv_base = tp * kUMMA_M;
 
+            // K for this stage is visible. A tile entirely past seq_len only
+            // writes -inf and hands the buffer back; otherwise UMMA, then
+            // the same ReLU·weight·scale store as the short kernel.
             dsa_ptx::mbarrier_wait_parity(
                 dsa_ptx::smem_ptr_to_uint(&smem_k_ready[buf]),
                 ready_parity[buf]);
@@ -253,22 +252,13 @@ void paged_mqa_logits_umma_kernel_persistent_ws(
                 continue;
             }
 
-            if (warp_id == 0) {
-                dsa_ptx::tcgen05_fence_after_thread_sync();
-                if (lane == 0) {
-#pragma unroll
-                    for (int k = 0; k < kKIters; ++k) {
-                        const int k_off = k * kUMMA_K_B;
-                        dsa_ptx::tcgen05_mma_f8f6f4_ss(
-                            tmem_addr,
-                            advance_k(a_desc_base[buf], k_off),
-                            advance_k(b_desc_base, k_off),
-                            instr, (k == 0) ? 0u : 1u);
-                    }
-                    dsa_ptx::tcgen05_commit_1sm(
-                        dsa_ptx::smem_ptr_to_uint(&smem_umma_done));
-                }
-            }
+            issue_umma_k_commit<kKIters>(
+                tmem_addr,
+                a_desc_base[buf],
+                b_desc_base,
+                instr,
+                dsa_ptx::smem_ptr_to_uint(&smem_umma_done),
+                warp_id, lane);
 
             dsa_ptx::mbarrier_wait_parity(
                 dsa_ptx::smem_ptr_to_uint(&smem_umma_done), umma_parity);

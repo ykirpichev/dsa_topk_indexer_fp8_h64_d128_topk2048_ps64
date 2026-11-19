@@ -184,12 +184,17 @@ break:
    tied tokens land in the output.
 9. **The redundant bounds in `describe_tile` are load-bearing.** Removing the
    `tp < tile_pair_begin || tp >= tile_pair_end` check — unreachable, since the
-   producer only ever asks for tiles it owns — costs 11.6% on the persistent
-   kernel on its own: the compiler drops to 96 registers and reschedules the
-   producer/consumer pipeline. The `tile_pair_begin >= max_kv_tile_pairs` early
-   return next to it measured within noise but is kept for the same reason, as
-   is the equivalent bound in the short kernel (also within noise, −0.9%). None
-   of the three are worth removing for the one line each saves.
+   producer only ever asks for tiles it owns — originally cost 11.6% on the
+   persistent kernel: the compiler dropped to 96 registers and rescheduled the
+   producer/consumer pipeline. Remeasured 2026-11-17 after the shared UMMA
+   helpers, same sign: persistent-bucket mean 17.70 µs with the check vs
+   19.42 µs without (+9.7%, warmup=2, iterations=25, trials=2, 128/128
+   passed). The two runs overlapped, and the untouched fast path moved the
+   other way, so treat 9.7% as confirmation rather than a new point estimate.
+   The `tile_pair_begin >= max_kv_tile_pairs` early return next to it measured
+   within noise but is kept for the same reason, as is the equivalent bound in
+   the short kernel (also within noise, −0.9%). None of the three are worth
+   removing for the one line each saves.
 10. **Stage 2's non-cached path is a correctness path.** No contest workload
    exceeds `kStage2MaxCachedLen`, but rows longer than 16384 need it; without
    it they would read cache entries that were never written.

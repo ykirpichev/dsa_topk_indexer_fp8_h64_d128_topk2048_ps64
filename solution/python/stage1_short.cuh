@@ -61,6 +61,9 @@ void paged_mqa_logits_umma_kernel_short(
         return;
     }
 
+    // Q [64, 128] and one K page, both in the 128B swizzle UMMA expects.
+    // The MMA is M=128 but this kernel only has 64 real K rows, so the
+    // upper half of smem_k is zero and cannot contribute to the accumulator.
     __shared__ __align__(1024) __nv_fp8_e4m3 smem_q[kNumHeads * kHeadDim];
     __shared__ __align__(1024) __nv_fp8_e4m3 smem_k[kUMMA_M * kHeadDim];
     __shared__ float   smem_kscale[kBlockKv];
@@ -101,41 +104,28 @@ void paged_mqa_logits_umma_kernel_short(
 
     __syncthreads();
 
-    if (warp_id == 0) {
-        const uint32_t tmem_ptr_smem = dsa_ptx::smem_ptr_to_uint(&smem_tmem_ptr);
-        dsa_ptx::tcgen05_alloc_1sm(tmem_ptr_smem, kTmemCols);
-        dsa_ptx::tcgen05_relinquish_alloc_permit_1sm();
-        if (lane == 0)
-            dsa_ptx::mbarrier_init(dsa_ptx::smem_ptr_to_uint(&smem_mbar), 1);
-        dsa_ptx::fence_barrier_init();
-    }
+    // One UMMA (K·Q^T into TMEM) for this page, then every thread reads its
+    // 64 accumulators back. Warp 0 deallocates TMEM before the logit stores.
+    alloc_tmem_init_mbars(&smem_tmem_ptr, kTmemCols, warp_id, lane, [&] {
+        dsa_ptx::mbarrier_init(dsa_ptx::smem_ptr_to_uint(&smem_mbar), 1);
+    });
     __syncthreads();
 
     const uint32_t tmem_addr = smem_tmem_ptr;
 
-    if (warp_id == 0) {
-        dsa_ptx::tcgen05_fence_after_thread_sync();
-        if (lane == 0) {
-            const auto instr = dsa_umma::make_instr_desc_f8f6f4(
-                dsa_umma::F8F6F4Format::E4M3, dsa_umma::F8F6F4Format::E4M3,
-                dsa_umma::CFormat::F32,
-                dsa_umma::Major::K, dsa_umma::Major::K,
-                kUMMA_M, kUMMA_N);
-
-            const auto a_desc_base = make_kmajor_desc(smem_k, kSboBytes);
-            const auto b_desc_base = make_kmajor_desc(smem_q, kSboBytes);
-
-#pragma unroll
-            for (int k = 0; k < kKIters; ++k) {
-                const int k_off = k * kUMMA_K_B;
-                dsa_ptx::tcgen05_mma_f8f6f4_ss(
-                    tmem_addr,
-                    advance_k(a_desc_base, k_off),
-                    advance_k(b_desc_base, k_off),
-                    instr, (k == 0) ? 0u : 1u);
-            }
-            dsa_ptx::tcgen05_commit_1sm(dsa_ptx::smem_ptr_to_uint(&smem_mbar));
-        }
+    {
+        const auto instr = dsa_umma::make_instr_desc_f8f6f4(
+            dsa_umma::F8F6F4Format::E4M3, dsa_umma::F8F6F4Format::E4M3,
+            dsa_umma::CFormat::F32,
+            dsa_umma::Major::K, dsa_umma::Major::K,
+            kUMMA_M, kUMMA_N);
+        issue_umma_k_commit<kKIters>(
+            tmem_addr,
+            make_kmajor_desc(smem_k, kSboBytes),
+            make_kmajor_desc(smem_q, kSboBytes),
+            instr,
+            dsa_ptx::smem_ptr_to_uint(&smem_mbar),
+            warp_id, lane);
     }
 
     dsa_ptx::mbarrier_wait_parity(dsa_ptx::smem_ptr_to_uint(&smem_mbar), 0u);
@@ -152,6 +142,8 @@ void paged_mqa_logits_umma_kernel_short(
         dsa_ptx::tcgen05_dealloc_1sm(tmem_addr, kTmemCols);
     }
 
+    // logit = scale * sum_h ReLU(acc[h]) * weight[h]. Threads past seq_len
+    // write FP16 -inf so Stage 2's radix select cannot pick the padding.
     if (tid < kBlockKv) {
         const float* acc = reinterpret_cast<const float*>(regs);
         float acc_relu = 0.0f;

@@ -51,6 +51,8 @@ void topk_page_table_transform_kernel(
     __shared__ int      smem_emit_counter;
     __shared__ uint16_t smem_ordered[kStage2MaxCachedLen];
 
+    // Whole row is inside top-K: the answer is [0, seq_len) through the
+    // block table, padded with -1. Stage 1 skipped these rows too.
     if (seq_len <= top_k) {
         for (int i = tid; i < top_k; i += blockDim.x) {
             if (i < seq_len)
@@ -67,6 +69,8 @@ void topk_page_table_transform_kernel(
     const bool use_ordered_cache = (seq_len <= kStage2MaxCachedLen);
     const int  cached_len        = use_ordered_cache ? seq_len : 0;
 
+    // Two radix rounds (8 bits each, MSB first) narrow the ordered-uint16
+    // prefix until exactly top_k keys remain at or above that prefix.
 #pragma unroll
     for (int round = 0; round < kRadixRounds; ++round) {
         const int shift = kOrderedBits - 8 - round * 8;
@@ -104,6 +108,8 @@ void topk_page_table_transform_kernel(
 
         if (tid < kRadix) smem_suffix[tid] = smem_hist[tid];
         __syncthreads();
+        // Inclusive suffix sum of the 256 buckets, high bucket first, so
+        // suffix[b] is the count of keys whose digit is >= b.
         for (int stride = 1; stride < kRadix; stride <<= 1) {
             uint32_t v = 0u;
             if (tid < kRadix) {
@@ -135,6 +141,9 @@ void topk_page_table_transform_kernel(
         __syncthreads();
     }
 
+    // Emit every index strictly above the pivot, then indices equal to it,
+    // so ties break in a stable scan order. Then rewrite logical token ids
+    // as physical slots: block_table[tok/64]*64 + tok%64.
     const uint16_t pivot = smem_prefix;
 
     if (tid == 0) { smem_gt_count = 0; smem_emit_counter = 0; }
