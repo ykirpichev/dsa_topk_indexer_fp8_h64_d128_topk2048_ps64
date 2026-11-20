@@ -102,7 +102,7 @@ ol.steps li { margin-bottom: 8px; }
 
 <p class="meta"><a href="../">DSA FP8 top-K indexer</a> · <a href="../triton-vs-cuda/">Triton vs CUDA, workload by workload</a></p>
 <h1>Four ways to write the same FP8 top-K indexer</h1>
-<p class="lede">One kernel, four implementations, one B200. This walks through the math, the shared plan, where each version lives, and what the timings say.</p>
+<p class="lede">One kernel, four implementations, one B200. This walks through the math, the shared plan, the source for each step, and what the timings say. The listings are the first section below.</p>
 <p class="meta">November 20, 2026 · NVIDIA B200 on Modal · definition <code>dsa_topk_indexer_fp8_h64_d128_topk2048_ps64</code> ·
 <a href="https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64">repository</a></p>
 
@@ -114,37 +114,6 @@ ol.steps li { margin-bottom: 8px; }
 </div>
 
 <p>The first two numbers are the official flashinfer-bench measurement: CUDA events are replaced by CUPTI, the L2 cache is flushed, and the reported time is the span from the first kernel start to the last kernel end across 128 contest shapes. The last two are a smaller check, described below, on five synthetic shapes. They are comparable to each other. They are an upper bound on the contest number for the same shape.</p>
-
-<h2>The operation</h2>
-<p>For each query in a batch, score every token of a paged FP8 KV cache and return the top 2048 physical indices.</p>
-<pre><code>logit[t] = scale[page, slot] * sum_h ReLU(Q[b, h] · K[page, slot]) * w[b, h]
-physical id = block_table[b, t / 64] * 64 + (t % 64)</code></pre>
-<p>Q is <code>[B, 64, 128]</code> FP8 E4M3. The cache is one byte buffer per page, 8448 bytes: 8192 FP8 values (64 tokens × 128) followed by 64 FP32 scales. The scale multiplies the ReLU'd dot product; it is not folded into the matrix multiply. Unused slots of the 2048-wide output are <code>-1</code>.</p>
-
-<h2>One plan, used by all four</h2>
-<p>The sequence length decides the kernel. <code>max_num_pages</code> is the longest sequence in the batch, in pages of 64 tokens.</p>
-<table>
-  <thead><tr><th>Pages</th><th>What runs</th><th>Why</th></tr></thead>
-  <tbody>
-    <tr><td>≤ 32</td><td>Fast path</td><td>Every live token is inside the top 2048, so the output is the block-table remap of <code>0 .. seq_len</code>. Q, K, and the weights are never read.</td></tr>
-    <tr><td>33–63</td><td>Stage 1, then stage 2</td><td>Short enough that one tile per CTA fills the GPU.</td></tr>
-    <tr><td>≥ 64</td><td>Stage 1, then stage 2</td><td>Same math. The CUDA version switches to a warp-specialized persistent stage 1 here; the ports keep one tile per CTA.</td></tr>
-  </tbody>
-</table>
-<p>Stage 1 scores two pages (128 tokens) per CTA. A Blackwell <code>tcgen05</code> MMA multiplies the FP8 tile of K by the FP8 tile of Q into FP32 tensor memory. The epilogue applies ReLU, the per-head weight, a sum over the 64 heads, and the per-token scale, and writes an FP16 logit.</p>
-<p>Stage 2 keeps the 2048 largest logits and remaps them through the block table. Rows at or under 2048 tokens skip the select and write the block-table ids directly.</p>
-
-<h2>Where the code is</h2>
-<table>
-  <thead><tr><th>Version</th><th>Entry</th><th>Size</th><th>Contest image</th></tr></thead>
-  <tbody>
-    <tr><td>CUDA</td><td><a href="https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64/tree/main/solution/python"><code>solution/python</code></a>, <code>solution.py::kernel</code></td><td>13 files, 1,246 lines</td><td>This is what <code>config.toml</code> submits.</td></tr>
-    <tr><td>Triton</td><td><a href="https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64/blob/main/solution/triton/solution.py"><code>solution/triton/solution.py</code></a></td><td>321 lines</td><td>Triton 3.7.0 is in the image. 3.9.0 was installed for the second run.</td></tr>
-    <tr><td>TileLang</td><td><a href="https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64/blob/main/solution/tilelang/solution.py"><code>solution/tilelang/solution.py</code></a></td><td>384 lines</td><td>TileLang is built by flashinfer-bench. These numbers are from 0.1.15.</td></tr>
-    <tr><td>ThunderKittens</td><td><a href="https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64/blob/main/solution/tk/indexer.cu"><code>solution/tk/indexer.cu</code></a> and <a href="https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64/blob/main/solution/tk/solution.py"><code>solution.py</code></a></td><td>373 + 48 lines</td><td>The headers are not in the contest image.</td></tr>
-  </tbody>
-</table>
-<p>Every <code>kernel(...)</code> has the same six arguments: Q, the KV cache, the weights, the sequence lengths, the block table, and the output index buffer.</p>
 
 <h2 id="code">The same pieces, side by side</h2>
 <p>Each step of the kernel is below. Pick a language and every step follows. The listing is the source that was timed. A line that says <code>...</code> is a cut between two regions of the same file.</p>
@@ -1059,6 +1028,37 @@ def _stage2_topk(logit_bits_ptr, seq_lens_ptr, bt_ptr, out_ptr,
 <p class="src"><a href="https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64/blob/main/solution/tk/indexer.cu#L257-L292">solution/tk/indexer.cu, lines 257–292</a></p>
 </div>
 </div></section>
+<h2>The operation</h2>
+<p>For each query in a batch, score every token of a paged FP8 KV cache and return the top 2048 physical indices.</p>
+<pre><code>logit[t] = scale[page, slot] * sum_h ReLU(Q[b, h] · K[page, slot]) * w[b, h]
+physical id = block_table[b, t / 64] * 64 + (t % 64)</code></pre>
+<p>Q is <code>[B, 64, 128]</code> FP8 E4M3. The cache is one byte buffer per page, 8448 bytes: 8192 FP8 values (64 tokens × 128) followed by 64 FP32 scales. The scale multiplies the ReLU'd dot product; it is not folded into the matrix multiply. Unused slots of the 2048-wide output are <code>-1</code>.</p>
+
+<h2>One plan, used by all four</h2>
+<p>The sequence length decides the kernel. <code>max_num_pages</code> is the longest sequence in the batch, in pages of 64 tokens.</p>
+<table>
+  <thead><tr><th>Pages</th><th>What runs</th><th>Why</th></tr></thead>
+  <tbody>
+    <tr><td>≤ 32</td><td>Fast path</td><td>Every live token is inside the top 2048, so the output is the block-table remap of <code>0 .. seq_len</code>. Q, K, and the weights are never read.</td></tr>
+    <tr><td>33–63</td><td>Stage 1, then stage 2</td><td>Short enough that one tile per CTA fills the GPU.</td></tr>
+    <tr><td>≥ 64</td><td>Stage 1, then stage 2</td><td>Same math. The CUDA version switches to a warp-specialized persistent stage 1 here; the ports keep one tile per CTA.</td></tr>
+  </tbody>
+</table>
+<p>Stage 1 scores two pages (128 tokens) per CTA. A Blackwell <code>tcgen05</code> MMA multiplies the FP8 tile of K by the FP8 tile of Q into FP32 tensor memory. The epilogue applies ReLU, the per-head weight, a sum over the 64 heads, and the per-token scale, and writes an FP16 logit.</p>
+<p>Stage 2 keeps the 2048 largest logits and remaps them through the block table. Rows at or under 2048 tokens skip the select and write the block-table ids directly.</p>
+
+<h2>Where the code is</h2>
+<table>
+  <thead><tr><th>Version</th><th>Entry</th><th>Size</th><th>Contest image</th></tr></thead>
+  <tbody>
+    <tr><td>CUDA</td><td><a href="https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64/tree/main/solution/python"><code>solution/python</code></a>, <code>solution.py::kernel</code></td><td>13 files, 1,246 lines</td><td>This is what <code>config.toml</code> submits.</td></tr>
+    <tr><td>Triton</td><td><a href="https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64/blob/main/solution/triton/solution.py"><code>solution/triton/solution.py</code></a></td><td>321 lines</td><td>Triton 3.7.0 is in the image. 3.9.0 was installed for the second run.</td></tr>
+    <tr><td>TileLang</td><td><a href="https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64/blob/main/solution/tilelang/solution.py"><code>solution/tilelang/solution.py</code></a></td><td>384 lines</td><td>TileLang is built by flashinfer-bench. These numbers are from 0.1.15.</td></tr>
+    <tr><td>ThunderKittens</td><td><a href="https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64/blob/main/solution/tk/indexer.cu"><code>solution/tk/indexer.cu</code></a> and <a href="https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64/blob/main/solution/tk/solution.py"><code>solution.py</code></a></td><td>373 + 48 lines</td><td>The headers are not in the contest image.</td></tr>
+  </tbody>
+</table>
+<p>Every <code>kernel(...)</code> has the same six arguments: Q, the KV cache, the weights, the sequence lengths, the block table, and the output index buffer.</p>
+
 <h2>Run them</h2>
 <h3>CUDA, the contest harness</h3>
 <pre><code>modal run scripts/run_modal.py</code></pre>
