@@ -54,6 +54,46 @@ caption { caption-side: bottom; text-align: left; color: var(--muted); font-size
 .swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 6px; }
 ol.steps { padding-left: 1.2rem; }
 ol.steps li { margin-bottom: 8px; }
+
+.piece-nav { display: flex; flex-wrap: wrap; gap: 8px; margin: 8px 0 4px; }
+.piece-nav a { font-size: 0.88rem; border: 1px solid var(--line); border-radius: 999px; padding: 3px 10px; background: var(--card); }
+.piece { margin: 36px 0; }
+.piece h3 { margin-bottom: 4px; }
+.piece .why { color: var(--muted); margin-top: 0; }
+.editor { border: 1px solid var(--line); border-radius: 10px; overflow: hidden; background: var(--code-bg); }
+.tabs { display: flex; gap: 0; background: var(--card); border-bottom: 1px solid var(--line); overflow-x: auto; }
+.tabs button {
+  appearance: none; background: transparent; border: 0; border-bottom: 2px solid transparent;
+  margin-bottom: -1px; padding: 10px 16px; font: inherit; font-size: 0.92rem;
+  color: var(--muted); cursor: pointer; white-space: nowrap;
+}
+.tabs button:hover { color: var(--fg); }
+.tabs button:focus-visible { outline: 2px solid var(--t39); outline-offset: -2px; }
+.tabs button.on { color: var(--fg); font-weight: 650; }
+.tabs button.cuda.on { border-bottom-color: var(--cuda); }
+.tabs button.triton.on { border-bottom-color: var(--t39); }
+.tabs button.tilelang.on { border-bottom-color: var(--tl); }
+.tabs button.tk.on { border-bottom-color: var(--tk); }
+.pane { display: none; }
+.pane.on { display: block; }
+.editor pre { margin: 0; border: 0; border-radius: 0; max-height: 32rem; padding: 16px 18px; background: transparent; }
+.editor .src { margin: 0; padding: 8px 16px 10px; border-top: 1px solid var(--line); font-size: 0.82rem; color: var(--muted); background: var(--card); }
+.tok-kw { color: #cf222e; }
+.tok-str { color: #0a3069; }
+.tok-cmt { color: #6e7781; font-style: italic; }
+.tok-num { color: #0550ae; }
+.tok-fn { color: #8250df; }
+.tok-pp { color: #953800; }
+.tok-dec { color: #953800; }
+@media (prefers-color-scheme: dark) {
+  .tok-kw { color: #ff7b72; }
+  .tok-str { color: #a5d6ff; }
+  .tok-cmt { color: #8b949e; }
+  .tok-num { color: #79c0ff; }
+  .tok-fn { color: #d2a8ff; }
+  .tok-pp, .tok-dec { color: #ffa657; }
+}
+
 @media (max-width: 800px) { .cards { grid-template-columns: 1fr 1fr; } h1 { font-size: 1.55rem; } }
 </style>
 </head>
@@ -106,6 +146,919 @@ physical id = block_table[b, t / 64] * 64 + (t % 64)</code></pre>
 </table>
 <p>Every <code>kernel(...)</code> has the same six arguments: Q, the KV cache, the weights, the sequence lengths, the block table, and the output index buffer.</p>
 
+<h2 id="code">The same pieces, side by side</h2>
+<p>Each step of the kernel is below. Pick a language and every step follows. The listing is the source that was timed. A line that says <code>...</code> is a cut between two regions of the same file.</p>
+<nav class="piece-nav">
+<a href="#piece-dispatch">Which kernel runs</a>
+<a href="#piece-fast">Fast path</a>
+<a href="#piece-gather">Gather a page into the MMA tile</a>
+<a href="#piece-mma">The matrix multiply</a>
+<a href="#piece-epilogue">ReLU, the head weight, and the scale</a>
+<a href="#piece-radix">Radix rounds</a>
+<a href="#piece-emit">Keep the winners and remap them</a>
+</nav>
+<section class="piece" id="piece-dispatch">
+<h3>Which kernel runs</h3>
+<p class="why">The longest sequence in the batch, measured in pages of 64 tokens, picks the kernel. At 32 pages or fewer every live token already fits in the top 2048, so scoring is skipped.</p>
+<div class="editor">
+<div class="tabs" role="tablist">
+<button type="button" role="tab" aria-selected="true" class="cuda on" data-lang="cuda">CUDA</button>
+<button type="button" role="tab" aria-selected="false" class="triton" data-lang="triton">Triton</button>
+<button type="button" role="tab" aria-selected="false" class="tilelang" data-lang="tilelang">TileLang</button>
+<button type="button" role="tab" aria-selected="false" class="tk" data-lang="tk">ThunderKittens</button>
+</div>
+<div class="pane on" data-lang="cuda" role="tabpanel">
+<pre><code class="lang-cpp">// Stage-1 plan for a call; derivable from max_num_pages alone.
+enum class Plan : uint8_t {
+    FastPath     = 0,  // context fits in top-K: skip Stage 1 and Stage 2
+    Short        = 1,  // kFastPathMaxPages &lt; pages &lt; kPersistentPageThreshold
+    PersistentWs = 2,  // pages &gt;= kPersistentPageThreshold
+};
+
+inline Plan select_plan(int max_num_pages) {
+    if (max_num_pages &lt;= kFastPathMaxPages) return Plan::FastPath;
+    if (max_num_pages &gt;= kPersistentPageThreshold) return Plan::PersistentWs;
+    return Plan::Short;
+}
+</code></pre>
+<p class="src"><a href="https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64/blob/main/solution/python/dsa_config.cuh#L49-L60">solution/python/dsa_config.cuh, lines 49–60</a></p>
+</div>
+<div class="pane" data-lang="triton" role="tabpanel">
+<pre><code class="lang-python">def _stage1_plan(batch, max_num_pages):
+    """(pages_per_tile, tiles_per_prog, grid_x, stages, logits_per_row)."""
+    if max_num_pages &lt; PERSISTENT_MIN_PAGES:
+        pages, stages = SHORT_PAGES_PER_TILE, 1
+        tiles = _ceil_div(max_num_pages, pages)
+        tiles_per_prog = 1
+    else:
+        pages, stages = 2, PERSISTENT_STAGES
+        tiles = _ceil_div(max_num_pages, pages)
+        programs = min(tiles, _ceil_div(PERSISTENT_PROGRAMS, batch))
+        tiles_per_prog = min(max(_ceil_div(tiles, programs), PERSISTENT_MIN_TILES),
+                             PERSISTENT_MAX_TILES)
+    logits_per_row = tiles * pages * PAGE.value
+    return pages, tiles_per_prog, _ceil_div(tiles, tiles_per_prog), stages, logits_per_row
+
+# ...
+def kernel(q_index_fp8, k_index_cache_fp8, weights, seq_lens, block_table, topk_indices):
+    batch, max_num_pages = block_table.shape
+
+    if max_num_pages &lt;= FAST_PATH_MAX_PAGES.value:
+        _fast_path[(batch,)](seq_lens, block_table, topk_indices, max_num_pages, num_warps=4)
+        return
+</code></pre>
+<p class="src"><a href="https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64/blob/main/solution/triton/solution.py#L204-L217">solution/triton/solution.py, lines 204–217 and 281–286</a></p>
+</div>
+<div class="pane" data-lang="tilelang" role="tabpanel">
+<pre><code class="lang-python">def kernel(q_index_fp8, k_index_cache_fp8, weights, seq_lens, block_table, topk_indices):
+    batch, max_num_pages = block_table.shape
+    device = block_table.device
+    if max_num_pages &lt;= FAST_MAX_PAGES:
+        def fast():
+            _fast_path(seq_lens, block_table, topk_indices)
+        key = (seq_lens.data_ptr(), block_table.data_ptr(), topk_indices.data_ptr(),
+               batch, max_num_pages)
+        _replay(key, device, fast)
+        return
+</code></pre>
+<p class="src"><a href="https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64/blob/main/solution/tilelang/solution.py#L349-L358">solution/tilelang/solution.py, lines 349–358</a></p>
+</div>
+<div class="pane" data-lang="tk" role="tabpanel">
+<pre><code class="lang-cpp">void run(torch::Tensor q, torch::Tensor k, torch::Tensor weights, torch::Tensor seq_lens,
+         torch::Tensor block_table, torch::Tensor topk_indices) {
+    const int batch = block_table.size(0);
+    const int max_pages = block_table.size(1);
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    if (max_pages &lt;= 32) {
+        fast_path&lt;&lt;&lt;batch, 256, 0, stream&gt;&gt;&gt;(
+            seq_lens.data_ptr&lt;int&gt;(), block_table.data_ptr&lt;int&gt;(),
+            topk_indices.data_ptr&lt;int&gt;(), max_pages);
+        check(cudaGetLastError(), "fast path");
+        return;
+    }
+</code></pre>
+<p class="src"><a href="https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64/blob/main/solution/tk/indexer.cu#L310-L322">solution/tk/indexer.cu, lines 310–322</a></p>
+</div>
+</div></section>
+<section class="piece" id="piece-fast">
+<h3>Fast path</h3>
+<p class="why">The output is the block-table remap of <code>0 .. seq_len</code>, and <code>-1</code> after that. Q, K, and the weights are never read.</p>
+<div class="editor">
+<div class="tabs" role="tablist">
+<button type="button" role="tab" aria-selected="true" class="cuda on" data-lang="cuda">CUDA</button>
+<button type="button" role="tab" aria-selected="false" class="triton" data-lang="triton">Triton</button>
+<button type="button" role="tab" aria-selected="false" class="tilelang" data-lang="tilelang">TileLang</button>
+<button type="button" role="tab" aria-selected="false" class="tk" data-lang="tk">ThunderKittens</button>
+</div>
+<div class="pane on" data-lang="cuda" role="tabpanel">
+<pre><code class="lang-cpp">__global__ __launch_bounds__(128)
+void topk_fast_path_kernel(
+    const int* __restrict__ seq_lens,
+    const int* __restrict__ block_table,
+    int max_num_pages,
+    int* __restrict__ out_indices)
+{
+    constexpr int kInts4PerRow   = kTopK / 4;           // 512 int4 per row
+    constexpr int kInt4PerThread = kInts4PerRow / 128;  // 4 int4 per thread
+
+    const int b   = blockIdx.x;
+    const int tid = threadIdx.x;
+
+    __shared__ int smem_bt[kFastPathMaxPages];
+    if (tid &lt; kFastPathMaxPages) {
+        smem_bt[tid] = (tid &lt; max_num_pages)
+            ? block_table[b * max_num_pages + tid]
+            : 0;
+    }
+
+    const int seq_len = seq_lens[b];
+    int4*     out4    = reinterpret_cast&lt;int4*&gt;(
+        out_indices + static_cast&lt;size_t&gt;(b) * kTopK);
+
+    __syncthreads();
+
+#pragma unroll
+    for (int s = 0; s &lt; kInt4PerThread; ++s) {
+        const int i4   = tid + s * 128;                     // 0..511
+        const int base = i4 &lt;&lt; 2;                            // 0..2044, stride 4
+
+        const int page0 = (base + 0) &gt;&gt; 6;                   // / 64
+        const int page1 = (base + 1) &gt;&gt; 6;
+        const int page2 = (base + 2) &gt;&gt; 6;
+        const int page3 = (base + 3) &gt;&gt; 6;
+        const int slot0 = (base + 0) &amp; 63;
+        const int slot1 = (base + 1) &amp; 63;
+        const int slot2 = (base + 2) &amp; 63;
+        const int slot3 = (base + 3) &amp; 63;
+
+        int4 v;
+        v.x = (base + 0 &lt; seq_len) ? (smem_bt[page0] &lt;&lt; 6) + slot0 : -1;
+        v.y = (base + 1 &lt; seq_len) ? (smem_bt[page1] &lt;&lt; 6) + slot1 : -1;
+        v.z = (base + 2 &lt; seq_len) ? (smem_bt[page2] &lt;&lt; 6) + slot2 : -1;
+        v.w = (base + 3 &lt; seq_len) ? (smem_bt[page3] &lt;&lt; 6) + slot3 : -1;
+        out4[i4] = v;
+    }
+}
+</code></pre>
+<p class="src"><a href="https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64/blob/main/solution/python/fast_path.cuh#L18-L65">solution/python/fast_path.cuh, lines 18–65</a></p>
+</div>
+<div class="pane" data-lang="triton" role="tabpanel">
+<pre><code class="lang-python">@triton.jit
+def _fast_path(seq_lens_ptr, bt_ptr, out_ptr, max_num_pages):
+    """out[b] = block-table transform of [0, seq_len), -1 past seq_len."""
+    b = tl.program_id(0)
+    seq_len = tl.load(seq_lens_ptr + b)
+    p = tl.arange(0, FAST_PATH_MAX_PAGES)
+    j = tl.arange(0, PAGE)
+    # One load per page, not per token: [32] page ids broadcast to [32, 64].
+    page = tl.load(bt_ptr + b * max_num_pages + p, mask=p &lt; max_num_pages, other=0)
+    tok = p[:, None] * PAGE + j[None, :]
+    phys = page[:, None] * PAGE + j[None, :]
+    tl.store(out_ptr + b * TOPK + tok, tl.where(tok &lt; seq_len, phys, -1))
+</code></pre>
+<p class="src"><a href="https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64/blob/main/solution/triton/solution.py#L59-L70">solution/triton/solution.py, lines 59–70</a></p>
+</div>
+<div class="pane" data-lang="tilelang" role="tabpanel">
+<pre><code class="lang-python">@tilelang.jit(target="cuda", pass_configs=_PASS)
+def _fast_path(seq_lens, block_table, out):
+    """out[b] = block-table transform of [0, seq_len), -1 past seq_len."""
+    B = T.dynamic("B")
+    max_pages = T.dynamic("max_pages")
+    seq_lens: T.Tensor((B,), T.int32)
+    block_table: T.Tensor((B, max_pages), T.int32)
+    out: T.Tensor((B, TOPK), T.int32)
+
+    with T.Kernel(B, threads=256) as b:
+        seq = seq_lens[b]
+        for n in T.Parallel(TOPK):
+            # seq_len never reaches a page the table does not hold.
+            page = block_table[b, T.min(n // PAGE, max_pages - 1)]
+            phys = page * PAGE + n % PAGE
+            out[b, n] = T.if_then_else(n &lt; seq, phys, -1)
+</code></pre>
+<p class="src"><a href="https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64/blob/main/solution/tilelang/solution.py#L45-L60">solution/tilelang/solution.py, lines 45–60</a></p>
+</div>
+<div class="pane" data-lang="tk" role="tabpanel">
+<pre><code class="lang-cpp">__global__ void fast_path(const int* __restrict__ seq_lens,
+                          const int* __restrict__ block_table,
+                          int* __restrict__ out,
+                          int max_pages) {
+    const int b = blockIdx.x;
+    const int seq = seq_lens[b];
+    for (int n = threadIdx.x; n &lt; kTopK; n += blockDim.x) {
+        const int page = block_table[b * max_pages + min(n / kPage, max_pages - 1)];
+        out[b * kTopK + n] = (n &lt; seq) ? page * kPage + (n % kPage) : -1;
+    }
+}
+</code></pre>
+<p class="src"><a href="https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64/blob/main/solution/tk/indexer.cu#L36-L46">solution/tk/indexer.cu, lines 36–46</a></p>
+</div>
+</div></section>
+<section class="piece" id="piece-gather">
+<h3>Gather a page into the MMA tile</h3>
+<p class="why">The KV cache is paged, so the CTA copies tokens into the 128-byte swizzle the tensor core reads, and loads the FP32 scale that sits after the FP8 bytes. The CUDA short kernel scores one page and zeroes the other half of the M=128 tile. The persistent CUDA kernel and the three ports score two pages.</p>
+<div class="editor">
+<div class="tabs" role="tablist">
+<button type="button" role="tab" aria-selected="true" class="cuda on" data-lang="cuda">CUDA</button>
+<button type="button" role="tab" aria-selected="false" class="triton" data-lang="triton">Triton</button>
+<button type="button" role="tab" aria-selected="false" class="tilelang" data-lang="tilelang">TileLang</button>
+<button type="button" role="tab" aria-selected="false" class="tk" data-lang="tk">ThunderKittens</button>
+</div>
+<div class="pane on" data-lang="cuda" role="tabpanel">
+<pre><code class="lang-cpp">    {
+        const uint4* src = reinterpret_cast&lt;const uint4*&gt;(
+            q_fp8 + static_cast&lt;size_t&gt;(b) * kNumHeads * kHeadDim);
+        uint4* dst = reinterpret_cast&lt;uint4*&gt;(smem_q);
+        constexpr int kVec = (kNumHeads * kHeadDim) / 16;
+#pragma unroll 4
+        for (int i = tid; i &lt; kVec; i += kThreads) dst[swizzle_16b(i)] = src[i];
+    }
+
+    const int page_idx = block_table[b * max_num_pages + tile_idx];
+    const uint8_t* page_ptr = kv_cache + static_cast&lt;size_t&gt;(page_idx) * kPageBytes;
+
+    {
+        const uint4* src = reinterpret_cast&lt;const uint4*&gt;(page_ptr);
+        uint4* dst = reinterpret_cast&lt;uint4*&gt;(smem_k);
+        constexpr int kVecReal  = (kBlockKv * kHeadDim) / 16;
+        constexpr int kVecTotal = (kUMMA_M * kHeadDim) / 16;
+        const uint4 zero4 = make_uint4(0u, 0u, 0u, 0u);
+#pragma unroll 4
+        for (int i = tid; i &lt; kVecReal; i += kThreads)
+            dst[swizzle_16b(i)] = src[i];
+#pragma unroll 4
+        for (int i = tid; i &lt; (kVecTotal - kVecReal); i += kThreads)
+            dst[swizzle_16b(i + kVecReal)] = zero4;
+    }
+
+    if (tid &lt; kBlockKv)
+        smem_kscale[tid] = reinterpret_cast&lt;const float*&gt;(page_ptr + kScaleOffsetBytes)[tid];
+    if (tid &lt; kNumHeads)
+        smem_w[tid] = weights[b * kNumHeads + tid];
+</code></pre>
+<p class="src"><a href="https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64/blob/main/solution/python/stage1_short.cuh#L74-L103">solution/python/stage1_short.cuh, lines 74–103</a></p>
+</div>
+<div class="pane" data-lang="triton" role="tabpanel">
+<pre><code class="lang-python">    for t in tl.range(first, last, num_stages=STAGES):
+        tok = t * TILE + m                                           # [TILE]
+        # Tokens past seq_len in the last tile re-read the row's final live
+        # page. That keeps every address valid without a masked load, and
+        # their logits are dropped by the store mask below.
+        slot = tl.minimum(tok // PAGE, last_page)
+        page = tl.load(bt_ptr + b * max_num_pages + slot).to(tl.int64)
+        row = tok % PAGE
+        k = tl.load(k_ptr + (page * PAGE_BYTES + row * D)[:, None] + d[None, :])  # [TILE, D] fp8
+        scale = tl.load(kscale_ptr + page * (PAGE_BYTES // 4) + SCALE_OFFSET // 4 + row)
+</code></pre>
+<p class="src"><a href="https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64/blob/main/solution/triton/solution.py#L103-L112">solution/triton/solution.py, lines 103–112</a></p>
+</div>
+<div class="pane" data-lang="tilelang" role="tabpanel">
+<pre><code class="lang-python">            tx = T.get_thread_binding()
+            # 128 threads cover a row's 8 chunks of 16 bytes. ldg32 is the
+            # widest load whose result is a scalar we can bitcast; a uint32x4
+            # from ldg128 cannot be indexed in this frontend.
+            for j in T.serial(4):
+                vid = tx + j * 128
+                h = vid // 8
+                col = (vid % 8) * 16
+                for part in T.serial(4):
+                    words[part] = T.ldg32(q[b, h, col + part * 4])
+                for e in T.serial(16):
+                    q_s[h, col + e] = gathered[e]
+            for j in T.serial(8):
+                vid = tx + j * 128
+                i = vid // 8
+                col = (vid % 8) * 16
+                tok = tile * TILE + i
+                slot = T.min(tok // PAGE, last_page)
+                page = T.cast(block_table[b, slot], "int64")
+                row = tok % PAGE
+                base = page * PAGE_BYTES + row * D + col
+                for part in T.serial(4):
+                    words[part] = T.ldg32(k[base + part * 4])
+                for e in T.serial(16):
+                    k_s[i, col + e] = gathered[e]
+            for h in T.Parallel(H):
+                w_s[h] = w[b, h]
+            for i in T.Parallel(TILE):
+                tok = tile * TILE + i
+                slot = T.min(tok // PAGE, last_page)
+                page = T.cast(block_table[b, slot], "int64")
+                row = tok % PAGE
+                scale_s[i] = kscale[page * SCALE_FLOATS + SCALE_OFFSET + row]
+</code></pre>
+<p class="src"><a href="https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64/blob/main/solution/tilelang/solution.py#L99-L131">solution/tilelang/solution.py, lines 99–131</a></p>
+</div>
+<div class="pane" data-lang="tk" role="tabpanel">
+<pre><code class="lang-cpp">    // One 16-byte store per vector, at the swizzled index the MMA descriptor
+    // reads. A byte-wise store through operator[] issues 16 shared stores
+    // for the same 16 bytes.
+    {
+        uint4* dst = reinterpret_cast&lt;uint4*&gt;(q_smem.data);
+        #pragma unroll
+        for (int j = 0; j &lt; (kHeads * kDim) / 16 / kStage1Threads; ++j) {
+            const int v = tx + j * kStage1Threads;
+            const int h = v &gt;&gt; 3;
+            const int col = (v &amp; 7) &lt;&lt; 4;
+            const uint8_t* src = q + (static_cast&lt;int64_t&gt;(b) * kHeads + h) * kDim + col;
+            dst[swizzle_16b(v)] = *reinterpret_cast&lt;const uint4*&gt;(src);
+        }
+    }
+    {
+        uint4* dst = reinterpret_cast&lt;uint4*&gt;(k_smem.data);
+        uint4 regs[(kTile * kDim) / 16 / kStage1Threads];
+        int dest[(kTile * kDim) / 16 / kStage1Threads];
+        #pragma unroll
+        for (int j = 0; j &lt; (kTile * kDim) / 16 / kStage1Threads; ++j) {
+            const int v = tx + j * kStage1Threads;
+            const int i = v &gt;&gt; 3;
+            const int col = (v &amp; 7) &lt;&lt; 4;
+            const int tok = tile * kTile + i;
+            const int slot = min(tok / kPage, last_page);
+            const int page = row_bt[slot];
+            const int row = tok % kPage;
+            const int64_t addr = static_cast&lt;int64_t&gt;(page) * kPageBytes + row * kDim + col;
+            regs[j] = *reinterpret_cast&lt;const uint4*&gt;(k + addr);
+            dest[j] = swizzle_16b(v);
+        }
+        #pragma unroll
+        for (int j = 0; j &lt; (kTile * kDim) / 16 / kStage1Threads; ++j)
+            dst[dest[j]] = regs[j];
+    }
+    if (tx &lt; kHeads) w_s[tx] = weights[b * kHeads + tx];
+    if (tx &lt; kTile) {
+        const int tok = tile * kTile + tx;
+        const int slot = min(tok / kPage, last_page);
+        const int page = row_bt[slot];
+        const int row = tok % kPage;
+        scale_s[tx] = kscale[static_cast&lt;int64_t&gt;(page) * (kPageBytes / 4) + (kDim * kPage) / 4 + row];
+    }
+</code></pre>
+<p class="src"><a href="https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64/blob/main/solution/tk/indexer.cu#L80-L122">solution/tk/indexer.cu, lines 80–122</a></p>
+</div>
+</div></section>
+<section class="piece" id="piece-mma">
+<h3>The matrix multiply</h3>
+<p class="why">Q is 64×128 and the K tile is 128×128. The product is FP32 in tensor memory. CUDA writes the K loop as <code>tcgen05.mma</code>. Triton, TileLang, and ThunderKittens each call that instruction through their own name.</p>
+<div class="editor">
+<div class="tabs" role="tablist">
+<button type="button" role="tab" aria-selected="true" class="cuda on" data-lang="cuda">CUDA</button>
+<button type="button" role="tab" aria-selected="false" class="triton" data-lang="triton">Triton</button>
+<button type="button" role="tab" aria-selected="false" class="tilelang" data-lang="tilelang">TileLang</button>
+<button type="button" role="tab" aria-selected="false" class="tk" data-lang="tk">ThunderKittens</button>
+</div>
+<div class="pane on" data-lang="cuda" role="tabpanel">
+<pre><code class="lang-cpp">    {
+        const auto instr = dsa_umma::make_instr_desc_f8f6f4(
+            dsa_umma::F8F6F4Format::E4M3, dsa_umma::F8F6F4Format::E4M3,
+            dsa_umma::CFormat::F32,
+            dsa_umma::Major::K, dsa_umma::Major::K,
+            kUMMA_M, kUMMA_N);
+        issue_umma_k_commit&lt;kKIters&gt;(
+            tmem_addr,
+            make_kmajor_desc(smem_k, kSboBytes),
+            make_kmajor_desc(smem_q, kSboBytes),
+            instr,
+            dsa_ptx::smem_ptr_to_uint(&amp;smem_mbar),
+            warp_id, lane);
+    }
+
+// issue_umma_k_commit, the loop that call hides. K steps by 32 bytes.
+    constexpr int kKStep = 32;
+    if (warp_id == 0) {
+        dsa_ptx::tcgen05_fence_after_thread_sync();
+        if (lane == 0) {
+#pragma unroll
+            for (int k = 0; k &lt; KIters; ++k) {
+                const int k_off = k * kKStep;
+                dsa_ptx::tcgen05_mma_f8f6f4_ss(
+                    tmem_addr,
+                    advance_k(a_base, k_off),
+                    advance_k(b_base, k_off),
+                    instr, (k == 0) ? 0u : 1u);
+            }
+            dsa_ptx::tcgen05_commit_1sm(mbar_addr);
+        }
+    }
+</code></pre>
+<p class="src"><a href="https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64/blob/main/solution/python/stage1_short.cuh#L116-L129">solution/python/stage1_short.cuh, lines 116–129, and solution/python/stage1_common.cuh, lines 73–87</a></p>
+</div>
+<div class="pane" data-lang="triton" role="tabpanel">
+<pre><code class="lang-python">    h = tl.arange(0, H)
+    d = tl.arange(0, D)
+    m = tl.arange(0, TILE)
+    # Loaded once per program and reused by every tile.
+    q = tl.load(q_ptr + b * (H * D) + h[:, None] * D + d[None, :])   # [H, D] fp8
+    qt = tl.trans(q)                                                 # [D, H]
+    w = tl.load(w_ptr + b * H + h)                                   # [H] f32
+
+    first = tl.program_id(0) * tiles_per_prog
+    # Tiles entirely past seq_len are skipped: Stage 2 only reads logits below
+    # seq_len, so they never need a value.
+    last = tl.minimum(first + tiles_per_prog, (seq_len + TILE - 1) // TILE)
+    last_page = (seq_len - 1) // PAGE
+    for t in tl.range(first, last, num_stages=STAGES):
+        tok = t * TILE + m                                           # [TILE]
+        # Tokens past seq_len in the last tile re-read the row's final live
+        # page. That keeps every address valid without a masked load, and
+        # their logits are dropped by the store mask below.
+        slot = tl.minimum(tok // PAGE, last_page)
+        page = tl.load(bt_ptr + b * max_num_pages + slot).to(tl.int64)
+        row = tok % PAGE
+        k = tl.load(k_ptr + (page * PAGE_BYTES + row * D)[:, None] + d[None, :])  # [TILE, D] fp8
+        scale = tl.load(kscale_ptr + page * (PAGE_BYTES // 4) + SCALE_OFFSET // 4 + row)
+
+        acc = tl.dot(k, qt, out_dtype=tl.float32)                    # [TILE, H]
+</code></pre>
+<p class="src"><a href="https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64/blob/main/solution/triton/solution.py#L90-L114">solution/triton/solution.py, lines 90–114</a></p>
+</div>
+<div class="pane" data-lang="tilelang" role="tabpanel">
+<pre><code class="lang-python">        q_s = T.alloc_shared((H, D), T.float8_e4m3fn)
+        w_s = T.alloc_shared((H,), T.float32)
+        k_s = T.alloc_shared((TILE, D), T.float8_e4m3fn)
+        scale_s = T.alloc_shared((TILE,), T.float32)
+        c_s = T.alloc_shared((TILE, H), T.float32)
+        acc = T.alloc_shared((TILE,), T.float32)
+        c_local = T.alloc_fragment((TILE, H), T.float32)
+
+# ...
+
+            T.clear(c_local)
+            T.gemm(k_s, q_s, c_local, transpose_A=False, transpose_B=True)
+</code></pre>
+<p class="src"><a href="https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64/blob/main/solution/tilelang/solution.py#L82-L88">solution/tilelang/solution.py, lines 82–88 and 133–135</a></p>
+</div>
+<div class="pane" data-lang="tk" role="tabpanel">
+<pre><code class="lang-cpp">    // tcgen05.alloc is sync.aligned: the whole first warp has to execute it.
+    tensor_allocator&lt;1, 1, false&gt; tm{};
+    if (tx &lt; 32) tm.provision(tmem_addr);
+    __syncthreads();
+    tm.set_addr(tmem_addr);
+    tt&lt;float, kTile, kHeads&gt; acc = tm.allocate&lt;tt&lt;float, kTile, kHeads&gt;&gt;(0);
+
+    // One thread issues the MMA. mm_ABt clears the accumulator, steps K by 32,
+    // and commits mma_done when the last step lands.
+    if (tx == 0) mm_ABt(acc, k_smem, q_smem, mma_done);
+    wait(mma_done, 0);
+
+    // A warpgroup holds the 128x64 accumulator as a 32x64 register tile.
+    rt_fl&lt;32, kHeads&gt; regs;
+    warpgroup::load_async(regs, acc);
+    tensor_load_wait();
+    warpgroup::sync(warpgroup::groupid() + 1);
+    warpgroup::store(c_smem, regs);
+</code></pre>
+<p class="src"><a href="https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64/blob/main/solution/tk/indexer.cu#L125-L143">solution/tk/indexer.cu, lines 125–143</a></p>
+</div>
+</div></section>
+<section class="piece" id="piece-epilogue">
+<h3>ReLU, the head weight, and the scale</h3>
+<p class="why">One logit per token: the scale for that token times the sum over the 64 heads of ReLU(dot) times the head weight. Tokens past the sequence length are left out of the select.</p>
+<div class="editor">
+<div class="tabs" role="tablist">
+<button type="button" role="tab" aria-selected="true" class="cuda on" data-lang="cuda">CUDA</button>
+<button type="button" role="tab" aria-selected="false" class="triton" data-lang="triton">Triton</button>
+<button type="button" role="tab" aria-selected="false" class="tilelang" data-lang="tilelang">TileLang</button>
+<button type="button" role="tab" aria-selected="false" class="tk" data-lang="tk">ThunderKittens</button>
+</div>
+<div class="pane on" data-lang="cuda" role="tabpanel">
+<pre><code class="lang-cpp">    // logit = scale * sum_h ReLU(acc[h]) * weight[h]. Threads past seq_len
+    // write FP16 -inf so Stage 2's radix select cannot pick the padding.
+    if (tid &lt; kBlockKv) {
+        const float* acc = reinterpret_cast&lt;const float*&gt;(regs);
+        float acc_relu = 0.0f;
+#pragma unroll
+        for (int h = 0; h &lt; kNumHeads; ++h) {
+            const float r = acc[h] &gt; 0.0f ? acc[h] : 0.0f;
+            acc_relu = fmaf(r, smem_w[h], acc_relu);
+        }
+        const int   kv_abs = kv_base + tid;
+        const float scaled = acc_relu * smem_kscale[tid];
+        logits_b[kv_abs]   = (kv_abs &lt; seq_len) ? __float2half_rn(scaled) : kHalfNegInf;
+    }
+</code></pre>
+<p class="src"><a href="https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64/blob/main/solution/python/stage1_short.cuh#L145-L158">solution/python/stage1_short.cuh, lines 145–158</a></p>
+</div>
+<div class="pane" data-lang="triton" role="tabpanel">
+<pre><code class="lang-python">        acc = tl.dot(k, qt, out_dtype=tl.float32)                    # [TILE, H]
+        logit = tl.sum(tl.maximum(acc, 0.0) * w[None, :], axis=1) * scale
+        tl.store(logits_ptr + b * row_stride + tok, logit.to(tl.float16),
+                 mask=tok &lt; seq_len)
+</code></pre>
+<p class="src"><a href="https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64/blob/main/solution/triton/solution.py#L114-L117">solution/triton/solution.py, lines 114–117</a></p>
+</div>
+<div class="pane" data-lang="tilelang" role="tabpanel">
+<pre><code class="lang-python">            T.clear(c_local)
+            T.gemm(k_s, q_s, c_local, transpose_A=False, transpose_B=True)
+            T.copy(c_local, c_s)
+            for i, h in T.Parallel(TILE, H):
+                c_s[i, h] = T.max(c_s[i, h], 0) * w_s[h]
+            T.reduce_sum(c_s, acc, dim=1)
+            T.sync_threads()
+            for i in T.Parallel(TILE):
+                tok = tile * TILE + i
+                if tok &lt; seq:
+                    logits[b, tok] = T.cast(acc[i] * scale_s[i], "float16")
+</code></pre>
+<p class="src"><a href="https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64/blob/main/solution/tilelang/solution.py#L134-L144">solution/tilelang/solution.py, lines 134–144</a></p>
+</div>
+<div class="pane" data-lang="tk" role="tabpanel">
+<pre><code class="lang-cpp">    // A warpgroup holds the 128x64 accumulator as a 32x64 register tile.
+    rt_fl&lt;32, kHeads&gt; regs;
+    warpgroup::load_async(regs, acc);
+    tensor_load_wait();
+    warpgroup::sync(warpgroup::groupid() + 1);
+    warpgroup::store(c_smem, regs);
+    __syncthreads();
+
+    // Thread i owns token i of this tile and reduces the 64 heads.
+    float sum = 0.f;
+    #pragma unroll
+    for (int h = 0; h &lt; kHeads; ++h) sum += fmaxf(c_smem[{tx, h}], 0.f) * w_s[h];
+    const int tok = tile * kTile + tx;
+    if (tok &lt; seq) logits[b * row_stride + tok] = __float2half(sum * scale_s[tx]);
+</code></pre>
+<p class="src"><a href="https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64/blob/main/solution/tk/indexer.cu#L138-L151">solution/tk/indexer.cu, lines 138–151</a></p>
+</div>
+</div></section>
+<section class="piece" id="piece-radix">
+<h3>Radix rounds</h3>
+<p class="why">FP16 bits are reordered so an unsigned compare matches float order. CUDA and ThunderKittens walk two 8-bit digits, high digit first, and cache the ordered keys in shared memory. Triton and TileLang walk digits of 5, 5, and 6 bits, because that is the histogram shape their compilers lower well.</p>
+<div class="editor">
+<div class="tabs" role="tablist">
+<button type="button" role="tab" aria-selected="true" class="cuda on" data-lang="cuda">CUDA</button>
+<button type="button" role="tab" aria-selected="false" class="triton" data-lang="triton">Triton</button>
+<button type="button" role="tab" aria-selected="false" class="tilelang" data-lang="tilelang">TileLang</button>
+<button type="button" role="tab" aria-selected="false" class="tk" data-lang="tk">ThunderKittens</button>
+</div>
+<div class="pane on" data-lang="cuda" role="tabpanel">
+<pre><code class="lang-cpp">// fp16 bits reordered so that unsigned integer comparison matches float
+// ordering: flip the sign bit for positives, invert everything for negatives.
+__device__ __forceinline__ uint16_t HalfToOrderedU16(__half h) {
+    const uint16_t bits = __half_as_ushort(h);
+    return (bits &amp; 0x8000u) ? static_cast&lt;uint16_t&gt;(~bits)
+                            : static_cast&lt;uint16_t&gt;(bits ^ 0x8000u);
+}
+
+    // ...
+    // Two radix rounds (8 bits each, MSB first) narrow the ordered-uint16
+    // prefix until exactly top_k keys remain at or above that prefix.
+#pragma unroll
+    for (int round = 0; round &lt; kRadixRounds; ++round) {
+        const int shift = kOrderedBits - 8 - round * 8;
+        const uint16_t prefix_mask =
+            (round == 0) ? uint16_t{0}
+                         : static_cast&lt;uint16_t&gt;(0xFFFFu &lt;&lt; (kOrderedBits - round * 8));
+
+        for (int i = tid; i &lt; kRadix; i += blockDim.x) smem_hist[i] = 0u;
+        __syncthreads();
+
+        const uint16_t prefix = smem_prefix;
+        if (round == 0 &amp;&amp; use_ordered_cache) {
+            // prefix_mask == 0 on round 0, so every key is accepted.
+            for (int i = tid; i &lt; seq_len; i += blockDim.x) {
+                const uint16_t ordered = HalfToOrderedU16(row_lg[i]);
+                smem_ordered[i] = ordered;
+                atomicAdd(&amp;smem_hist[(ordered &gt;&gt; shift) &amp; 0xFFu], 1u);
+            }
+        } else if (use_ordered_cache) {
+#pragma unroll 4
+            for (int i = tid; i &lt; cached_len; i += blockDim.x) {
+                const uint16_t ordered = smem_ordered[i];
+                if ((uint16_t)(ordered &amp; prefix_mask) == prefix)
+                    atomicAdd(&amp;smem_hist[(ordered &gt;&gt; shift) &amp; 0xFFu], 1u);
+            }
+        } else {
+#pragma unroll 4
+            for (int i = tid; i &lt; seq_len; i += blockDim.x) {
+                const uint16_t ordered = HalfToOrderedU16(row_lg[i]);
+                if ((uint16_t)(ordered &amp; prefix_mask) == prefix)
+                    atomicAdd(&amp;smem_hist[(ordered &gt;&gt; shift) &amp; 0xFFu], 1u);
+            }
+        }
+</code></pre>
+<p class="src"><a href="https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64/blob/main/solution/python/stage2_topk.cuh#L14-L20">solution/python/stage2_topk.cuh, lines 14–20 and 72–106</a></p>
+</div>
+<div class="pane" data-lang="triton" role="tabpanel">
+<pre><code class="lang-python">@triton.jit
+def _select_digit(digit, mask, need, BINS: tl.constexpr):
+    """One radix-select round over the keys under `mask`.
+
+    Returns the digit of the need-th largest key and the number of keys whose
+    digit is larger.
+    """
+    hist = tl.histogram(digit, BINS, mask=mask)
+    at_or_above = tl.cumsum(hist, 0, reverse=True)       # keys with digit &gt;= bin
+    # Bins [0, d] are exactly the ones that still have `need` keys at or above
+    # them. One sum gives both answers: how many such bins (high bits) and how
+    # many keys sit in the bins above d (low bits, always below `need`).
+    packed = tl.sum(tl.where(at_or_above &gt;= need, 1 &lt;&lt; 20, hist), axis=0)
+    return (packed &gt;&gt; 20) - 1, packed &amp; 0xFFFFF
+
+
+@triton.jit
+def _stage2_topk(logit_bits_ptr, seq_lens_ptr, bt_ptr, out_ptr,
+                 row_stride, max_num_pages, BLOCK: tl.constexpr):
+    """Top-2048 of row b's logits as physical slot ids. One program per row.
+
+    Radix select on the FP16 bit patterns, then a prefix-sum compaction; BLOCK
+    is a power of two covering the whole row.
+    """
+    b = tl.program_id(0)
+    seq_len = tl.load(seq_lens_ptr + b)
+    row_bt = bt_ptr + b * max_num_pages
+    row_out = out_ptr + b * TOPK
+
+    # Whole row is inside top-K: same transform as the fast path.
+    if seq_len &lt;= TOPK:
+        n = tl.arange(0, TOPK)
+        keep = n &lt; seq_len
+        page = tl.load(row_bt + n // PAGE, mask=keep, other=0)
+        tl.store(row_out + n, tl.where(keep, page * PAGE + n % PAGE, -1))
+        return
+
+    i = tl.arange(0, BLOCK)
+    valid = i &lt; seq_len
+    bits = tl.load(logit_bits_ptr + b * row_stride + i, mask=valid, other=0)
+    bits = bits.to(tl.int32) &amp; 0xFFFF
+    # FP16 bits reordered so integer order matches float order: positives move
+    # above 0x8000, negatives are mirrored below it. Slots past seq_len get -1,
+    # below every real key.
+    key = tl.where(valid, tl.where(bits &gt;= 0x8000, 0xFFFF - bits, bits + 0x8000), -1)
+
+    # K-th largest key by radix select, 5 + 5 + 6 bits from the top. Triton
+    # 3.7 lowers tl.histogram to one warp ballot per bin-index bit per key, so
+    # three narrow rounds cost less than the two 8-bit rounds of the CUDA
+    # version. `above` counts the keys strictly beyond the pivot.
+    d, above = _select_digit(key &gt;&gt; 11, valid, TOPK, 32)
+    pivot = d &lt;&lt; 11
+    d, more = _select_digit((key &gt;&gt; 6) &amp; 31, (key &gt;&gt; 11) == d, TOPK - above, 32)
+    above += more
+    pivot = pivot | (d &lt;&lt; 6)
+    d, more = _select_digit(key &amp; 63, (key &gt;&gt; 6) == (pivot &gt;&gt; 6), TOPK - above, 64)
+    above += more
+    pivot = pivot | d
+</code></pre>
+<p class="src"><a href="https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64/blob/main/solution/triton/solution.py#L120-L177">solution/triton/solution.py, lines 120–177</a></p>
+</div>
+<div class="pane" data-lang="tilelang" role="tabpanel">
+<pre><code class="lang-python">            base = tx * elems
+            for j in T.serial(elems):
+                idx = base + j
+                src = T.min(idx, stride - 1)
+                raw = T.cast(bits[b, src], "int32") &amp; 0xFFFF
+                # FP16 bits reordered so unsigned order matches float order.
+                key = T.if_then_else(raw &gt;= 0x8000, 0xFFFF - raw, raw + 0x8000)
+                keys[idx] = T.if_then_else(idx &lt; seq, key, -1)
+            if tx == 0:
+                pivot[0] = 0
+                above[0] = 0
+            T.sync_threads()
+
+            # 5 + 5 + 6 bits from the top. Same split as the Triton kernel:
+            # three narrow histograms rather than two 8-bit ones.
+            rounds = ((11, 31, 11, 32), (6, 31, 6, 32), (0, 63, 0, 64))
+            for shift, mask, place, nbins in rounds:
+                T.clear(hist)
+                T.sync_threads()
+                for j in T.serial(elems):
+                    k = keys[base + j]
+                    if shift == 11:
+                        pred = k &gt;= 0
+                        digit = k &gt;&gt; 11
+                    elif shift == 6:
+                        pred = (k &gt;&gt; 11) == (pivot[0] &gt;&gt; 11)
+                        digit = (k &gt;&gt; 6) &amp; mask
+                    else:
+                        pred = (k &gt;&gt; 6) == (pivot[0] &gt;&gt; 6)
+                        digit = k &amp; mask
+                    if pred:
+                        T.atomic_add(hist[digit], 1)
+                T.sync_threads()
+                if tx == 0:
+                    run[0] = 0
+                    found_digit[0] = 0
+                    found_above[0] = 0
+                    need = TOPK - above[0]
+                    for bin_i in T.serial(nbins):
+                        bin_id = nbins - 1 - bin_i
+                        c = hist[bin_id]
+                        if run[0] &lt; need:
+                            if run[0] + c &gt;= need:
+                                found_digit[0] = bin_id
+                                found_above[0] = run[0]
+                        run[0] = run[0] + c
+                    pivot[0] = pivot[0] | (found_digit[0] &lt;&lt; place)
+                    above[0] = above[0] + found_above[0]
+                T.sync_threads()
+</code></pre>
+<p class="src"><a href="https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64/blob/main/solution/tilelang/solution.py#L183-L231">solution/tilelang/solution.py, lines 183–231</a></p>
+</div>
+<div class="pane" data-lang="tk" role="tabpanel">
+<pre><code class="lang-cpp">__device__ __forceinline__ uint16_t half_to_ordered(const __half* row, int i) {
+    const uint16_t bits = __half_as_ushort(row[i]);
+    return (bits &amp; 0x8000u) ? static_cast&lt;uint16_t&gt;(~bits)
+                            : static_cast&lt;uint16_t&gt;(bits ^ 0x8000u);
+}
+
+    // ...
+    #pragma unroll
+    for (int round = 0; round &lt; 2; ++round) {
+        const int shift = 8 - round * 8;
+        const uint16_t prefix_mask = (round == 0) ? uint16_t{0}
+                                                   : static_cast&lt;uint16_t&gt;(0xFFFFu &lt;&lt; (16 - round * 8));
+        for (int i = tx; i &lt; kBins; i += kThreads) hist[i] = 0;
+        __syncthreads();
+        const uint16_t cur = prefix;
+        for (int i = tx; i &lt; seq; i += kThreads) {
+            uint16_t key;
+            if (round == 0) {
+                key = half_to_ordered(row, i);
+                ordered[i] = key;
+            } else {
+                key = ordered[i];
+            }
+            if ((uint16_t)(key &amp; prefix_mask) == cur)
+                atomicAdd(hist + ((key &gt;&gt; shift) &amp; 0xFFu), 1u);
+        }
+</code></pre>
+<p class="src"><a href="https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64/blob/main/solution/tk/indexer.cu#L157-L161">solution/tk/indexer.cu, lines 157–161 and 204–222</a></p>
+</div>
+</div></section>
+<section class="piece" id="piece-emit">
+<h3>Keep the winners and remap them</h3>
+<p class="why">Every key strictly above the pivot is taken. Ties at the pivot fill the remaining slots in token order. The stored id is <code>block_table[token / 64] * 64 + token % 64</code>.</p>
+<div class="editor">
+<div class="tabs" role="tablist">
+<button type="button" role="tab" aria-selected="true" class="cuda on" data-lang="cuda">CUDA</button>
+<button type="button" role="tab" aria-selected="false" class="triton" data-lang="triton">Triton</button>
+<button type="button" role="tab" aria-selected="false" class="tilelang" data-lang="tilelang">TileLang</button>
+<button type="button" role="tab" aria-selected="false" class="tk" data-lang="tk">ThunderKittens</button>
+</div>
+<div class="pane on" data-lang="cuda" role="tabpanel">
+<pre><code class="lang-cpp">    // Emit every index strictly above the pivot, then indices equal to it,
+    // so ties break in a stable scan order. Then rewrite logical token ids
+    // as physical slots: block_table[tok/64]*64 + tok%64.
+    const uint16_t pivot = smem_prefix;
+
+    if (tid == 0) { smem_gt_count = 0; smem_emit_counter = 0; }
+    __syncthreads();
+
+    auto ordered_at = [&amp;](int i) -&gt; uint16_t {
+        return use_ordered_cache ? smem_ordered[i]
+                                 : HalfToOrderedU16(row_lg[i]);
+    };
+
+    {
+        int local = 0;
+        for (int i = tid; i &lt; seq_len; i += blockDim.x)
+            if (ordered_at(i) &gt; pivot) local++;
+#pragma unroll
+        for (int off = 16; off &gt; 0; off &gt;&gt;= 1)
+            local += __shfl_xor_sync(0xffffffffu, local, off);
+        if ((tid &amp; 31) == 0) atomicAdd(&amp;smem_gt_count, local);
+    }
+    __syncthreads();
+
+    const int gt_total = smem_gt_count;
+
+    for (int i = tid; i &lt; seq_len; i += blockDim.x) {
+        if (ordered_at(i) &gt; pivot) {
+            const int pos = atomicAdd(&amp;smem_emit_counter, 1);
+            if (pos &lt; gt_total) row_out[pos] = i;
+        }
+    }
+    __syncthreads();
+
+    for (int i = tid; i &lt; seq_len; i += blockDim.x) {
+        if (ordered_at(i) == pivot) {
+            const int pos = atomicAdd(&amp;smem_emit_counter, 1);
+            if (pos &lt; top_k) row_out[pos] = i;
+        }
+    }
+    __syncthreads();
+
+    for (int i = tid; i &lt; top_k; i += blockDim.x) {
+        const int tok = row_out[i];
+        if (tok &gt;= 0 &amp;&amp; tok &lt; seq_len)
+            row_out[i] = row_bt[tok / kPageSize] * kPageSize + (tok % kPageSize);
+        else
+            row_out[i] = -1;
+    }
+</code></pre>
+<p class="src"><a href="https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64/blob/main/solution/python/stage2_topk.cuh#L144-L192">solution/python/stage2_topk.cuh, lines 144–192</a></p>
+</div>
+<div class="pane" data-lang="triton" role="tabpanel">
+<pre><code class="lang-python">    # Every key above the pivot is taken; ties at the pivot fill the rest in
+    # token order. One prefix sum ranks both groups: the low 16 bits count
+    # keys above the pivot, the high 16 bits count ties.
+    gt = key &gt; pivot
+    eq = key == pivot
+    rank = tl.cumsum(gt.to(tl.int32) + (eq.to(tl.int32) &lt;&lt; 16), 0)
+    pos = tl.where(gt, (rank &amp; 0xFFFF) - 1, above + (rank &gt;&gt; 16) - 1)
+    take = gt | (eq &amp; (pos &lt; TOPK))
+
+    # Logical token id -&gt; physical slot, fused into the emit.
+    page = tl.load(row_bt + i // PAGE, mask=take, other=0)
+    tl.store(row_out + pos, page * PAGE + i % PAGE, mask=take)
+</code></pre>
+<p class="src"><a href="https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64/blob/main/solution/triton/solution.py#L179-L190">solution/triton/solution.py, lines 179–190</a></p>
+</div>
+<div class="pane" data-lang="tilelang" role="tabpanel">
+<pre><code class="lang-python">            # Count keys strictly above the pivot, and ties, per thread.
+            pvt = pivot[0]
+            partial_gt[tx] = 0
+            partial_eq[tx] = 0
+            for j in T.serial(elems):
+                k = keys[base + j]
+                if k &gt; pvt:
+                    partial_gt[tx] = partial_gt[tx] + 1
+                elif k == pvt:
+                    partial_eq[tx] = partial_eq[tx] + 1
+            count_gt[tx] = partial_gt[tx]
+            count_eq[tx] = partial_eq[tx]
+            T.sync_threads()
+
+            # Inclusive scan of the per-thread counts. `tmp` is the double buffer.
+            for step in T.serial(STAGE2_SCAN_STEPS):
+                offset = 1 &lt;&lt; step
+                for i in T.Parallel(STAGE2_THREADS):
+                    extra = T.if_then_else(i &gt;= offset, partial_gt[i - offset], 0)
+                    tmp[i] = partial_gt[i] + extra
+                T.sync_threads()
+                for i in T.Parallel(STAGE2_THREADS):
+                    partial_gt[i] = tmp[i]
+                T.sync_threads()
+            for step in T.serial(STAGE2_SCAN_STEPS):
+                offset = 1 &lt;&lt; step
+                for i in T.Parallel(STAGE2_THREADS):
+                    extra = T.if_then_else(i &gt;= offset, partial_eq[i - offset], 0)
+                    tmp[i] = partial_eq[i] + extra
+                T.sync_threads()
+                for i in T.Parallel(STAGE2_THREADS):
+                    partial_eq[i] = tmp[i]
+                T.sync_threads()
+
+            # Exclusive start of this thread's chunk, then a serial emit.
+            tmp[tx] = partial_gt[tx] - count_gt[tx]
+            count_gt[tx] = above[0] + (partial_eq[tx] - count_eq[tx])
+            for j in T.serial(elems):
+                idx = base + j
+                k = keys[idx]
+                if k &gt; pvt:
+                    page = block_table[b, idx // PAGE]
+                    out[b, tmp[tx]] = page * PAGE + idx % PAGE
+                    tmp[tx] = tmp[tx] + 1
+                elif k == pvt:
+                    if count_gt[tx] &lt; TOPK:
+                        page = block_table[b, idx // PAGE]
+                        out[b, count_gt[tx]] = page * PAGE + idx % PAGE
+                        count_gt[tx] = count_gt[tx] + 1
+</code></pre>
+<p class="src"><a href="https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64/blob/main/solution/tilelang/solution.py#L233-L281">solution/tilelang/solution.py, lines 233–281</a></p>
+</div>
+<div class="pane" data-lang="tk" role="tabpanel">
+<pre><code class="lang-cpp">    const uint16_t pivot = prefix;
+    if (tx == 0) {
+        gt_count = 0;
+        emit = 0;
+    }
+    __syncthreads();
+    int local = 0;
+    for (int i = tx; i &lt; seq; i += kThreads)
+        local += ordered[i] &gt; pivot;
+    #pragma unroll
+    for (int off = 16; off &gt; 0; off &gt;&gt;= 1)
+        local += __shfl_xor_sync(0xffffffffu, local, off);
+    if ((tx &amp; 31) == 0) atomicAdd(&amp;gt_count, local);
+    __syncthreads();
+
+    for (int i = tx; i &lt; seq; i += kThreads) {
+        if (ordered[i] &gt; pivot) {
+            const int pos = atomicAdd(&amp;emit, 1);
+            if (pos &lt; gt_count) row_out[pos] = i;
+        }
+    }
+    __syncthreads();
+    for (int i = tx; i &lt; seq; i += kThreads) {
+        if (ordered[i] == pivot) {
+            const int pos = atomicAdd(&amp;emit, 1);
+            if (pos &lt; kTopK) row_out[pos] = i;
+        }
+    }
+    __syncthreads();
+    for (int i = tx; i &lt; kTopK; i += kThreads) {
+        const int tok = row_out[i];
+        if (tok &gt;= 0 &amp;&amp; tok &lt; seq)
+            row_out[i] = row_bt[tok / kPage] * kPage + (tok % kPage);
+        else
+            row_out[i] = -1;
+    }
+</code></pre>
+<p class="src"><a href="https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64/blob/main/solution/tk/indexer.cu#L257-L292">solution/tk/indexer.cu, lines 257–292</a></p>
+</div>
+</div></section>
 <h2>Run them</h2>
 <h3>CUDA, the contest harness</h3>
 <pre><code>modal run scripts/run_modal.py</code></pre>
@@ -189,5 +1142,147 @@ physical id = block_table[b, t / 64] * 64 + (t % 64)</code></pre>
 <p><code>config.toml</code> keeps pointing at <code>solution/python</code>. That is the kernel the contest image builds, and it is the one measured by the official harness at 8.00 µs. Triton 3.9 is faster on that harness, and the contest image ships Triton 3.7, where the two are even. TileLang and ThunderKittens are in the tree so the same plan can be read and timed in each language; on these measurements they trail the CUDA and Triton kernels on every scoring shape.</p>
 
 </main>
+<script>
+(function () {
+  var CPP = new Set(("if else for while return const constexpr auto void int float bool "
+    + "template class struct namespace enum true false nullptr __global__ __device__ "
+    + "__forceinline__ __restrict__ __shared__ __syncthreads __launch_bounds__ "
+    + "static_cast reinterpret_cast size_t uint32_t uint16_t int32_t unsigned short").split(" "));
+  var PY = new Set(("def return if elif else for while in with as import from and or not "
+    + "lambda None True False class yield pass break continue").split(" "));
+
+  function esc(s) {
+    return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  }
+
+  function paint(src, lang) {
+    var kw = lang === "python" ? PY : CPP;
+    var i = 0, n = src.length, out = "";
+    function span(cls, word) {
+      return '<span class="' + cls + '">' + esc(word) + "</span>";
+    }
+    while (i < n) {
+      var c = src.charAt(i);
+      var two = src.slice(i, i + 2);
+      if (lang !== "python" && two === "//") {
+        var j = src.indexOf("\n", i);
+        if (j < 0) j = n;
+        out += span("tok-cmt", src.slice(i, j));
+        i = j;
+        continue;
+      }
+      if (lang !== "python" && two === "/*") {
+        var j2 = src.indexOf("*/", i + 2);
+        j2 = j2 < 0 ? n : j2 + 2;
+        out += span("tok-cmt", src.slice(i, j2));
+        i = j2;
+        continue;
+      }
+      if (lang === "python" && (src.slice(i, i + 3) === '"""' || src.slice(i, i + 3) === "'''")) {
+        var q = src.slice(i, i + 3);
+        var j3 = src.indexOf(q, i + 3);
+        j3 = j3 < 0 ? n : j3 + 3;
+        out += span("tok-str", src.slice(i, j3));
+        i = j3;
+        continue;
+      }
+      if (c === '"' || c === "'") {
+        var k = i + 1;
+        while (k < n && src.charAt(k) !== c) {
+          if (src.charAt(k) === "\\") k++;
+          k++;
+        }
+        if (k < n) k++;
+        out += span("tok-str", src.slice(i, k));
+        i = k;
+        continue;
+      }
+      if (lang === "python" && c === "#") {
+        var j4 = src.indexOf("\n", i);
+        if (j4 < 0) j4 = n;
+        out += span("tok-cmt", src.slice(i, j4));
+        i = j4;
+        continue;
+      }
+      if (lang !== "python" && c === "#") {
+        var j5 = src.indexOf("\n", i);
+        if (j5 < 0) j5 = n;
+        out += span("tok-pp", src.slice(i, j5));
+        i = j5;
+        continue;
+      }
+      if (lang === "python" && c === "@") {
+        var k2 = i + 1;
+        while (k2 < n && /[\w.]/.test(src.charAt(k2))) k2++;
+        if (src.charAt(k2) === "(") {
+          var depth = 0;
+          while (k2 < n) {
+            var ch = src.charAt(k2);
+            if (ch === "(") depth++;
+            else if (ch === ")") {
+              depth--;
+              k2++;
+              if (depth === 0) break;
+              continue;
+            }
+            k2++;
+          }
+        }
+        out += span("tok-dec", src.slice(i, k2));
+        i = k2;
+        continue;
+      }
+      if (/[0-9]/.test(c) && (i === 0 || !/[\w]/.test(src.charAt(i - 1)))) {
+        var k3 = i;
+        var hex = src.slice(i, i + 2);
+        if (hex === "0x" || hex === "0X") k3 = i + 2;
+        while (k3 < n && /[0-9A-Fa-fxX.]/.test(src.charAt(k3))) k3++;
+        var suf = src.charAt(k3);
+        if (suf === "u" || suf === "f") k3++;
+        out += span("tok-num", src.slice(i, k3));
+        i = k3;
+        continue;
+      }
+      if (/[A-Za-z_]/.test(c)) {
+        var k4 = i + 1;
+        while (k4 < n && /[\w]/.test(src.charAt(k4))) k4++;
+        var word = src.slice(i, k4);
+        var cls = kw.has(word) ? "tok-kw" : (src.charAt(k4) === "(" ? "tok-fn" : "");
+        out += cls ? span(cls, word) : esc(word);
+        i = k4;
+        continue;
+      }
+      out += esc(c);
+      i++;
+    }
+    return out;
+  }
+
+  document.querySelectorAll(".piece code").forEach(function (el) {
+    var lang = el.className.indexOf("lang-python") >= 0 ? "python" : "cpp";
+    el.innerHTML = paint(el.textContent.replace(/\n$/, ""), lang);
+  });
+
+  function select(lang) {
+    document.querySelectorAll(".piece").forEach(function (piece) {
+      piece.querySelectorAll(".tabs button").forEach(function (btn) {
+        var on = btn.getAttribute("data-lang") === lang;
+        btn.classList.toggle("on", on);
+        btn.setAttribute("aria-selected", on ? "true" : "false");
+      });
+      piece.querySelectorAll(".pane").forEach(function (pane) {
+        pane.classList.toggle("on", pane.getAttribute("data-lang") === lang);
+      });
+    });
+  }
+
+  document.querySelectorAll(".piece .tabs button").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      select(btn.getAttribute("data-lang"));
+    });
+  });
+})();
+
+</script>
 </body>
 </html>
