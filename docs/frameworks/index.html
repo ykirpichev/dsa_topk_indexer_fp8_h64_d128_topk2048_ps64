@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Four ways to write the DSA FP8 top-K indexer</title>
+<meta name="description" content="The same Blackwell FP8 top-K indexer in CUDA, Triton, TileLang, and ThunderKittens, with the plan, the source, and the B200 numbers.">
+<style>
+:root {
+  --bg: #fff; --fg: #1b1f24; --muted: #5d6673; --line: #e6e8eb; --code-bg: #f4f6f8;
+  --cuda: #4d8a00; --t37: #b45309; --t39: #2563eb; --tk: #6d28d9; --tl: #c2410c;
+  --card: #f7f8f9;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #111418; --fg: #e6e8eb; --muted: #9aa3ad; --line: #2a3038; --code-bg: #1b2128;
+    --cuda: #8fd14f; --t37: #fbbf24; --t39: #60a5fa; --tk: #c4b5fd; --tl: #fdba74;
+    --card: #1b2128;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; font: 16px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif; color: var(--fg); background: var(--bg); }
+main { max-width: 1040px; margin: 0 auto; padding: 48px 24px 96px; }
+h1 { font-size: 2rem; line-height: 1.2; margin: 0 0 12px; }
+h2 { font-size: 1.35rem; margin: 48px 0 12px; }
+h3 { font-size: 1.05rem; margin: 28px 0 8px; }
+p, li { color: var(--fg); }
+.lede { font-size: 1.15rem; color: var(--muted); }
+.meta { color: var(--muted); font-size: 0.9rem; }
+a { color: var(--t39); text-decoration: none; }
+a:hover { text-decoration: underline; }
+code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.88em; background: var(--code-bg); padding: 0.1em 0.35em; border-radius: 4px; }
+pre { background: var(--code-bg); padding: 14px 16px; border-radius: 8px; overflow-x: auto; font-size: 0.86rem; line-height: 1.5; }
+pre code { background: none; padding: 0; }
+.cards { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin: 24px 0; }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; border-top: 3px solid var(--line); }
+.card .label { color: var(--muted); font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.04em; }
+.card .value { font-size: 1.7rem; font-weight: 650; margin: 4px 0; }
+.card small { font-size: 0.9rem; font-weight: 500; color: var(--muted); }
+.card .note { color: var(--muted); font-size: 0.82rem; }
+.card.cuda { border-top-color: var(--cuda); }
+.card.t39 { border-top-color: var(--t39); }
+.card.tk { border-top-color: var(--tk); }
+.card.tl { border-top-color: var(--tl); }
+table { width: 100%; border-collapse: collapse; margin: 16px 0 8px; font-variant-numeric: tabular-nums; }
+th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); }
+th { color: var(--muted); font-weight: 600; font-size: 0.82rem; }
+td.num, th.num { text-align: right; }
+caption { caption-side: bottom; text-align: left; color: var(--muted); font-size: 0.85rem; padding-top: 8px; }
+.figure { margin: 20px 0; padding: 16px; border: 1px solid var(--line); border-radius: 10px; background: var(--card); }
+.figure svg { width: 100%; height: auto; display: block; }
+.figure figcaption { color: var(--muted); font-size: 0.85rem; margin-top: 10px; }
+.legend { display: flex; gap: 16px; flex-wrap: wrap; font-size: 0.85rem; margin-bottom: 8px; }
+.swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 6px; }
+ol.steps { padding-left: 1.2rem; }
+ol.steps li { margin-bottom: 8px; }
+@media (max-width: 800px) { .cards { grid-template-columns: 1fr 1fr; } h1 { font-size: 1.55rem; } }
+</style>
+</head>
+<body>
+<main>
+
+<p class="meta"><a href="../">DSA FP8 top-K indexer</a> · <a href="../triton-vs-cuda/">Triton vs CUDA, workload by workload</a></p>
+<h1>Four ways to write the same FP8 top-K indexer</h1>
+<p class="lede">One kernel, four implementations, one B200. This walks through the math, the shared plan, where each version lives, and what the timings say.</p>
+<p class="meta">November 20, 2026 · NVIDIA B200 on Modal · definition <code>dsa_topk_indexer_fp8_h64_d128_topk2048_ps64</code> ·
+<a href="https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64">repository</a></p>
+
+<div class="cards">
+  <div class="card t39"><div class="label">Triton 3.9.0</div><div class="value">6.78 <small>µs</small></div><div class="note">mean of 128 contest workloads</div></div>
+  <div class="card cuda"><div class="label">CUDA, the submission</div><div class="value">8.00 <small>µs</small></div><div class="note">same 128, contest compiler</div></div>
+  <div class="card tk"><div class="label">ThunderKittens</div><div class="value">17.5 <small>µs</small></div><div class="note">batch 16, ~48 pages, event timer</div></div>
+  <div class="card tl"><div class="label">TileLang 0.1.15</div><div class="value">28.5 <small>µs</small></div><div class="note">same shape and timer as ThunderKittens</div></div>
+</div>
+
+<p>The first two numbers are the official flashinfer-bench measurement: CUDA events are replaced by CUPTI, the L2 cache is flushed, and the reported time is the span from the first kernel start to the last kernel end across 128 contest shapes. The last two are a smaller check, described below, on five synthetic shapes. They are comparable to each other. They are an upper bound on the contest number for the same shape.</p>
+
+<h2>The operation</h2>
+<p>For each query in a batch, score every token of a paged FP8 KV cache and return the top 2048 physical indices.</p>
+<pre><code>logit[t] = scale[page, slot] * sum_h ReLU(Q[b, h] · K[page, slot]) * w[b, h]
+physical id = block_table[b, t / 64] * 64 + (t % 64)</code></pre>
+<p>Q is <code>[B, 64, 128]</code> FP8 E4M3. The cache is one byte buffer per page, 8448 bytes: 8192 FP8 values (64 tokens × 128) followed by 64 FP32 scales. The scale multiplies the ReLU'd dot product; it is not folded into the matrix multiply. Unused slots of the 2048-wide output are <code>-1</code>.</p>
+
+<h2>One plan, used by all four</h2>
+<p>The sequence length decides the kernel. <code>max_num_pages</code> is the longest sequence in the batch, in pages of 64 tokens.</p>
+<table>
+  <thead><tr><th>Pages</th><th>What runs</th><th>Why</th></tr></thead>
+  <tbody>
+    <tr><td>≤ 32</td><td>Fast path</td><td>Every live token is inside the top 2048, so the output is the block-table remap of <code>0 .. seq_len</code>. Q, K, and the weights are never read.</td></tr>
+    <tr><td>33–63</td><td>Stage 1, then stage 2</td><td>Short enough that one tile per CTA fills the GPU.</td></tr>
+    <tr><td>≥ 64</td><td>Stage 1, then stage 2</td><td>Same math. The CUDA version switches to a warp-specialized persistent stage 1 here; the ports keep one tile per CTA.</td></tr>
+  </tbody>
+</table>
+<p>Stage 1 scores two pages (128 tokens) per CTA. A Blackwell <code>tcgen05</code> MMA multiplies the FP8 tile of K by the FP8 tile of Q into FP32 tensor memory. The epilogue applies ReLU, the per-head weight, a sum over the 64 heads, and the per-token scale, and writes an FP16 logit.</p>
+<p>Stage 2 keeps the 2048 largest logits and remaps them through the block table. Rows at or under 2048 tokens skip the select and write the block-table ids directly.</p>
+
+<h2>Where the code is</h2>
+<table>
+  <thead><tr><th>Version</th><th>Entry</th><th>Size</th><th>Contest image</th></tr></thead>
+  <tbody>
+    <tr><td>CUDA</td><td><a href="https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64/tree/main/solution/python"><code>solution/python</code></a>, <code>solution.py::kernel</code></td><td>13 files, 1,246 lines</td><td>This is what <code>config.toml</code> submits.</td></tr>
+    <tr><td>Triton</td><td><a href="https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64/blob/main/solution/triton/solution.py"><code>solution/triton/solution.py</code></a></td><td>321 lines</td><td>Triton 3.7.0 is in the image. 3.9.0 was installed for the second run.</td></tr>
+    <tr><td>TileLang</td><td><a href="https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64/blob/main/solution/tilelang/solution.py"><code>solution/tilelang/solution.py</code></a></td><td>384 lines</td><td>TileLang is built by flashinfer-bench. These numbers are from 0.1.15.</td></tr>
+    <tr><td>ThunderKittens</td><td><a href="https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64/blob/main/solution/tk/indexer.cu"><code>solution/tk/indexer.cu</code></a> and <a href="https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64/blob/main/solution/tk/solution.py"><code>solution.py</code></a></td><td>373 + 48 lines</td><td>The headers are not in the contest image.</td></tr>
+  </tbody>
+</table>
+<p>Every <code>kernel(...)</code> has the same six arguments: Q, the KV cache, the weights, the sequence lengths, the block table, and the output index buffer.</p>
+
+<h2>Run them</h2>
+<h3>CUDA, the contest harness</h3>
+<pre><code>modal run scripts/run_modal.py</code></pre>
+<p>This builds <code>solution/python</code> the way the contest does and prints a latency per workload. The Triton comparison uses the same harness for both languages:</p>
+<pre><code>modal run scripts/run_modal_triton_vs_cuda.py</code></pre>
+<p>Per-workload means, the three plans, and the Triton 3.7 versus 3.9 split are in the <a href="../triton-vs-cuda/">Triton report</a>.</p>
+
+<h3>TileLang</h3>
+<p>Import <code>solution.tilelang.solution</code> and call <code>kernel</code>. The fast path and the stage-1-plus-stage-2 path are both captured in a CUDA graph, keyed on the tensor pointers, so a replay is two graph launches. <code>T.gemm</code> lowers to the same <code>tcgen05</code> MMA. The gather is the part that stays in scalar code: a 16-byte load comes back as a vector the frontend cannot index, and a raw shared store of that vector would skip the swizzle the MMA reads, so each token is four 4-byte loads stored one FP8 value at a time.</p>
+
+<h3>ThunderKittens</h3>
+<p>Import <code>solution.tk.solution</code> and call <code>kernel</code>. The loader JIT-compiles <code>indexer.cu</code> with <code>-DKITTENS_SM100</code>, <code>TORCH_CUDA_ARCH_LIST=10.0a</code>, and include paths <code>/opt/ThunderKittens/include</code> and <code>/opt/ThunderKittens/prototype</code>. Clone <a href="https://github.com/HazyResearch/ThunderKittens">ThunderKittens</a> there first. Stage 1 is <code>kittens::mm_ABt</code>: one warp provisions tensor memory, one thread issues the MMA, and the CTA reduces the 64 heads. The paged gather is a 16-byte load stored at <code>idx ^ ((idx &gt;&gt; 3) &amp; 7)</code>, which is the swizzle the TK descriptor reads. Stage 2 is the CUDA select: 1024 threads, two 8-bit radix passes, an ordered-key cache of 16384 logits.</p>
+
+<h2>The contest numbers</h2>
+<p>Mean latency over the 128 workloads. CUDA and Triton 3.7.0 ran together. Triton 3.9.0 is the same source on a newer compiler, measured against a CUDA mean of 8.06 µs in that run.</p>
+<table>
+  <thead>
+    <tr><th>Plan</th><th class="num">Workloads</th><th class="num">CUDA</th><th class="num">Triton 3.7</th><th class="num">Triton 3.9</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Fast path, ≤ 32 pages</td><td class="num">69</td><td class="num">2.44 µs</td><td class="num">1.98 µs</td><td class="num">2.02 µs</td></tr>
+    <tr><td>Short, 33–63 pages</td><td class="num">39</td><td class="num">12.87 µs</td><td class="num">12.36 µs</td><td class="num">10.10 µs</td></tr>
+    <tr><td>Persistent, ≥ 64 pages</td><td class="num">20</td><td class="num">17.68 µs</td><td class="num">21.41 µs</td><td class="num">16.72 µs</td></tr>
+    <tr><td>All 128</td><td class="num">128</td><td class="num">8.00 µs</td><td class="num">8.18 µs</td><td class="num">6.78 µs</td></tr>
+  </tbody>
+  <caption>Mean of per-workload medians. CUPTI kernel span, cold L2, warmup 3, 100 iterations, 5 trials. CUDA and Triton 3.7 are one run. Triton 3.9 is a second run, in which CUDA measured 2.48 / 13.06 / 17.58 / 8.06 µs on the same four rows.</caption>
+</table>
+<p>On the contest compiler the two languages trade places by plan: Triton is ahead on the fast path and on short sequences, CUDA is ahead once the sequence is long enough for the persistent stage 1. Triton 3.9 is ahead on all 128. The change is the lowering of <code>tl.histogram</code>, which is the whole stage-2 digit count. The source did not change between 3.7 and 3.9.</p>
+
+<h2>TileLang and ThunderKittens, on five shapes</h2>
+<p>These two were timed with CUDA events around ten calls after three warmup calls. There is no L2 flush, and the clock stays running across the gap between stage 1 and stage 2, so a number here is larger than the CUPTI span of the same kernels. The CUDA and Triton columns are the nearest contest workload, copied from the <a href="../triton-vs-cuda/">128-workload table</a>, so the comparison is the right shape at the official timer.</p>
+<table>
+  <thead>
+    <tr><th>Shape</th><th class="num">CUDA</th><th class="num">Triton 3.7</th><th class="num">ThunderKittens</th><th class="num">TileLang</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Fast, batch 2, 8 pages</td><td class="num">2.39 µs</td><td class="num">1.91 µs</td><td class="num">3.4 µs</td><td class="num">15.4 µs</td></tr>
+    <tr><td>Short, batch 2, 40 pages</td><td class="num">—</td><td class="num">—</td><td class="num">12.3 µs</td><td class="num">30.5 µs</td></tr>
+    <tr><td>Short, batch 16, ~40–48 pages</td><td class="num">12.5–13.3 µs</td><td class="num">12.2–12.3 µs</td><td class="num">17.5 µs</td><td class="num">28.5 µs</td></tr>
+    <tr><td>Long, batch 2, 80 pages</td><td class="num">—</td><td class="num">—</td><td class="num">13.5 µs</td><td class="num">32.1 µs</td></tr>
+    <tr><td>Long, batch 16, ~90–96 pages</td><td class="num">~17.9 µs</td><td class="num">~21.5 µs</td><td class="num">24.4 µs</td><td class="num">44.0 µs</td></tr>
+  </tbody>
+  <caption>CUDA and Triton are CUPTI on the nearest contest row (batch 2 has no short or long row in the suite). ThunderKittens and TileLang are CUDA-event smokes on synthetic FP8 data.</caption>
+</table>
+
+<figure class="figure">
+  <div class="legend">
+    <span><i class="swatch" style="background:#4d8a00"></i>CUDA</span>
+    <span><i class="swatch" style="background:#2563eb"></i>Triton 3.7</span>
+    <span><i class="swatch" style="background:#6d28d9"></i>ThunderKittens</span>
+    <span><i class="swatch" style="background:#c2410c"></i>TileLang</span>
+  </div>
+  <svg viewBox="0 0 640 250" role="img" aria-label="Latency bars for the batch-16 short and long shapes">
+    <text x="0" y="16" fill="currentColor" font-size="13">Batch 16, short (~48 pages)</text>
+    <g transform="translate(150,28)" font-size="12" fill="currentColor">
+      <rect x="0" y="0" height="16" width="156" fill="#4d8a00"/><text x="162" y="13">13.0 µs</text>
+      <rect x="0" y="22" height="16" width="148" fill="#2563eb"/><text x="154" y="35">12.3 µs</text>
+      <rect x="0" y="44" height="16" width="210" fill="#6d28d9"/><text x="216" y="57">17.5 µs</text>
+      <rect x="0" y="66" height="16" width="342" fill="#c2410c"/><text x="348" y="79">28.5 µs</text>
+    </g>
+    <text x="0" y="140" fill="currentColor" font-size="13">Batch 16, long (~96 pages)</text>
+    <g transform="translate(150,152)" font-size="12" fill="currentColor">
+      <rect x="0" y="0" height="16" width="215" fill="#4d8a00"/><text x="221" y="13">17.9 µs</text>
+      <rect x="0" y="22" height="16" width="258" fill="#2563eb"/><text x="264" y="35">21.5 µs</text>
+      <rect x="0" y="44" height="16" width="293" fill="#6d28d9"/><text x="299" y="57">24.4 µs</text>
+      <rect x="0" y="66" height="16" width="480" fill="#c2410c"/><text x="486" y="79">44.0 µs</text>
+    </g>
+  </svg>
+  <figcaption>Bar length is microseconds, 12 µs per 100 px. The green and blue bars are the nearest contest rows. The purple and orange bars include the launch gap between stage 1 and stage 2.</figcaption>
+</figure>
+
+<p>Both ports passed a score check on all five shapes. Short rows matched the physical ids exactly, including the <code>-1</code> padding. Long rows kept 2048 unique in-range ids, and the gap between the true 2048th score and the worst selected score stayed within 0.016 absolute.</p>
+
+<h2>What the gap is made of</h2>
+<p>On the fast path every version does the same block-table remap. A few microseconds there is the launch, and the TileLang fast-path smoke (15.4 µs) is that overhead on a two-kernel graph, not the remap itself. The scoring rows are where the implementations diverge.</p>
+<p><strong>ThunderKittens</strong> is the closer of the two ports. The MMA and the select match the CUDA kernel: 16-byte swizzled stores, one <code>mm_ABt</code> per two pages, and the 1024-thread 8-bit radix. The remaining gap on batch 16 (17.5 µs against a 13 µs contest row, 24.4 µs against 18 µs) is the epilogue, which round-trips the accumulator through shared memory before the head reduction, and the event timer, which counts the gap between the two launches. This port does not capture a CUDA graph.</p>
+<p><strong>TileLang</strong> pays for the gather and for a smaller stage 2. Four-byte loads plus scalar shared stores move the KV tile much more slowly than the 16-byte swizzled store, and the select is a 512-thread 5+5+6 radix whose histograms and scans live in shared memory. That is why 28.5 µs and 44.0 µs sit well above the other three on the same shapes. The first draft was several times slower still: a shared atomic per head, a K-dimension split into four MMA steps, and a persistent loop that left most of the GPU idle. One tile per CTA, one GEMM, and a warp reduction removed that.</p>
+<p><strong>Triton 3.9</strong> is the fastest of the four on the contest harness. The source is the same plan, and the compiler version is the difference: 3.7 is 8.18 µs mean, 3.9 is 6.78 µs, with the gain concentrated in stage 2.</p>
+
+<h2>What to ship</h2>
+<p><code>config.toml</code> keeps pointing at <code>solution/python</code>. That is the kernel the contest image builds, and it is the one measured by the official harness at 8.00 µs. Triton 3.9 is faster on that harness, and the contest image ships Triton 3.7, where the two are even. TileLang and ThunderKittens are in the tree so the same plan can be read and timed in each language; on these measurements they trail the CUDA and Triton kernels on every scoring shape.</p>
+
+</main>
+</body>
+</html>

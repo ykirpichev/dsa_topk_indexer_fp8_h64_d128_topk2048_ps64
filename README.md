@@ -2,6 +2,8 @@
 
 Create high-performance GPU kernels for state-of-the-art LLM architectures on NVIDIA Blackwell GPUs with humans and/or AI agents.
 
+The contest submission is the CUDA kernel in [`solution/python`](solution/python). Three ports of the same algorithm sit beside it: [Triton](solution/triton/solution.py), [TileLang](solution/tilelang/solution.py), and [ThunderKittens](solution/tk/). A walkthrough of the plan, the numbers, and how to run each one is at [four ways to write this kernel](https://ykirpichev.github.io/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64/frameworks/). The workload-by-workload Triton comparison is [here](https://ykirpichev.github.io/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64/triton-vs-cuda/).
+
 ---
 
 <p align="center">
