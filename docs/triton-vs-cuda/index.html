@@ -1,0 +1,600 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Triton vs CUDA: DSA FP8 top-K indexer on B200</title>
+<meta name="description" content="The same FP8 top-K indexer kernel written in hand-tuned CUDA and in Triton, benchmarked side by side on an NVIDIA B200.">
+<style>
+:root {
+  --bg: #ffffff; --panel: #f6f7f9; --text: #1b1f24; --muted: #5d6673; --line: #e2e5ea;
+  --grid: #eceef1; --link: #1d4ed8;
+  --cuda: #4d8a00; --t37: #2563eb; --t39: #d97706;
+  --good: #1a7f37; --bad: #c2410c;
+  --code-bg: #f3f4f6;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #111418; --panel: #191d23; --text: #e6e8eb; --muted: #9aa3ad; --line: #2a3038;
+    --grid: #232830; --link: #8ab4ff;
+    --cuda: #8fce2e; --t37: #6ea0ff; --t39: #f5a623;
+    --good: #5fd27a; --bad: #ff9166;
+    --code-bg: #1b2027;
+  }
+}
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
+body {
+  margin: 0; background: var(--bg); color: var(--text);
+  font: 16px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+}
+main { max-width: 1040px; margin: 0 auto; padding: 48px 24px 96px; }
+h1 { font-size: 2rem; line-height: 1.2; margin: 0 0 8px; letter-spacing: -0.01em; }
+h2 { font-size: 1.4rem; line-height: 1.3; margin: 56px 0 12px; padding-top: 20px; border-top: 1px solid var(--line); }
+h3 { font-size: 1.05rem; margin: 28px 0 8px; }
+p, ul, ol { margin: 0 0 14px; }
+ul, ol { padding-left: 22px; }
+li { margin-bottom: 6px; }
+a { color: var(--link); text-decoration: none; }
+a:hover { text-decoration: underline; }
+.lede { font-size: 1.1rem; color: var(--muted); margin-bottom: 6px; max-width: 760px; }
+.meta { font-size: 0.85rem; color: var(--muted); margin-bottom: 28px; }
+.narrow { max-width: 760px; }
+code { font: 0.86em/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; background: var(--code-bg); padding: 1px 5px; border-radius: 4px; }
+pre { background: var(--code-bg); border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; overflow-x: auto; margin: 0 0 14px;
+  font: 0.78rem/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+pre code { background: none; padding: 0; font: inherit; }
+
+.cards { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; margin: 22px 0 24px; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 16px 18px; }
+.card .label { font-size: 0.8rem; color: var(--muted); margin-bottom: 4px; }
+.card .value { font-size: 1.9rem; font-weight: 650; line-height: 1.15; font-variant-numeric: tabular-nums; }
+.card .value small { font-size: 0.95rem; font-weight: 500; color: var(--muted); }
+.card .note { font-size: 0.85rem; color: var(--muted); margin-top: 4px; }
+.card.cuda { border-top: 3px solid var(--cuda); }
+.card.t37 { border-top: 3px solid var(--t37); }
+.card.t39 { border-top: 3px solid var(--t39); }
+
+.figure { margin: 18px 0 22px; }
+.figure .title { font-weight: 600; margin-bottom: 2px; }
+.figure .caption { font-size: 0.85rem; color: var(--muted); margin-top: 6px; max-width: 860px; }
+.scroll { overflow-x: auto; }
+.scroll > svg { min-width: 760px; }
+.pair { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+svg { display: block; width: 100%; height: auto; }
+svg text { fill: var(--muted); font: 11px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif; }
+svg .strong { fill: var(--text); font-weight: 600; }
+svg .gridline { stroke: var(--grid); stroke-width: 1; }
+svg .axis { stroke: var(--line); stroke-width: 1; }
+svg .cuda { fill: var(--cuda); } svg .t37 { fill: var(--t37); } svg .t39 { fill: var(--t39); }
+svg .tint { fill-opacity: 0.42; }
+svg .stem { stroke: var(--grid); stroke-width: 1; }
+.legend { display: flex; flex-wrap: wrap; gap: 6px 18px; font-size: 0.85rem; color: var(--muted); margin: 6px 0 4px; }
+.legend span { display: inline-flex; align-items: center; gap: 6px; }
+.sw { width: 11px; height: 11px; border-radius: 2px; display: inline-block; }
+.sw.cuda { background: var(--cuda); } .sw.t37 { background: var(--t37); } .sw.t39 { background: var(--t39); }
+.sw.round { border-radius: 50%; } .sw.diamond { transform: rotate(45deg) scale(0.82); }
+
+.tablewrap { overflow-x: auto; margin: 10px 0 18px; }
+table { border-collapse: collapse; width: 100%; font-size: 0.9rem; }
+th, td { padding: 7px 10px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+th { font-weight: 600; color: var(--muted); font-size: 0.8rem; white-space: nowrap; }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+tr.total td { font-weight: 650; border-top: 2px solid var(--line); }
+th.grp { text-align: center; border-bottom: 1px solid var(--line); }
+td.good { color: var(--good); font-weight: 600; } td.bad { color: var(--bad); font-weight: 600; }
+table.map td:first-child { font-weight: 600; width: 20%; }
+table.map td { width: 40%; }
+
+.cols { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+.cols h4 { margin: 0 0 6px; font-size: 0.85rem; color: var(--muted); font-weight: 600; }
+.cols > div { min-width: 0; }
+.callout { background: var(--panel); border: 1px solid var(--line); border-left: 3px solid var(--t37); border-radius: 8px; padding: 12px 16px; margin: 14px 0 18px; max-width: 860px; }
+.callout p:last-child { margin-bottom: 0; }
+details { margin: 10px 0 18px; }
+summary { cursor: pointer; color: var(--link); font-size: 0.92rem; }
+footer { margin-top: 64px; padding-top: 16px; border-top: 1px solid var(--line); font-size: 0.85rem; color: var(--muted); }
+
+@media (max-width: 760px) {
+  main { padding: 28px 16px 64px; }
+  h1 { font-size: 1.55rem; }
+  .cards, .pair, .cols { grid-template-columns: 1fr; }
+}
+</style>
+</head>
+<body>
+<main>
+
+<h1>Triton vs CUDA: the DSA FP8 top-K indexer on B200</h1>
+<p class="lede">The same kernel, written once in hand-tuned CUDA with inline PTX and once in Triton, benchmarked side by side on the 128 contest workloads.</p>
+<p class="meta">November 19, 2026 · NVIDIA B200 on Modal · definition <code>dsa_topk_indexer_fp8_h64_d128_topk2048_ps64</code> ·
+<a href="https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64">repository</a></p>
+
+<div class="cards">
+  <div class="card cuda"><div class="label">CUDA, mean over 128 workloads</div><div class="value">8.00 <small>µs</small></div><div class="note">13 files, 1,246 lines of code</div></div>
+  <div class="card t37"><div class="label">Triton 3.7.0 (contest image)</div><div class="value">8.18 <small>µs</small></div><div class="note">2% slower than CUDA · 1 file, 190 lines of code</div></div>
+  <div class="card t39"><div class="label">Triton 3.9.0, same source</div><div class="value">6.78 <small>µs</small></div><div class="note">16% faster than CUDA (8.06 µs in that run)</div></div>
+</div>
+
+<ul class="narrow">
+  <li>Both implementations pass all 128 workloads in flashinfer-bench.</li>
+  <li>On the contest image, Triton is faster on the fast path (1.98 vs 2.44 µs) and on mid-size contexts (12.36 vs 12.87 µs), and slower on long contexts (21.41 vs 17.68 µs).</li>
+  <li>With Triton 3.9.0 the same source is faster than CUDA on every one of the 128 workloads. The whole change is in how the compiler lowers <code>tl.histogram</code>, which the top-K selection is built on.</li>
+  <li>Per-kernel traces point at three places where the CUDA version can still improve: its fast path, its scoring kernel at large batch, and its top-K selection kernel.</li>
+</ul>
+
+<h2 id="setup">What was compared</h2>
+<div class="narrow">
+<p>The kernel is the indexer of DeepSeek sparse attention. For every row <code>b</code> of a batch and every token <code>t</code> of its paged context it computes</p>
+<pre><code>logit[t] = scale[page, slot] * sum_h ReLU(Q[b, h] . K[page, slot]) * w[b, h]</code></pre>
+<p>with 64 heads of dimension 128 in FP8 (E4M3), and returns the physical cache slots of the 2,048 largest logits. Both implementations use the same plan:</p>
+<ul>
+  <li><b>Fast path</b> (context of at most 32 pages, 69 workloads). The context fits in top-K, so the answer is the block-table transform of <code>[0, seq_len)</code>. One kernel, and Q, K and the weights are never read.</li>
+  <li><b>Short</b> (33 to 45 pages, batch 4 to 31, 39 workloads) and <b>persistent</b> (82 to 91 pages, batch 12 to 30, 20 workloads). Stage 1 scores every token on the FP8 tensor cores and writes FP16 logits. Stage 2 radix-selects the top 2,048 and maps them to physical slots. The two launches replay as one CUDA graph.</li>
+</ul>
+<p>Sources: <a href="https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64/tree/main/solution/python"><code>solution/python</code></a> (CUDA, the contest submission) and
+<a href="https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64/blob/main/solution/triton/solution.py"><code>solution/triton/solution.py</code></a>.</p>
+
+<h3>Measurement</h3>
+<ul>
+  <li><b>Benchmark.</b> flashinfer-bench at the contest settings: 3 warmup calls, 100 timed calls, 5 trials per workload. Time is taken from CUPTI activity records as first kernel start to last kernel end, with the L2 cache flushed before every call. Host time before the first kernel is excluded; any gap between the two kernels counts.</li>
+  <li><b>Two runs.</b> Each run benchmarks both solutions on the same B200 worker. Run A uses the contest image as is (Triton 3.7.0). Run B adds <code>pip install triton==3.9.0</code> and changes nothing else. CUDA is the control in both; its plan means differ by at most 1.5% between the runs.</li>
+  <li><b>Kernel traces.</b> A second pass records the GPU time of each kernel separately (50 calls per workload, medians). It is used for the split between Stage 1 and Stage 2.</li>
+  <li><b>Software.</b> CUDA 13.2, torch 2.12.0.dev20260408+cu132, flashinfer-bench and FlashInfer as cloned from their main branches when the image was built.</li>
+  <li><b>Code size.</b> Line counts exclude blank lines, comments and docstrings.</li>
+</ul>
+</div>
+
+<h2 id="results">Results</h2>
+<div class="figure">
+  <div class="title">Mean latency by dispatch plan</div>
+  <div class="legend"><span><i class="sw cuda"></i>CUDA</span><span><i class="sw t37"></i>Triton 3.7.0</span><span><i class="sw t39"></i>Triton 3.9.0</span></div>
+  <div class="pair">
+    <div id="plan-a"></div>
+    <div id="plan-b"></div>
+  </div>
+  <div class="caption">Microseconds, lower is better. The figure under each group is Triton latency divided by CUDA latency in the same run.</div>
+</div>
+<div class="tablewrap" id="plan-table"></div>
+
+<div class="figure">
+  <div class="title">Every two-stage workload</div>
+  <div class="legend"><span><i class="sw cuda round"></i>CUDA (run A)</span><span><i class="sw t37"></i>Triton 3.7.0 (run A)</span><span><i class="sw t39 diamond"></i>Triton 3.9.0 (run B)</span></div>
+  <div class="scroll" id="workloads"></div>
+  <div class="caption">Latency in µs for the 59 workloads that run both stages, ordered by context size and then batch size. The vertical axis starts at 9 µs. Hover a marker for the exact value.</div>
+</div>
+
+<div class="narrow">
+<ul>
+  <li><b>Fast path.</b> Triton is faster on all 69 workloads in both runs, by 0.46 µs on average.</li>
+  <li><b>Short, Triton 3.7.0.</b> Triton stays between 11.8 and 13.0 µs at every batch size. CUDA ranges from 10.9 to 16.5 µs and grows with the batch. CUDA wins all 14 workloads with batch up to 8 (11.35 vs 12.20 µs), Triton wins all 10 with batch 29 to 31 (12.63 vs 15.50 µs), and the 15 in between are close (12.32 vs 12.54 µs).</li>
+  <li><b>Persistent, Triton 3.7.0.</b> Triton is slower on all 20 workloads, by 3.3 to 4.2 µs.</li>
+  <li><b>Triton 3.9.0.</b> Faster than CUDA on all 128 workloads: by 3.0 µs on average in the short plan and by 0.85 µs in the persistent plan.</li>
+</ul>
+</div>
+
+<details>
+  <summary>All 128 workloads</summary>
+  <div class="tablewrap" id="workload-table"></div>
+</details>
+
+<h2 id="stages">Where the time goes</h2>
+<div class="figure">
+  <div class="title">GPU time per kernel</div>
+  <div class="legend">
+    <span><i class="sw cuda"></i>CUDA</span><span><i class="sw t37"></i>Triton 3.7.0</span><span><i class="sw t39"></i>Triton 3.9.0</span>
+    <span>solid: Stage 1 (scoring)</span><span>light: Stage 2 (top-K selection)</span>
+  </div>
+  <div class="scroll" id="stages-chart"></div>
+  <div class="caption">Mean of per-workload medians, in µs. CUDA and Triton 3.7.0 come from the run A trace, Triton 3.9.0 from the run B trace; CUDA measured within 0.3 µs of these values in run B. The gap between the two kernels is 0.2 µs in every case and is left out.</div>
+</div>
+<div class="tablewrap" id="stage-table"></div>
+
+<div class="narrow">
+<ul>
+  <li><b>Graph replay works the same in both.</b> Stage 2 starts 0.2 µs after Stage 1 ends, whether the graph comes from the CUDA runtime API or from <code>torch.cuda.CUDAGraph</code>.</li>
+  <li><b>Stage 1 is close.</b> The compiler-generated tensor-core code is 0.75 µs slower than the hand-written one at small batch and 0.7 µs slower on long contexts. At batch 29 to 31 in the short plan it is 2.8 µs faster, because the CUDA kernel's time grows with the batch and Triton's barely moves.</li>
+  <li><b>Stage 2 decides the outcome.</b> On Triton 3.7.0 it costs 7.1 µs for short rows, slightly less than the CUDA kernel, and 12.3 µs for long rows, 2.2 µs more. On Triton 3.9.0 it drops to 5.3 and 8.0 µs, 2.0 to 2.4 µs less than the CUDA kernel.</li>
+</ul>
+</div>
+
+<h2 id="mapping">Same techniques, two spellings</h2>
+<div class="tablewrap">
+<table class="map">
+<thead><tr><th>Technique</th><th>CUDA</th><th>Triton</th></tr></thead>
+<tbody>
+<tr><td>Fast path</td>
+  <td><code>topk_fast_path_kernel</code>: 128 threads, block table staged in shared memory, vectorised <code>int4</code> stores.</td>
+  <td><code>_fast_path</code>: one broadcast <code>[32, 64]</code> expression and a single <code>tl.store</code>.</td></tr>
+<tr><td>FP8 tensor-core scoring</td>
+  <td>Hand-written PTX wrappers for <code>tcgen05.mma</code> (<code>kind::f8f6f4</code>), instruction and shared-memory descriptors, 128-byte swizzled operand layout. 275 lines in <code>tcgen05_ptx.h</code> and <code>umma_desc.h</code>.</td>
+  <td><code>tl.dot(k, qt, out_dtype=tl.float32)</code> on <code>float8_e4m3fn</code> tensors. The compiler emits the same <code>tcgen05.mma</code> with a TMEM accumulator.</td></tr>
+<tr><td>TMEM accumulator</td>
+  <td>Explicit allocation, <code>mbarrier</code> wait on the MMA commit, <code>tcgen05.ld</code> of 64 columns into registers, deallocation.</td>
+  <td>Implicit in <code>tl.dot</code> and the ReLU/weight reduction that follows.</td></tr>
+<tr><td>K pipeline</td>
+  <td>Persistent kernel: producer warps stream K into a triple-buffered <code>cp.async</code> ring, handed to the MMA warp through mbarriers.</td>
+  <td><code>tl.range(first, last, num_stages=3)</code>. The compiler emits <code>cp.async.cg</code> prefetch for the block-table-indirect K loads.</td></tr>
+<tr><td>Dispatch by context size</td>
+  <td>Short kernel: one page per MMA, one CTA per page. Persistent kernel: two pages per MMA, each CTA loops over tiles.</td>
+  <td>One kernel, same thresholds. Two pages per MMA everywhere; a program scores one tile below 64 pages and a loop of tiles above.</td></tr>
+<tr><td>Skipping work</td>
+  <td>Rows that fit in top-K are skipped in Stage 1. Padding past <code>seq_len</code> is written as FP16 −inf.</td>
+  <td>Same row skip. Tiles past <code>seq_len</code> are skipped and nothing is written for padding, because Stage 2 masks by <code>seq_len</code>.</td></tr>
+<tr><td>FP16 logits</td>
+  <td>Yes.</td><td>Yes. The evaluator's 1e-2 tolerance covers the rounding.</td></tr>
+<tr><td>Radix select</td>
+  <td>Two rounds of 8 bits. One <code>atomicAdd</code> into a shared-memory histogram per key, 1,024 threads, ordered keys cached in shared memory.</td>
+  <td>Three rounds of 5, 5 and 6 bits through <code>tl.histogram</code>, 512 threads for rows up to 4,096 tokens and 1,024 above.</td></tr>
+<tr><td>Emitting the result</td>
+  <td>Three passes over the row with a shared atomic counter (keys above the pivot, ties, then the block-table rewrite).</td>
+  <td>One <code>tl.cumsum</code> ranks both groups; one masked scatter store writes physical slots directly. The output order is deterministic.</td></tr>
+<tr><td>Two launches as one</td>
+  <td>CUDA graph cached per stream and shape; <code>cudaGraphExecUpdate</code> retargets the pointers on each call.</td>
+  <td><code>torch.cuda.CUDAGraph</code> cached per tensor addresses and shape, since torch cannot retarget a captured graph.</td></tr>
+</tbody>
+</table>
+</div>
+
+<h3>Scoring one tile</h3>
+<div class="cols">
+<div><h4>CUDA, <a href="https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64/blob/main/solution/python/stage1_short.cuh">stage1_short.cuh</a> (abridged)</h4>
+<pre><code>const auto instr = dsa_umma::make_instr_desc_f8f6f4(
+    dsa_umma::F8F6F4Format::E4M3,
+    dsa_umma::F8F6F4Format::E4M3,
+    dsa_umma::CFormat::F32,
+    dsa_umma::Major::K, dsa_umma::Major::K,
+    kUMMA_M, kUMMA_N);
+issue_umma_k_commit&lt;kKIters&gt;(
+    tmem_addr,
+    make_kmajor_desc(smem_k, kSboBytes),
+    make_kmajor_desc(smem_q, kSboBytes),
+    instr,
+    dsa_ptx::smem_ptr_to_uint(&amp;smem_mbar),
+    warp_id, lane);
+
+dsa_ptx::mbarrier_wait_parity(
+    dsa_ptx::smem_ptr_to_uint(&amp;smem_mbar), 0u);
+dsa_ptx::tcgen05_fence_after_thread_sync();
+
+uint32_t regs[kUMMA_N];
+dsa_ptx::tcgen05_ld_32x32b_x64_b32(tmem_addr, regs);
+dsa_ptx::tcgen05_wait_ld();
+// ...
+for (int h = 0; h &lt; kNumHeads; ++h) {
+    const float r = acc[h] &gt; 0.0f ? acc[h] : 0.0f;
+    acc_relu = fmaf(r, smem_w[h], acc_relu);
+}
+const float scaled = acc_relu * smem_kscale[tid];
+logits_b[kv_abs] = (kv_abs &lt; seq_len)
+    ? __float2half_rn(scaled) : kHalfNegInf;</code></pre></div>
+<div><h4>Triton, <a href="https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64/blob/main/solution/triton/solution.py">solution.py</a> (reflowed)</h4>
+<pre><code>for t in tl.range(first, last, num_stages=STAGES):
+    tok = t * TILE + m
+    slot = tl.minimum(tok // PAGE, last_page)
+    page = tl.load(bt_ptr + b * max_num_pages + slot)
+    page = page.to(tl.int64)
+    row = tok % PAGE
+    # k: [TILE, D] fp8
+    k = tl.load(k_ptr
+                + (page * PAGE_BYTES + row * D)[:, None]
+                + d[None, :])
+    scale = tl.load(kscale_ptr + page * (PAGE_BYTES // 4)
+                    + SCALE_OFFSET // 4 + row)
+
+    # acc: [TILE, H] f32, one FP8 MMA
+    acc = tl.dot(k, qt, out_dtype=tl.float32)
+    logit = tl.sum(tl.maximum(acc, 0.0) * w[None, :],
+                   axis=1) * scale
+    tl.store(logits_ptr + b * row_stride + tok,
+             logit.to(tl.float16), mask=tok &lt; seq_len)</code></pre></div>
+</div>
+
+<h3>One radix-select round</h3>
+<div class="cols">
+<div><h4>CUDA, <a href="https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64/blob/main/solution/python/stage2_topk.cuh">stage2_topk.cuh</a> (abridged)</h4>
+<pre><code>for (int i = tid; i &lt; cached_len; i += blockDim.x) {
+    const uint16_t ordered = smem_ordered[i];
+    if ((uint16_t)(ordered &amp; prefix_mask) == prefix)
+        atomicAdd(
+            &amp;smem_hist[(ordered &gt;&gt; shift) &amp; 0xFFu], 1u);
+}
+__syncthreads();
+
+if (tid &lt; kRadix) smem_suffix[tid] = smem_hist[tid];
+__syncthreads();
+for (int stride = 1; stride &lt; kRadix; stride &lt;&lt;= 1) {
+    uint32_t v = 0u;
+    if (tid &lt; kRadix) {
+        v = smem_suffix[tid];
+        if (tid + stride &lt; kRadix)
+            v += smem_suffix[tid + stride];
+    }
+    __syncthreads();
+    if (tid &lt; kRadix) smem_suffix[tid] = v;
+    __syncthreads();
+}
+// ...
+if (tid &lt; kRadix) {
+    const uint32_t cge = smem_suffix[tid];
+    const uint32_t cgt =
+        (tid + 1 &lt; kRadix) ? smem_suffix[tid + 1] : 0u;
+    if (cge &gt;= smem_remaining &amp;&amp; cgt &lt; smem_remaining) {
+        smem_found_bucket    = (uint32_t)tid;
+        smem_found_remaining = smem_remaining - cgt;
+    }
+}</code></pre></div>
+<div><h4>Triton, <a href="https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64/blob/main/solution/triton/solution.py">solution.py</a> (reflowed)</h4>
+<pre><code>@triton.jit
+def _select_digit(digit, mask, need,
+                  BINS: tl.constexpr):
+    hist = tl.histogram(digit, BINS, mask=mask)
+    at_or_above = tl.cumsum(hist, 0, reverse=True)
+    # Bins [0, d] are exactly the ones that still
+    # have `need` keys at or above them. One sum
+    # gives both answers: how many such bins (high
+    # bits) and how many keys sit in the bins above
+    # d (low bits).
+    packed = tl.sum(
+        tl.where(at_or_above &gt;= need, 1 &lt;&lt; 20, hist),
+        axis=0)
+    return (packed &gt;&gt; 20) - 1, packed &amp; 0xFFFFF</code></pre></div>
+</div>
+
+<h2 id="stage2">Stage 2 and the Triton version</h2>
+<div class="narrow">
+<p>Top-K selection needs a histogram of key digits, and the usual way to build one on a GPU is one shared-memory atomic add per key. Triton has no shared-memory atomics in the language. The closest construct is <code>tl.histogram</code>, and the two releases compile it differently.</p>
+<ul>
+  <li><b>Triton 3.7.0</b> uses warp ballots. For every group of 32 keys it issues one ballot per bit of the bin index, then each thread population-counts the ballots for the bins it owns, and the per-thread counts are merged with one atomic per owned bin
+    (<a href="https://github.com/triton-lang/triton/blob/release/3.7.x/lib/Conversion/TritonGPUToLLVM/HistogramOpToLLVM.cpp">source</a>). The cost grows with the number of bins as well as the number of keys. The compiled Stage 2 contains 4 atomic instructions.</li>
+  <li><b>Triton 3.9.0</b> uses one shared-memory atomic add per key, the same approach as the CUDA kernel, and keeps ballots only for histograms of at most two bins
+    (<a href="https://github.com/triton-lang/triton/blob/release/3.9.x/lib/Conversion/TritonGPUToLLVM/HistogramOpToLLVM.cpp">source</a>,
+    <a href="https://github.com/triton-lang/triton/blob/release/3.9.x/lib/Analysis/Utility.cpp">condition</a>). The compiled Stage 2 contains 24 atomic instructions: 8 keys per thread in each of the 3 rounds.</li>
+</ul>
+<p>Several selection designs were measured in isolation before choosing one. The table gives the time of the whole Stage 2 kernel in µs on synthetic inputs at batch 16, for the best of 8, 16 and 32 warps.</p>
+</div>
+<div class="tablewrap">
+<table>
+<thead>
+<tr><th rowspan="2">Selection design</th><th class="grp" colspan="2">Triton 3.7.0</th><th class="grp" colspan="2">Triton 3.9.0</th></tr>
+<tr><th class="num">4,096 tokens</th><th class="num">8,192 tokens</th><th class="num">4,096 tokens</th><th class="num">8,192 tokens</th></tr>
+</thead>
+<tbody>
+<tr><td>Histogram, 8 + 8 bits (the CUDA design)</td><td class="num">9.7</td><td class="num">15.7</td><td class="num">5.6</td><td class="num">8.1</td></tr>
+<tr><td><b>Histogram, 5 + 5 + 6 bits (shipped)</b></td><td class="num"><b>8.0</b></td><td class="num"><b>12.9</b></td><td class="num"><b>5.9</b></td><td class="num"><b>8.5</b></td></tr>
+<tr><td>Bisection, 16 counting passes</td><td class="num">8.5</td><td class="num">11.2</td><td class="num">7.0</td><td class="num">10.5</td></tr>
+<tr><td>64-bin histogram, then 10 bisection passes</td><td class="num">8.5</td><td class="num">12.4</td><td class="num">6.7</td><td class="num">10.0</td></tr>
+<tr><td>4-way search, 8 passes</td><td class="num">8.9</td><td class="num">12.2</td><td class="num">8.0</td><td class="num">11.9</td></tr>
+</tbody>
+</table>
+</div>
+<div class="narrow">
+<p>Of the roughly 8 µs at 4,096 tokens on Triton 3.7.0, about 1.9 µs is the cost of launching a kernel at all, 0.7 µs loads the row and builds the keys, 1.7 µs ranks and writes the result, and the rest is selection.</p>
+<p>One design is shipped for both compiler versions. Two measured gains are therefore left unused: on 3.7.0, bisection is about 1.7 µs faster for 8,192-token rows, and on 3.9.0 the 8 + 8 split is about 0.3 µs faster.</p>
+</div>
+
+<h2 id="findings">What the port says about the CUDA version</h2>
+<div class="narrow">
+<p>The Triton version was written to answer one question, and it ended up measuring the CUDA version from the outside. Three differences stand out. None has been applied to the CUDA code yet.</p>
+<ol>
+  <li><b>Fast path: 0.46 µs.</b> Triton's kernel is faster on all 69 fast-path workloads, 54% of the set. Matching it would lower the overall mean by about 0.25 µs.</li>
+  <li><b>Short-plan scoring at large batch: 2.8 µs.</b> At batch 29 to 31 the CUDA Stage 1 takes 8.15 µs against 5.33 µs for Triton. The CUDA short kernel launches one CTA per page, 1,320 CTAs at batch 30 with 44 pages; Triton scores two pages per MMA and launches 660 programs. Whether the CTA count is the cause has not been tested. Ten workloads are affected.</li>
+  <li><b>Top-K selection: about 2 µs.</b> With the 3.9.0 histogram, Triton's Stage 2 takes 5.3 and 8.0 µs against 7.7 and 9.9 µs for the CUDA kernel in the same trace, although both now count keys with per-key shared-memory atomics. The designs differ in three ways: three narrow rounds over 32 and 64 bins instead of two rounds over 256, one prefix sum and one scatter instead of three passes over a shared atomic counter, and half the threads for short rows. Which of these carries the gain has not been tested. All 59 two-stage workloads are affected.</li>
+</ol>
+<p>Taking the better of the two implementations for each kernel in the run B trace gives a mean of 6.7 µs against 8.3 µs for CUDA in that trace. That is an upper estimate of what the CUDA version could gain, and it carries the trace caveat below.</p>
+</div>
+
+<h2 id="limits">Limits and caveats</h2>
+<div class="narrow">
+<ul>
+  <li><b>Triton 3.9.0 is outside the contest image.</b> Run B shows what the compiler change is worth. It says nothing about which Triton an official evaluation would use, so the CUDA version remains the submission.</li>
+  <li><b>Traces and benchmark disagree slightly.</b> The trace tool does its own L2 flush and runs both solutions in one process. Its CUDA totals are 0.3 to 0.8 µs above the benchmark on the two-stage plans, while Triton's agree within 0.3 µs. The reason is unknown. Totals in this report come from the benchmark; the traces are used for the split between kernels.</li>
+  <li><b>Graph cache keyed on addresses.</b> The Triton version replays its graph only when a call passes the same tensors as an earlier one, which the benchmark does within a trial. A caller that passes new tensors every time would get two direct launches with host time between them.</li>
+  <li><b>Row length.</b> Triton's Stage 2 holds a row in one block of up to 16,384 tokens (256 pages). Longer rows fall back to <code>torch.topk</code>. The contest maximum is 91 pages.</li>
+  <li><b>Compilation.</b> Triton compiles each specialisation on first use, which the warmup calls absorb. The CUDA version compiles once when the solution is built.</li>
+  <li><b>Run-to-run variation.</b> The CUDA control moved by up to 1.5% in plan means between the two runs, on different B200 workers.</li>
+</ul>
+</div>
+
+<h2 id="reproduce">Reproducing</h2>
+<div class="narrow">
+<pre><code># Benchmark both solutions on Modal B200 (about 20 minutes)
+modal run scripts/run_modal_triton_vs_cuda.py
+
+# Same with Triton 3.9.0
+DSA_TRITON_VERSION=3.9.0 modal run scripts/run_modal_triton_vs_cuda.py
+
+# Per-kernel GPU time
+modal run scripts/run_modal_triton_vs_cuda.py --kernels --iterations 50
+
+# Short checks
+modal run scripts/run_modal_triton_vs_cuda.py --smoke
+modal run scripts/run_modal_triton_vs_cuda.py --quick</code></pre>
+<p>The numbers behind every chart and table on this page are in <a href="data.js"><code>data.js</code></a>.</p>
+</div>
+
+<footer>
+DSA FP8 top-K indexer, MLSys 2026 FlashInfer contest ·
+<a href="https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64">source on GitHub</a> ·
+<a href="https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64/blob/main/docs/KERNEL_ARCHITECTURE.md">CUDA kernel architecture</a>
+</footer>
+</main>
+
+<script src="data.js"></script>
+<script>
+(function () {
+  const D = window.REPORT_DATA;
+  const A = "3.7.0", B = "3.9.0";
+  const mean = a => a.reduce((s, x) => s + x, 0) / a.length;
+  const f2 = x => x.toFixed(2);
+  const PLANS = [["fast", "Fast path"], ["short", "Short"], ["persistent", "Persistent"], ["all", "All"]];
+  const inPlan = p => r => p === "all" || r.plan === p;
+  const svg = (w, h, body) => `<svg viewBox="0 0 ${w} ${h}" role="img">${body}</svg>`;
+  const el = id => document.getElementById(id);
+
+  // ---- Mean latency by plan: one panel per run -----------------------------
+  function planPanel(ver, cls, title) {
+    const W = 500, H = 300, L = 38, R = 8, T = 30, Bm = 52, top = 24;
+    const y = v => T + (H - T - Bm) * (1 - v / top);
+    let s = `<text x="${L}" y="14" class="strong">${title}</text>`;
+    for (let v = 0; v <= top; v += 4) {
+      s += `<line class="gridline" x1="${L}" x2="${W - R}" y1="${y(v)}" y2="${y(v)}"/>`;
+      s += `<text x="${L - 6}" y="${y(v) + 4}" text-anchor="end">${v}</text>`;
+    }
+    const gw = (W - L - R) / PLANS.length, bw = 38;
+    PLANS.forEach(([p, label], i) => {
+      const rows = D.bench[ver].workloads.filter(inPlan(p));
+      const c = mean(rows.map(r => r.cuda)), t = mean(rows.map(r => r.triton));
+      const cx = L + gw * (i + 0.5);
+      [[c, "cuda", cx - bw - 2], [t, cls, cx + 2]].forEach(([v, k, x]) => {
+        s += `<rect class="${k}" x="${x}" y="${y(v)}" width="${bw}" height="${y(0) - y(v)}" rx="2"/>`;
+        s += `<text class="strong" x="${x + bw / 2}" y="${y(v) - 5}" text-anchor="middle">${f2(v)}</text>`;
+      });
+      s += `<text class="strong" x="${cx}" y="${H - Bm + 17}" text-anchor="middle">${label}</text>`;
+      s += `<text x="${cx}" y="${H - Bm + 32}" text-anchor="middle">${rows.length} workloads</text>`;
+      s += `<text x="${cx}" y="${H - Bm + 47}" text-anchor="middle">${f2(t / c)}×</text>`;
+    });
+    s += `<line class="axis" x1="${L}" x2="${W - R}" y1="${y(0)}" y2="${y(0)}"/>`;
+    return svg(W, H, s);
+  }
+  el("plan-a").innerHTML = planPanel(A, "t37", "Run A: contest image, Triton 3.7.0");
+  el("plan-b").innerHTML = planPanel(B, "t39", "Run B: Triton 3.9.0");
+
+  // ---- Plan table -----------------------------------------------------------
+  const ratioCell = r => `<td class="num ${r < 0.995 ? "good" : r > 1.005 ? "bad" : ""}">${f2(r)}×</td>`;
+  (function () {
+    let h = `<table><thead><tr><th rowspan="2">Plan</th><th rowspan="2" class="num">Workloads</th>
+      <th class="grp" colspan="3">Run A (contest image)</th><th class="grp" colspan="3">Run B</th></tr>
+      <tr><th class="num">CUDA</th><th class="num">Triton 3.7.0</th><th class="num">Triton / CUDA</th>
+      <th class="num">CUDA</th><th class="num">Triton 3.9.0</th><th class="num">Triton / CUDA</th></tr></thead><tbody>`;
+    PLANS.forEach(([p, label]) => {
+      const a = D.bench[A].workloads.filter(inPlan(p)), b = D.bench[B].workloads.filter(inPlan(p));
+      const ac = mean(a.map(r => r.cuda)), at = mean(a.map(r => r.triton));
+      const bc = mean(b.map(r => r.cuda)), bt = mean(b.map(r => r.triton));
+      h += `<tr class="${p === "all" ? "total" : ""}"><td>${label}</td><td class="num">${a.length}</td>
+        <td class="num">${f2(ac)}</td><td class="num">${f2(at)}</td>${ratioCell(at / ac)}
+        <td class="num">${f2(bc)}</td><td class="num">${f2(bt)}</td>${ratioCell(bt / bc)}</tr>`;
+    });
+    el("plan-table").innerHTML = h + "</tbody></table>";
+  })();
+
+  // ---- Every two-stage workload ---------------------------------------------
+  (function () {
+    const a = D.bench[A].workloads.filter(r => r.plan !== "fast");
+    const b = Object.fromEntries(D.bench[B].workloads.map(r => [r.id, r]));
+    const W = 1000, H = 372, L = 40, R = 10, T = 12, Bm = 72, lo = 9, hi = 23, gap = 22;
+    const nShort = a.filter(r => r.plan === "short").length;
+    const step = (W - L - R - gap) / a.length;
+    const x = i => L + step * (i + 0.5) + (i >= nShort ? gap : 0);
+    const y = v => T + (H - T - Bm) * (1 - (v - lo) / (hi - lo));
+    let s = "";
+    for (let v = lo + 1; v <= hi; v += 2) {
+      s += `<line class="gridline" x1="${L}" x2="${W - R}" y1="${y(v)}" y2="${y(v)}"/>`;
+      s += `<text x="${L - 6}" y="${y(v) + 4}" text-anchor="end">${v}</text>`;
+    }
+    s += `<text x="${L - 6}" y="${H - Bm + 14}" text-anchor="end">batch</text>`;
+    s += `<text x="${L - 6}" y="${H - Bm + 34}" text-anchor="end">pages</text>`;
+    a.forEach((r, i) => {
+      const t39 = b[r.id].triton, cx = x(i);
+      const tip = `batch ${r.batch}, ${r.pages} pages (${r.id})`;
+      s += `<line class="stem" x1="${cx}" x2="${cx}" y1="${y(Math.max(r.cuda, r.triton, t39))}" y2="${y(Math.min(r.cuda, r.triton, t39))}"/>`;
+      s += `<circle class="cuda" cx="${cx}" cy="${y(r.cuda)}" r="4.2"><title>CUDA ${f2(r.cuda)} µs · ${tip}</title></circle>`;
+      s += `<rect class="t37" x="${cx - 3.7}" y="${y(r.triton) - 3.7}" width="7.4" height="7.4"><title>Triton 3.7.0 ${f2(r.triton)} µs · ${tip}</title></rect>`;
+      s += `<path class="t39" d="M${cx} ${y(t39) - 5.2}L${cx + 5.2} ${y(t39)}L${cx} ${y(t39) + 5.2}L${cx - 5.2} ${y(t39)}Z"><title>Triton 3.9.0 ${f2(t39)} µs · ${tip}</title></path>`;
+      s += `<text x="${cx}" y="${H - Bm + 14}" text-anchor="middle" style="font-size:9.5px">${r.batch}</text>`;
+    });
+    // Bracket workloads that share a page count.
+    for (let i = 0; i < a.length;) {
+      let j = i;
+      while (j + 1 < a.length && a[j + 1].pages === a[i].pages) j++;
+      const x0 = x(i) - step * 0.4, x1 = x(j) + step * 0.4;
+      s += `<line class="axis" x1="${x0}" x2="${x1}" y1="${H - Bm + 21}" y2="${H - Bm + 21}"/>`;
+      s += `<text x="${(x0 + x1) / 2}" y="${H - Bm + 34}" text-anchor="middle">${a[i].pages}</text>`;
+      i = j + 1;
+    }
+    const mid = (i0, i1) => (x(i0) + x(i1)) / 2;
+    s += `<text class="strong" x="${mid(0, nShort - 1)}" y="${H - 14}" text-anchor="middle">Short plan</text>`;
+    s += `<text class="strong" x="${mid(nShort, a.length - 1)}" y="${H - 14}" text-anchor="middle">Persistent plan</text>`;
+    el("workloads").innerHTML = svg(W, H, s);
+  })();
+
+  // ---- Workload table -------------------------------------------------------
+  (function () {
+    const b = Object.fromEntries(D.bench[B].workloads.map(r => [r.id, r]));
+    const names = { fast: "fast path", short: "short", persistent: "persistent" };
+    let h = `<table><thead><tr><th rowspan="2">Workload</th><th rowspan="2" class="num">Batch</th><th rowspan="2" class="num">Pages</th><th rowspan="2">Plan</th>
+      <th class="grp" colspan="3">Run A</th><th class="grp" colspan="3">Run B</th></tr>
+      <tr><th class="num">CUDA</th><th class="num">Triton 3.7.0</th><th class="num">ratio</th>
+      <th class="num">CUDA</th><th class="num">Triton 3.9.0</th><th class="num">ratio</th></tr></thead><tbody>`;
+    D.bench[A].workloads.forEach(r => {
+      const q = b[r.id];
+      h += `<tr><td><code>${r.id}</code></td><td class="num">${r.batch}</td><td class="num">${r.pages}</td><td>${names[r.plan]}</td>
+        <td class="num">${f2(r.cuda)}</td><td class="num">${f2(r.triton)}</td>${ratioCell(r.triton / r.cuda)}
+        <td class="num">${f2(q.cuda)}</td><td class="num">${f2(q.triton)}</td>${ratioCell(q.triton / q.cuda)}</tr>`;
+    });
+    el("workload-table").innerHTML = h + "</tbody></table>";
+  })();
+
+  // ---- GPU time per kernel --------------------------------------------------
+  const GROUPS = [
+    ["Short, batch 4 to 8", r => r.plan === "short" && r.batch <= 8],
+    ["Short, batch 14 to 16", r => r.plan === "short" && r.batch > 8 && r.batch <= 16],
+    ["Short, batch 29 to 31", r => r.plan === "short" && r.batch > 16],
+    ["Persistent, batch 12 to 30", r => r.plan === "persistent"],
+  ];
+  const stageMeans = (ver, sol, pick) => {
+    const rows = D.kernels[ver].workloads.filter(pick);
+    return { n: rows.length, s1: mean(rows.map(r => r[sol].s1)), s2: mean(rows.map(r => r[sol].s2)) };
+  };
+  const SERIES = [["CUDA", "cuda", A, "cuda"], ["Triton 3.7.0", "t37", A, "triton"], ["Triton 3.9.0", "t39", B, "triton"]];
+  (function () {
+    const W = 1000, H = 340, L = 40, R = 10, T = 14, Bm = 44, top = 22;
+    const y = v => T + (H - T - Bm) * (1 - v / top);
+    let s = "";
+    for (let v = 0; v <= top; v += 4) {
+      s += `<line class="gridline" x1="${L}" x2="${W - R}" y1="${y(v)}" y2="${y(v)}"/>`;
+      s += `<text x="${L - 6}" y="${y(v) + 4}" text-anchor="end">${v}</text>`;
+    }
+    const gw = (W - L - R) / GROUPS.length, bw = 58, sp = 8;
+    GROUPS.forEach(([label, pick], g) => {
+      const cx = L + gw * (g + 0.5);
+      let n = 0;
+      SERIES.forEach(([name, cls, ver, sol], k) => {
+        const m = stageMeans(ver, sol, pick);
+        n = m.n;
+        const x = cx + (k - 1.5) * (bw + sp) + sp / 2;
+        s += `<rect class="${cls}" x="${x}" y="${y(m.s1)}" width="${bw}" height="${y(0) - y(m.s1)}"><title>${name} Stage 1: ${f2(m.s1)} µs</title></rect>`;
+        s += `<rect class="${cls} tint" x="${x}" y="${y(m.s1 + m.s2)}" width="${bw}" height="${y(m.s1) - y(m.s1 + m.s2)}"><title>${name} Stage 2: ${f2(m.s2)} µs</title></rect>`;
+        s += `<text x="${x + bw / 2}" y="${y(m.s1 / 2) + 4}" text-anchor="middle" style="fill:#fff;font-weight:600">${f2(m.s1)}</text>`;
+        s += `<text class="strong" x="${x + bw / 2}" y="${y(m.s1 + m.s2 / 2) + 4}" text-anchor="middle">${f2(m.s2)}</text>`;
+        s += `<text x="${x + bw / 2}" y="${y(m.s1 + m.s2) - 5}" text-anchor="middle">${f2(m.s1 + m.s2)}</text>`;
+      });
+      s += `<text class="strong" x="${cx}" y="${H - Bm + 18}" text-anchor="middle">${label}</text>`;
+      s += `<text x="${cx}" y="${H - Bm + 33}" text-anchor="middle">${n} workloads</text>`;
+    });
+    s += `<line class="axis" x1="${L}" x2="${W - R}" y1="${y(0)}" y2="${y(0)}"/>`;
+    el("stages-chart").innerHTML = svg(W, H, s);
+  })();
+
+  // ---- Stage table ----------------------------------------------------------
+  (function () {
+    let h = `<table><thead><tr><th rowspan="2">Workloads</th><th rowspan="2" class="num">Count</th>
+      <th class="grp" colspan="2">CUDA</th><th class="grp" colspan="2">Triton 3.7.0</th><th class="grp" colspan="2">Triton 3.9.0</th></tr><tr>`;
+    for (let i = 0; i < 3; i++) h += `<th class="num">Stage 1</th><th class="num">Stage 2</th>`;
+    h += `</tr></thead><tbody>`;
+    GROUPS.forEach(([label, pick]) => {
+      const m = SERIES.map(([, , ver, sol]) => stageMeans(ver, sol, pick));
+      h += `<tr><td>${label}</td><td class="num">${m[0].n}</td>` +
+        m.map(v => `<td class="num">${f2(v.s1)}</td><td class="num">${f2(v.s2)}</td>`).join("") + `</tr>`;
+    });
+    const fast = r => r.plan === "fast";
+    const span = (ver, sol) => mean(D.kernels[ver].workloads.filter(fast).map(r => r[sol].span));
+    h += `<tr><td>Fast path (single kernel)</td><td class="num">${D.kernels[A].workloads.filter(fast).length}</td>
+      <td class="num" colspan="2">${f2(span(A, "cuda"))}</td><td class="num" colspan="2">${f2(span(A, "triton"))}</td>
+      <td class="num" colspan="2">${f2(span(B, "triton"))} (CUDA ${f2(span(B, "cuda"))} in run B)</td></tr>`;
+    el("stage-table").innerHTML = h + "</tbody></table>";
+  })();
+})();
+</script>
+</body>
+</html>
