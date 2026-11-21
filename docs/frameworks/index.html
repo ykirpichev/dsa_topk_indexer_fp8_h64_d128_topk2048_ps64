@@ -8,13 +8,13 @@
 <style>
 :root {
   --bg: #fff; --fg: #1b1f24; --muted: #5d6673; --line: #e6e8eb; --code-bg: #f4f6f8;
-  --cuda: #4d8a00; --t37: #b45309; --t39: #2563eb; --tk: #6d28d9; --tl: #c2410c;
+  --cuda: #4d8a00; --t37: #b45309; --t39: #2563eb; --tk: #6d28d9; --tl: #c2410c; --pt: #0e7490;
   --card: #f7f8f9;
 }
 @media (prefers-color-scheme: dark) {
   :root {
     --bg: #111418; --fg: #e6e8eb; --muted: #9aa3ad; --line: #2a3038; --code-bg: #1b2128;
-    --cuda: #8fd14f; --t37: #fbbf24; --t39: #60a5fa; --tk: #c4b5fd; --tl: #fdba74;
+    --cuda: #8fd14f; --t37: #fbbf24; --t39: #60a5fa; --tk: #c4b5fd; --tl: #fdba74; --pt: #5eead4;
     --card: #1b2128;
   }
 }
@@ -74,6 +74,8 @@ ol.steps li { margin-bottom: 8px; }
 .tabs button.triton.on { border-bottom-color: var(--t39); }
 .tabs button.tilelang.on { border-bottom-color: var(--tl); }
 .tabs button.tk.on { border-bottom-color: var(--tk); }
+.tabs button.pytorch.on { border-bottom-color: var(--pt); }
+.pane-note { margin: 0; padding: 12px 16px 0; color: var(--muted); font-size: 0.9rem; }
 .pane { display: none; }
 .pane.on { display: block; }
 .editor pre { margin: 0; border: 0; border-radius: 0; max-height: 32rem; padding: 16px 18px; background: transparent; }
@@ -116,7 +118,7 @@ ol.steps li { margin-bottom: 8px; }
 <p>The first two numbers are the official flashinfer-bench measurement: CUDA events are replaced by CUPTI, the L2 cache is flushed, and the reported time is the span from the first kernel start to the last kernel end across 128 contest shapes. The last two are a smaller check, described below, on five synthetic shapes. They are comparable to each other. They are an upper bound on the contest number for the same shape.</p>
 
 <h2 id="code">The same pieces, side by side</h2>
-<p>Each step of the kernel is below. Pick a language and every step follows. The listing is the source that was timed. A line that says <code>...</code> is a cut between two regions of the same file.</p>
+<p>Each step of the kernel is below. Pick a language and every step follows. PyTorch is the reference the other four implement: one loop, a matrix multiply, and <code>torch.topk</code>. The other listings are the source that was timed. A line that says <code>...</code> is a cut between two regions of the same file.</p>
 <nav class="piece-nav">
 <a href="#piece-dispatch">Which kernel runs</a>
 <a href="#piece-fast">Fast path</a>
@@ -135,6 +137,7 @@ ol.steps li { margin-bottom: 8px; }
 <button type="button" role="tab" aria-selected="false" class="triton" data-lang="triton">Triton</button>
 <button type="button" role="tab" aria-selected="false" class="tilelang" data-lang="tilelang">TileLang</button>
 <button type="button" role="tab" aria-selected="false" class="tk" data-lang="tk">ThunderKittens</button>
+<button type="button" role="tab" aria-selected="false" class="pytorch" data-lang="pytorch">PyTorch</button>
 </div>
 <div class="pane on" data-lang="cuda" role="tabpanel">
 <pre><code class="lang-cpp">// Stage-1 plan for a call; derivable from max_num_pages alone.
@@ -209,6 +212,29 @@ def kernel(q_index_fp8, k_index_cache_fp8, weights, seq_lens, block_table, topk_
 </code></pre>
 <p class="src"><a href="https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64/blob/main/solution/tk/indexer.cu#L310-L322">solution/tk/indexer.cu, lines 310–322</a></p>
 </div>
+<div class="pane" data-lang="pytorch" role="tabpanel">
+<p class="pane-note">No page-count dispatch. Every row is scored, then the top 2048 are kept.</p>
+<pre><code class="lang-python">def kernel(
+    q_index_fp8: torch.Tensor,       # [B, H, D]
+    k_index_cache_fp8: torch.Tensor, # [P, PS, 1, 132]
+    weights: torch.Tensor,           # [B, H]
+    seq_lens: torch.Tensor,          # [B]
+    block_table: torch.Tensor,       # [B, M]
+    topk_indices: torch.Tensor,      # [B, K] destination
+) -&gt; None:
+    """Destination-passing wrapper matching ``solution/python/solution.py``."""
+    out, = run(q_index_fp8, k_index_cache_fp8, weights, seq_lens, block_table)
+    topk_indices.copy_(out)  # [B, K]
+
+# ... run(), one row at a time
+    for b in range(batch_size):
+        # S = number of valid logical tokens in this row
+        seq_len = int(seq_lens[b].item())
+        if seq_len == 0:
+            continue
+</code></pre>
+<p class="src"><a href="https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64/blob/main/baselines/pytorch_naive_reference.py#L174-L184">baselines/pytorch_naive_reference.py, lines 174–184 and 122–126</a></p>
+</div>
 </div></section>
 <section class="piece" id="piece-fast">
 <h3>Fast path</h3>
@@ -219,6 +245,7 @@ def kernel(q_index_fp8, k_index_cache_fp8, weights, seq_lens, block_table, topk_
 <button type="button" role="tab" aria-selected="false" class="triton" data-lang="triton">Triton</button>
 <button type="button" role="tab" aria-selected="false" class="tilelang" data-lang="tilelang">TileLang</button>
 <button type="button" role="tab" aria-selected="false" class="tk" data-lang="tk">ThunderKittens</button>
+<button type="button" role="tab" aria-selected="false" class="pytorch" data-lang="pytorch">PyTorch</button>
 </div>
 <div class="pane on" data-lang="cuda" role="tabpanel">
 <pre><code class="lang-cpp">__global__ __launch_bounds__(128)
@@ -323,6 +350,21 @@ def _fast_path(seq_lens, block_table, out):
 </code></pre>
 <p class="src"><a href="https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64/blob/main/solution/tk/indexer.cu#L36-L46">solution/tk/indexer.cu, lines 36–46</a></p>
 </div>
+<div class="pane" data-lang="pytorch" role="tabpanel">
+<p class="pane-note">No bypass. The output row starts as -1, and a sequence shorter than 2048 simply selects fewer tokens.</p>
+<pre><code class="lang-python">    # topk_indices: [B, K] int32, pre-filled with -1 padding
+    topk_indices = torch.full(
+        (batch_size, TOPK), -1, dtype=torch.int32, device=device
+    )
+
+# ...
+        # ---- top-K over logical tokens ----------------------------------------
+        # topk_local: [actual_topk]  logical ids in [0, S)
+        actual_topk = min(TOPK, seq_len)
+        _, topk_local = torch.topk(logits, actual_topk)  # values unused
+</code></pre>
+<p class="src"><a href="https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64/blob/main/baselines/pytorch_naive_reference.py#L117-L120">baselines/pytorch_naive_reference.py, lines 117–120 and 153–156</a></p>
+</div>
 </div></section>
 <section class="piece" id="piece-gather">
 <h3>Gather a page into the MMA tile</h3>
@@ -333,6 +375,7 @@ def _fast_path(seq_lens, block_table, out):
 <button type="button" role="tab" aria-selected="false" class="triton" data-lang="triton">Triton</button>
 <button type="button" role="tab" aria-selected="false" class="tilelang" data-lang="tilelang">TileLang</button>
 <button type="button" role="tab" aria-selected="false" class="tk" data-lang="tk">ThunderKittens</button>
+<button type="button" role="tab" aria-selected="false" class="pytorch" data-lang="pytorch">PyTorch</button>
 </div>
 <div class="pane on" data-lang="cuda" role="tabpanel">
 <pre><code class="lang-cpp">    {
@@ -466,6 +509,44 @@ def _fast_path(seq_lens, block_table, out):
 </code></pre>
 <p class="src"><a href="https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64/blob/main/solution/tk/indexer.cu#L80-L122">solution/tk/indexer.cu, lines 80–122</a></p>
 </div>
+<div class="pane" data-lang="pytorch" role="tabpanel">
+<p class="pane-note">The per-token scale is multiplied into K here. A non-negative scale makes that equal to scaling the ReLU'd dot afterwards.</p>
+<pre><code class="lang-python">    # Per page the bytes are packed flat: [all FP8 | all scales], NOT
+    # interleaved as [fp8||scale] per token. Flatten, then split.
+    # kv_flat: [P, PS*132] = [P, 8448] uint8
+    kv_flat = cache_u8.view(num_pages, page_size * head_dim_sf)
+
+    # FP8 payload: first PS*D bytes per page
+    # fp8_bytes: [P, PS*D] = [P, 8192] uint8
+    # fp8:       [P, PS, D] float8_e4m3fn
+    # fp8_f32:   [P, PS, D] float32
+    fp8_bytes = kv_flat[:, : page_size * head_dim].contiguous()
+    fp8 = fp8_bytes.view(num_pages, page_size, head_dim).view(torch.float8_e4m3fn)
+    fp8_f32 = fp8.to(torch.float32)
+
+    # Scales: last PS*4 bytes per page -&gt; PS float32s
+    # scale_bytes: [P, PS*4] = [P, 256] uint8
+    # scale:       [P, PS, 1] float32
+    scale_bytes = kv_flat[:, page_size * head_dim :].contiguous()
+    scale = scale_bytes.view(torch.float32).view(num_pages, page_size, 1)
+
+    # Broadcast multiply: [P, PS, D] * [P, PS, 1] -&gt; [P, PS, D]
+    return fp8_f32 * scale
+
+# ...
+        # Logical tokens [0, S) live in the first Np = ceil(S / PS) pages.
+        # page_indices: [Np]  — physical page ids from the block table
+        num_pages_for_seq = (seq_len + page_size - 1) // page_size
+        page_indices = block_table[b, :num_pages_for_seq].to(torch.long)  # [Np]
+
+        # Gather those pages, flatten tokens, trim to S:
+        #   K_all[page_indices]: [Np, PS, D]
+        #   .reshape(-1, D):     [Np*PS, D]
+        #   [:seq_len]:          [S, D]
+        K = K_all[page_indices].reshape(-1, head_dim)[:seq_len]  # [S, D]
+</code></pre>
+<p class="src"><a href="https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64/blob/main/baselines/pytorch_naive_reference.py#L72-L92">baselines/pytorch_naive_reference.py, lines 72–92 and 128–137</a></p>
+</div>
 </div></section>
 <section class="piece" id="piece-mma">
 <h3>The matrix multiply</h3>
@@ -476,6 +557,7 @@ def _fast_path(seq_lens, block_table, out):
 <button type="button" role="tab" aria-selected="false" class="triton" data-lang="triton">Triton</button>
 <button type="button" role="tab" aria-selected="false" class="tilelang" data-lang="tilelang">TileLang</button>
 <button type="button" role="tab" aria-selected="false" class="tk" data-lang="tk">ThunderKittens</button>
+<button type="button" role="tab" aria-selected="false" class="pytorch" data-lang="pytorch">PyTorch</button>
 </div>
 <div class="pane on" data-lang="cuda" role="tabpanel">
 <pre><code class="lang-cpp">    {
@@ -580,6 +662,20 @@ def _fast_path(seq_lens, block_table, out):
 </code></pre>
 <p class="src"><a href="https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64/blob/main/solution/tk/indexer.cu#L125-L143">solution/tk/indexer.cu, lines 125–143</a></p>
 </div>
+<div class="pane" data-lang="pytorch" role="tabpanel">
+<p class="pane-note">The product the other tabs issue as a tcgen05 MMA.</p>
+<pre><code class="lang-python">        # ---- score ------------------------------------------------------------
+        # q[b]:      [H, D]
+        # K.T:       [D, S]
+        # q[b] @ K.T -&gt; [H, S]   raw head scores
+        # ReLU + per-head weight broadcast:
+        #   weights[b]:          [H]
+        #   weights[b][:, None]: [H, 1]
+        #   scores:              [H, S]
+        scores = torch.relu(q[b] @ K.T) * weights[b][:, None]  # [H, S]
+</code></pre>
+<p class="src"><a href="https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64/blob/main/baselines/pytorch_naive_reference.py#L139-L147">baselines/pytorch_naive_reference.py, lines 139–147</a></p>
+</div>
 </div></section>
 <section class="piece" id="piece-epilogue">
 <h3>ReLU, the head weight, and the scale</h3>
@@ -590,6 +686,7 @@ def _fast_path(seq_lens, block_table, out):
 <button type="button" role="tab" aria-selected="false" class="triton" data-lang="triton">Triton</button>
 <button type="button" role="tab" aria-selected="false" class="tilelang" data-lang="tilelang">TileLang</button>
 <button type="button" role="tab" aria-selected="false" class="tk" data-lang="tk">ThunderKittens</button>
+<button type="button" role="tab" aria-selected="false" class="pytorch" data-lang="pytorch">PyTorch</button>
 </div>
 <div class="pane on" data-lang="cuda" role="tabpanel">
 <pre><code class="lang-cpp">    // logit = scale * sum_h ReLU(acc[h]) * weight[h]. Threads past seq_len
@@ -650,6 +747,19 @@ def _fast_path(seq_lens, block_table, out):
 </code></pre>
 <p class="src"><a href="https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64/blob/main/solution/tk/indexer.cu#L138-L151">solution/tk/indexer.cu, lines 138–151</a></p>
 </div>
+<div class="pane" data-lang="pytorch" role="tabpanel">
+<p class="pane-note">ReLU, the head weight, and the sum over heads. The scale is already inside K.</p>
+<pre><code class="lang-python">        #   weights[b]:          [H]
+        #   weights[b][:, None]: [H, 1]
+        #   scores:              [H, S]
+        scores = torch.relu(q[b] @ K.T) * weights[b][:, None]  # [H, S]
+
+        # Sum across heads -&gt; one logit per logical token
+        # logits: [S]
+        logits = scores.sum(dim=0)
+</code></pre>
+<p class="src"><a href="https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64/blob/main/baselines/pytorch_naive_reference.py#L144-L151">baselines/pytorch_naive_reference.py, lines 144–151</a></p>
+</div>
 </div></section>
 <section class="piece" id="piece-radix">
 <h3>Radix rounds</h3>
@@ -660,6 +770,7 @@ def _fast_path(seq_lens, block_table, out):
 <button type="button" role="tab" aria-selected="false" class="triton" data-lang="triton">Triton</button>
 <button type="button" role="tab" aria-selected="false" class="tilelang" data-lang="tilelang">TileLang</button>
 <button type="button" role="tab" aria-selected="false" class="tk" data-lang="tk">ThunderKittens</button>
+<button type="button" role="tab" aria-selected="false" class="pytorch" data-lang="pytorch">PyTorch</button>
 </div>
 <div class="pane on" data-lang="cuda" role="tabpanel">
 <pre><code class="lang-cpp">// fp16 bits reordered so that unsigned integer comparison matches float
@@ -854,6 +965,15 @@ def _stage2_topk(logit_bits_ptr, seq_lens_ptr, bt_ptr, out_ptr,
 </code></pre>
 <p class="src"><a href="https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64/blob/main/solution/tk/indexer.cu#L157-L161">solution/tk/indexer.cu, lines 157–161 and 204–222</a></p>
 </div>
+<div class="pane" data-lang="pytorch" role="tabpanel">
+<p class="pane-note">torch.topk in place of the radix select.</p>
+<pre><code class="lang-python">        # ---- top-K over logical tokens ----------------------------------------
+        # topk_local: [actual_topk]  logical ids in [0, S)
+        actual_topk = min(TOPK, seq_len)
+        _, topk_local = torch.topk(logits, actual_topk)  # values unused
+</code></pre>
+<p class="src"><a href="https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64/blob/main/baselines/pytorch_naive_reference.py#L153-L156">baselines/pytorch_naive_reference.py, lines 153–156</a></p>
+</div>
 </div></section>
 <section class="piece" id="piece-emit">
 <h3>Keep the winners and remap them</h3>
@@ -864,6 +984,7 @@ def _stage2_topk(logit_bits_ptr, seq_lens_ptr, bt_ptr, out_ptr,
 <button type="button" role="tab" aria-selected="false" class="triton" data-lang="triton">Triton</button>
 <button type="button" role="tab" aria-selected="false" class="tilelang" data-lang="tilelang">TileLang</button>
 <button type="button" role="tab" aria-selected="false" class="tk" data-lang="tk">ThunderKittens</button>
+<button type="button" role="tab" aria-selected="false" class="pytorch" data-lang="pytorch">PyTorch</button>
 </div>
 <div class="pane on" data-lang="cuda" role="tabpanel">
 <pre><code class="lang-cpp">    // Emit every index strictly above the pivot, then indices equal to it,
@@ -1027,6 +1148,21 @@ def _stage2_topk(logit_bits_ptr, seq_lens_ptr, bt_ptr, out_ptr,
 </code></pre>
 <p class="src"><a href="https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64/blob/main/solution/tk/indexer.cu#L257-L292">solution/tk/indexer.cu, lines 257–292</a></p>
 </div>
+<div class="pane" data-lang="pytorch" role="tabpanel">
+<p class="pane-note">Logical token id to a physical slot: page id times 64, plus the slot.</p>
+<pre><code class="lang-python">        # ---- logical -&gt; physical ----------------------------------------------
+        # page_col: [actual_topk]  which block-table column (logical page)
+        # slot:     [actual_topk]  offset within the page
+        # physical: [actual_topk]  page_id * PS + slot
+        page_col = topk_local // page_size
+        slot = topk_local % page_size
+        physical = page_indices[page_col] * page_size + slot
+
+        # Write into the output row; remaining K - actual_topk entries stay -1
+        topk_indices[b, :actual_topk] = physical.to(torch.int32)
+</code></pre>
+<p class="src"><a href="https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64/blob/main/baselines/pytorch_naive_reference.py#L158-L167">baselines/pytorch_naive_reference.py, lines 158–167</a></p>
+</div>
 </div></section>
 <h2>The operation</h2>
 <p>For each query in a batch, score every token of a paged FP8 KV cache and return the top 2048 physical indices.</p>
@@ -1055,6 +1191,7 @@ physical id = block_table[b, t / 64] * 64 + (t % 64)</code></pre>
     <tr><td>Triton</td><td><a href="https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64/blob/main/solution/triton/solution.py"><code>solution/triton/solution.py</code></a></td><td>321 lines</td><td>Triton 3.7.0 is in the image. 3.9.0 was installed for the second run.</td></tr>
     <tr><td>TileLang</td><td><a href="https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64/blob/main/solution/tilelang/solution.py"><code>solution/tilelang/solution.py</code></a></td><td>384 lines</td><td>TileLang is built by flashinfer-bench. These numbers are from 0.1.15.</td></tr>
     <tr><td>ThunderKittens</td><td><a href="https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64/blob/main/solution/tk/indexer.cu"><code>solution/tk/indexer.cu</code></a> and <a href="https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64/blob/main/solution/tk/solution.py"><code>solution.py</code></a></td><td>373 + 48 lines</td><td>The headers are not in the contest image.</td></tr>
+    <tr><td>PyTorch</td><td><a href="https://github.com/ykirpichev/dsa_topk_indexer_fp8_h64_d128_topk2048_ps64/blob/main/baselines/pytorch_naive_reference.py"><code>baselines/pytorch_naive_reference.py</code></a></td><td>225 lines</td><td>The reference. It runs on CPU; it is not a contest submission.</td></tr>
   </tbody>
 </table>
 <p>Every <code>kernel(...)</code> has the same six arguments: Q, the KV cache, the weights, the sequence lengths, the block table, and the output index buffer.</p>
@@ -1065,6 +1202,10 @@ physical id = block_table[b, t / 64] * 64 + (t % 64)</code></pre>
 <p>This builds <code>solution/python</code> the way the contest does and prints a latency per workload. The Triton comparison uses the same harness for both languages:</p>
 <pre><code>modal run scripts/run_modal_triton_vs_cuda.py</code></pre>
 <p>Per-workload means, the three plans, and the Triton 3.7 versus 3.9 split are in the <a href="../triton-vs-cuda/">Triton report</a>.</p>
+
+<h3>PyTorch, the reference</h3>
+<pre><code>python baselines/pytorch_naive_reference.py</code></pre>
+<p>That runs a two-row CPU check of <code>baselines/pytorch_naive_reference.py</code>. <code>kernel(...)</code> has the same six arguments as the other four and writes the index buffer in place. The per-token scale is multiplied into K before the dot. A non-negative scale makes that equal to scaling the ReLU'd dot afterwards, which is what the kernels do.</p>
 
 <h3>TileLang</h3>
 <p>Import <code>solution.tilelang.solution</code> and call <code>kernel</code>. The fast path and the stage-1-plus-stage-2 path are both captured in a CUDA graph, keyed on the tensor pointers, so a replay is two graph launches. <code>T.gemm</code> lowers to the same <code>tcgen05</code> MMA. The gather is the part that stays in scalar code: a 16-byte load comes back as a vector the frontend cannot index, and a raw shared store of that vector would skip the swizzle the MMA reads, so each token is four 4-byte loads stored one FP8 value at a time.</p>
